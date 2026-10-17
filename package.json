@@ -1,0 +1,50 @@
+{
+  "name": "hivemind-session-archive",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin: persist the current session tree into a deterministic, project-scoped JSONL transcript archive plus a SQLite index, from a read-only view of the host session database.",
+  "license": "MIT",
+  "author": "shynlee04",
+  "type": "module",
+  "main": "src/plugin.ts",
+  "types": "src/plugin.ts",
+  "exports": {
+    ".": "./src/plugin.ts",
+    "./dist/session-archive.ts": "./dist/session-archive.ts",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "hivemind-session-archive": "bin/install.mjs"
+  },
+  "files": [
+    "src",
+    "dist",
+    "bin",
+    "README.md",
+    "LICENSE",
+    "AGENTS.md"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun scripts/build.ts",
+    "prepublishOnly": "bun test && bun run typecheck && bun run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "session",
+    "archive",
+    "transcript"
+  ],
+  "dependencies": {
+    "jsonc-parser": "^3.3.1"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.31",
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
