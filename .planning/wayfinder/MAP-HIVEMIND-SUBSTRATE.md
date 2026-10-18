@@ -1,6 +1,6 @@
 # Wayfinder Map — `hivemind-substrate`
 
-- **Status:** `active` (experimental prototyping & trial-and-error learning stage)
+- **Status:** `resolved` (all prototype spikes `WF-SUB-01..07` and owner grill gate `WF-SUB-08` completed; transitioned to `to-spec` for Phases `E1.1..E1.3`)
 - **Updated:** 2026-10-18
 
 ## Destination
@@ -15,10 +15,10 @@ Build `hivemind-substrate` as the deterministic, programmatic context glue acros
   - [`WF-SUB-R02-host-storage-kv-snapshots-spills.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/research/WF-SUB-R02-host-storage-kv-snapshots-spills.md)
   - [`WF-SUB-R03-codebase-memory-ast-pagerank-cochange.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/research/WF-SUB-R03-codebase-memory-ast-pagerank-cochange.md)
   - [`WF-SUB-R04-domain-model-and-viewport-matrix.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/research/WF-SUB-R04-domain-model-and-viewport-matrix.md)
-- **Proposed ADRs (Pending Prototype Evidence):**
-  - [`ADR-001-three-layer-context-substrate.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-001-three-layer-context-substrate.md) (`proposed`)
-  - [`ADR-002-step-watermark-valve-and-breadcrumb-handles.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-002-step-watermark-valve-and-breadcrumb-handles.md) (`proposed`)
-  - [`ADR-003-bun-native-codebase-structural-graph.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-003-bun-native-codebase-structural-graph.md) (`proposed`)
+- **Accepted ADRs (Verified by `WF-SUB-01..07` & Approved in `WF-SUB-08`):**
+  - [`ADR-001-three-layer-context-substrate.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-001-three-layer-context-substrate.md) (`accepted`)
+  - [`ADR-002-step-watermark-valve-and-breadcrumb-handles.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-002-step-watermark-valve-and-breadcrumb-handles.md) (`accepted`)
+  - [`ADR-003-bun-native-codebase-structural-graph.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-003-bun-native-codebase-structural-graph.md) (`accepted`)
 
 ## Decisions so far
 
@@ -32,20 +32,20 @@ Build `hivemind-substrate` as the deterministic, programmatic context glue acros
 
 | Ticket | Kind | Question / Prototype Spike | Depends on | Status |
 |---|---|---|---|---|
-| [`WF-SUB-01`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-01-semantic-session-digest-and-vibe-navigation.md) | `wayfinder:prototype` | Can a deterministic semantic session digest + `intent_pivot` + FTS5 layer over `.session-archive/index.sqlite` replace opaque `ses_id` navigation and eliminate ad-hoc Python JSONL scraping (`S2 msg[124..125]`)? | — | `open` |
-| [`WF-SUB-02`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-02-intra-turn-step-watermark-and-breadcrumb-valve.md) | `wayfinder:prototype` | Does assistant step-watermark slicing (`keepRecentSteps: K`) + `blob:<sha256>` `FactBreadcrumb`s + `WorkingMemoryManifest` solve both the 45-step auto-run `0`-byte prune (`S1 msg[45]`) and the post-prune re-read spiral (`S2 msg[125..130]`)? | `WF-SUB-01` | `open` |
-| [`WF-SUB-03`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-03-spine-kv-snapshot-and-spill-ingestion.md) | `wayfinder:prototype` | Can we ingest `opencode.db` `kv` bindings, sink uncommitted shadow Git snapshot blobs (`~/.local/share/opencode/snapshot/`), capture `tool-output`/`shell` spills, and separate `ReportedOutcome` from `VerifiedOutcome` across the 11 false-positive Antigravity children? | — | `open` |
-| [`WF-SUB-04`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-04-incremental-sync-and-hook-latency-budget.md) | `wayfinder:prototype` | Does watermark-gated incremental SQLite sync run in `< 150 ms` on `compaction`/`idle` against the `2.15 GB` `opencode.db` while keeping the `context` hook `< 2 ms` in-memory? | `WF-SUB-03` | `open` |
-| [`WF-SUB-05`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-05-bun-transpiler-depth2-ast-skeletonizer.md) | `wayfinder:prototype` | Does the `+4.2 KB` `Bun.Transpiler` + Depth-2 closure-factory skeletonizer index all `51` `src/**/*.ts` files (`>= 88%` compression) and expose inner helpers of `createNativeDelegationDriver` (`[L839-L3727]`)? | — | `open` |
-| [`WF-SUB-06`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-06-pagerank-repomap-and-git-cochange-couplings.md) | `wayfinder:prototype` | Does `Float64Array` PageRank + `git log` temporal co-change mining produce `< 1,000`-token Tier-1 RepoMaps and accurate coupling warnings (`devin-executable <-> harness-antigravity` `66.7%`)? | `WF-SUB-05` | `open` |
-| [`WF-SUB-07`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-07-compaction-continuity-and-provenance-reconciler.md) | `wayfinder:prototype` | Can a SQLite-backed `compaction` hook + `ProvenanceChain` staleness reconciler retire `.opencode/compaction-history/*.jsonl` and inject a `< 1,200`-token continuation packet with `FRESH` vs `STALE` file status? | `WF-SUB-01`, `WF-SUB-02`, `WF-SUB-03`, `WF-SUB-05` | `open` |
-| [`WF-SUB-08`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-08-substrate-surface-and-cross-harness-switching-grill.md) | `wayfinder:grilling` | Owner HITL grill gate on the prototype results (`WF-SUB-01..07`), the 2-tool surface (`substrate` + `viewport`), auto-thinning thresholds, and locking `ADR-001..003` before `to-spec`. | `WF-SUB-01..07` | `open` |
+| [`WF-SUB-01`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-01-semantic-session-digest-and-vibe-navigation.md) | `wayfinder:prototype` | Can a deterministic semantic session digest + `intent_pivot` + FTS5 layer over `.session-archive/index.sqlite` replace opaque `ses_id` navigation and eliminate ad-hoc Python JSONL scraping (`S2 msg[124..125]`)? | — | `resolved` |
+| [`WF-SUB-02`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-02-intra-turn-step-watermark-and-breadcrumb-valve.md) | `wayfinder:prototype` | Does assistant step-watermark slicing (`keepRecentSteps: K`) + `blob:<sha256>` `FactBreadcrumb`s + `WorkingMemoryManifest` solve both the 45-step auto-run `0`-byte prune (`S1 msg[45]`) and the post-prune re-read spiral (`S2 msg[125..130]`)? | `WF-SUB-01` | `resolved` |
+| [`WF-SUB-03`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-03-spine-kv-snapshot-and-spill-ingestion.md) | `wayfinder:prototype` | Can we ingest `opencode.db` `kv` bindings, sink uncommitted shadow Git snapshot blobs (`~/.local/share/opencode/snapshot/`), capture `tool-output`/`shell` spills, and separate `ReportedOutcome` from `VerifiedOutcome` across the 11 false-positive Antigravity children? | — | `resolved` |
+| [`WF-SUB-04`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-04-incremental-sync-and-hook-latency-budget.md) | `wayfinder:prototype` | Does watermark-gated incremental SQLite sync run in `< 150 ms` on `compaction`/`idle` against the `2.15 GB` `opencode.db` while keeping the `context` hook `< 2 ms` in-memory? | `WF-SUB-03` | `resolved` |
+| [`WF-SUB-05`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-05-bun-transpiler-depth2-ast-skeletonizer.md) | `wayfinder:prototype` | Does the `+4.2 KB` `Bun.Transpiler` + Depth-2 closure-factory skeletonizer index all `51` `src/**/*.ts` files (`>= 88%` compression) and expose inner helpers of `createNativeDelegationDriver` (`[L839-L3727]`)? | — | `resolved` |
+| [`WF-SUB-06`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-06-pagerank-repomap-and-git-cochange-couplings.md) | `wayfinder:prototype` | Does `Float64Array` PageRank + `git log` temporal co-change mining produce `< 1,000`-token Tier-1 RepoMaps and accurate coupling warnings (`devin-executable <-> harness-antigravity` `66.7%`)? | `WF-SUB-05` | `resolved` |
+| [`WF-SUB-07`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-07-compaction-continuity-and-provenance-reconciler.md) | `wayfinder:prototype` | Can a SQLite-backed `compaction` hook + `ProvenanceChain` staleness reconciler retire `.opencode/compaction-history/*.jsonl` and inject a `< 1,200`-token continuation packet with `FRESH` vs `STALE` file status? | `WF-SUB-01`, `WF-SUB-02`, `WF-SUB-03`, `WF-SUB-05` | `resolved` |
+| [`WF-SUB-08`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-08-substrate-surface-and-cross-harness-switching-grill.md) | `wayfinder:grilling` | Owner HITL grill gate on the prototype results (`WF-SUB-01..07`), the 2-tool surface (`substrate` + `viewport`), auto-thinning thresholds, and locking `ADR-001..003` before `to-spec`. | `WF-SUB-01..07` | `resolved` |
 
-## Not yet specified
+## Resolved in `WF-SUB-08` & Transitioned to Phase `SPEC.md`
 
-- Phase 1-3 production `SPEC.md` documents (deferred until `WF-SUB-01..07` prototypes complete and `WF-SUB-08` resolves).
-- Whether `substrate({ action: "prune" })` also triggers automatically on a token-budget watermark (`65%`) or stays explicit.
-- How `hivemind-steward-oc-devin-dev`'s `delegate-devin` and `hivemind-delegate` tools consume `viewport` briefs automatically when spawning child sessions.
+- **Tool Surface (`Q1`):** Unified `substrate.valve` + `substrate.viewport` primary tools with backwards-compatible delegating aliases (`archive.persist` and `ctx.context-prune`, plus direct `substrate` and `viewport` action entry points) and deterministic `sessionID` defaulting.
+- **Auto-Watermark Threshold (`Q2`):** Hybrid activation combining explicit `substrate.valve` (`keepRecentSteps = 8`) and automatic `context` hook watermark activation at `65%` of the model window (`keepRecentSteps = 12`).
+- **Cross-Harness Brief Packing (`Q3`):** Pure exported helper `buildImplementorViewportBrief(db, options)` packing Tier-1 `RepoMap`, Tier-2 `AstSkeleton`, Tier-3 `SymbolSlice`, and Tier-4 `CoChangeCoupling` warnings for `delegate-devin` and `hivemind-delegate`.
 
 ## Out of scope
 
