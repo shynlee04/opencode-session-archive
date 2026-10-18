@@ -78,6 +78,12 @@ CREATE TABLE project (
   commands text,
   time_archived integer
 );
+CREATE TABLE kv (
+  key text PRIMARY KEY,
+  value text NOT NULL,
+  time_created integer NOT NULL,
+  time_updated integer NOT NULL
+);
 `
 
 export const PROJECT_ID = "proj_test"
@@ -163,5 +169,22 @@ export const addMessage = (db: Database, seed: MessageSeed) => {
     seed.time_created ?? 1000 + seed.seq,
     seed.time_updated ?? 1000 + seed.seq,
     JSON.stringify(seed.data),
+  )
+}
+
+export const encodeUtf16BeHex = (input: string): string =>
+  Array.from(input)
+    .map((ch) => ch.charCodeAt(0).toString(16).padStart(4, "0"))
+    .join("")
+
+export const addKv = (
+  db: Database,
+  seed: { key: string; value: unknown; time_created?: number; time_updated?: number },
+) => {
+  db.query("INSERT OR REPLACE INTO kv (key, value, time_created, time_updated) VALUES (?, ?, ?, ?)").run(
+    seed.key,
+    typeof seed.value === "string" ? seed.value : JSON.stringify(seed.value),
+    seed.time_created ?? 1000,
+    seed.time_updated ?? 2000,
   )
 }
