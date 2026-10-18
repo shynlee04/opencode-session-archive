@@ -394,3 +394,300 @@ describe("layout: laneOf", () => {
     expect(sessionRelDir(path.join("sessions", "a"), "b")).toBe(path.join("sessions", "a", "subagents", "b"))
   })
 })
+
+describe("TWM-02, TWM-03 & TWM-04: spine tables, incremental watermark sync, and WAL concurrency", () => {
+  test("populates delegation_turn, file_read_ledger, skill_load_ledger, file_touch, and sync_watermark in index.sqlite", () => {
+    addMessage(db, {
+      id: "msg_skill_load",
+      session_id: "ses_root",
+      type: "skill",
+      seq: 6,
+      data: {
+        time: { created: 1006 },
+        name: "tdd",
+        text: "# Skill: TDD\nRed -> Green -> Refactor",
+      },
+    })
+    addMessage(db, {
+      id: "msg_edit_touch",
+      session_id: "ses_root",
+      type: "assistant",
+      seq: 7,
+      data: {
+        time: { created: 1007, completed: 1008 },
+        agent: "build",
+        model: { id: "gpt-6.1-sol", providerID: "openai" },
+        finish: "stop",
+        content: [
+          {
+            type: "tool",
+            id: "call_edit_1",
+            name: "edit",
+            time: { created: 1007, ran: 1007, completed: 1008 },
+            state: {
+              status: "completed",
+              input: { filePath: "src/archive/index.ts" },
+              content: [{ type: "text", text: "Edited src/archive/index.ts" }],
+            },
+          },
+        ],
+      },
+    })
+
+    const opencodeDataDir = path.join(dir, "opencode-data")
+    const spillDir = path.join(opencodeDataDir, "tool-output")
+    const { mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs")
+    mkdirSync(spillDir, { recursive: true })
+    writeFileSync(path.join(spillDir, "tool_call_edit_1"), "FULL_EXTERNAL_SPILL_PAYLOAD\n".repeat(200), "utf8")
+
+    const source = sqliteSource(dbPath)
+    let report: ReturnType<typeof persist>
+    try {
+      report = persist({ sessionID: "ses_root", projectID: PROJECT_ID, projectRoot, opencodeDataDir }, source)
+    } finally {
+      source.close()
+    }
+    expect(report.mode).toBe("cold_full")
+    expect(report.spillsSunk).toBe(1)
+
+    const index = new Database(path.join(archiveDir(), "index.sqlite"), { readonly: true })
+    try {
+      const reads = index
+        .query("SELECT session_id, path, read_seq, blob_sha FROM file_read_ledger WHERE session_id = ?")
+        .all("ses_grand") as Array<{ session_id: string; path: string; read_seq: number; blob_sha: string }>
+      expect(reads).toHaveLength(1)
+      expect(reads[0]!.path).toBe("/x")
+      expect(reads[0]!.blob_sha).toHaveLength(64)
+
+      const skills = index
+        .query("SELECT session_id, skill_name, load_seq, blob_sha FROM skill_load_ledger WHERE session_id = ?")
+        .all("ses_root") as Array<{ session_id: string; skill_name: string; load_seq: number; blob_sha: string }>
+      expect(skills).toHaveLength(1)
+      expect(skills[0]!.skill_name).toBe("tdd")
+
+      const touches = index
+        .query("SELECT session_id, path, op FROM file_touch WHERE session_id = ? AND op = 'edit'")
+        .all("ses_root") as Array<{ session_id: string; path: string; op: string }>
+      expect(touches).toHaveLength(1)
+      expect(touches[0]!.path).toBe("src/archive/index.ts")
+
+      const spills = index
+        .query("SELECT session_id, call_id, spill_kind, full_byte_len, blob_sha FROM spill_artifact WHERE session_id = ?")
+        .all("ses_root") as Array<{
+        session_id: string
+        call_id: string
+        spill_kind: string
+        full_byte_len: number
+        blob_sha: string
+      }>
+      expect(spills).toHaveLength(1)
+      expect(spills[0]!.call_id).toBe("call_edit_1")
+      expect(spills[0]!.spill_kind).toBe("tool-output")
+      expect(existsSync(path.join(archiveDir(), "blobs", `${spills[0]!.blob_sha}.txt`))).toBe(true)
+
+      const turns = index
+        .query(
+          "SELECT parent_session_id, call_id, turn_index, child_session_id, verified_outcome FROM delegation_turn ORDER BY parent_session_id, call_id",
+        )
+        .all() as Array<{
+        parent_session_id: string
+        call_id: string
+        turn_index: number
+        child_session_id: string
+        verified_outcome: string
+      }>
+      expect(turns.length).toBeGreaterThanOrEqual(3)
+      const grandTurn = turns.find((t) => t.call_id === "call_dd")!
+      expect(grandTurn).toBeDefined()
+      expect(grandTurn.child_session_id).toBe("ses_grand")
+      expect(grandTurn.verified_outcome).toBe("verified_pass")
+
+      const watermarks = index
+        .query("SELECT session_id, root_id, last_max_seq, last_message_id FROM sync_watermark WHERE root_id = ?")
+        .all("ses_root") as Array<{
+        session_id: string
+        root_id: string
+        last_max_seq: number
+        last_message_id: string
+      }>
+      expect(watermarks).toHaveLength(5)
+      const rootWm = watermarks.find((w) => w.session_id === "ses_root")!
+      expect(rootWm.last_max_seq).toBe(7)
+      expect(rootWm.last_message_id).toBe("msg_edit_touch")
+    } finally {
+      index.close()
+    }
+  })
+
+  test("TWM-04: warm no-op sync completes in < 2 ms and fetches 0 message rows", () => {
+    run() // cold full sync
+
+    const source = sqliteSource(dbPath)
+    try {
+      // Warm up JIT once, then measure warm no-op
+      const noop = persist({ sessionID: "ses_root", projectID: PROJECT_ID, projectRoot }, source)
+      expect(noop.mode).toBe("noop_delta")
+      expect(noop.messagesProcessed).toBe(0)
+      expect(noop.dirtySessionsCount).toBe(0)
+      expect(noop.written).toEqual([])
+
+      const t0 = performance.now()
+      const noop2 = persist({ sessionID: "ses_root", projectID: PROJECT_ID, projectRoot }, source)
+      const elapsed = performance.now() - t0
+      expect(noop2.mode).toBe("noop_delta")
+      expect(noop2.messagesProcessed).toBe(0)
+      expect(elapsed).toBeLessThan(2)
+    } finally {
+      source.close()
+    }
+  })
+
+  test("TWM-04: incremental 1-turn delta sync processes only new seq > last_max_seq in < 150 ms and advances sync_watermark", () => {
+    run() // cold full sync (10 messages across 5 sessions; ses_root has max_seq = 5)
+
+    // Append 1 turn (user seq 6 + assistant seq 7) to ses_root
+    db.query("UPDATE session_v2 SET time_updated = 9999 WHERE id = 'ses_root'").run()
+    addMessage(db, {
+      id: "msg_delta_u6",
+      session_id: "ses_root",
+      type: "user",
+      seq: 6,
+      time_created: 9990,
+      time_updated: 9990,
+      data: { time: { created: 9990 }, text: "follow-up incremental question" },
+    })
+    addMessage(db, {
+      id: "msg_delta_a7",
+      session_id: "ses_root",
+      type: "assistant",
+      seq: 7,
+      time_created: 9995,
+      time_updated: 9999,
+      data: {
+        time: { created: 9995, completed: 9999 },
+        agent: "build",
+        model: { id: "gpt-6.1-sol", providerID: "openai" },
+        finish: "stop",
+        tokens: { input: 25, output: 30 },
+        content: [{ type: "text", text: "incremental answer" }],
+      },
+    })
+
+    const source = sqliteSource(dbPath)
+    try {
+      const t0 = performance.now()
+      const delta = persist({ sessionID: "ses_root", projectID: PROJECT_ID, projectRoot }, source)
+      const elapsed = performance.now() - t0
+
+      expect(delta.mode).toBe("incremental_delta")
+      expect(delta.dirtySessionsCount).toBe(1)
+      expect(delta.messagesProcessed).toBe(2)
+      expect(delta.messages).toBe(12)
+      expect(elapsed).toBeLessThan(150)
+
+      // Only ses_root.jsonl, ses_root/info.json, new blobs, and index.sqlite were written; children were skipped
+      expect(delta.written).toContain(path.join("sessions", "ses_root", "ses_root.jsonl"))
+      expect(delta.written).not.toContain(
+        path.join("sessions", "ses_root", "subagents", "ses_child", "ses_child.jsonl"),
+      )
+
+      const rootRecords = readJsonl(path.join(rootDir(), "ses_root.jsonl"))
+      expect(rootRecords).toHaveLength(8) // 1 header + 7 messages
+
+      const index = new Database(path.join(archiveDir(), "index.sqlite"), { readonly: true })
+      try {
+        const wm = index
+          .query("SELECT last_max_seq, last_message_id, last_time_updated FROM sync_watermark WHERE session_id = ?")
+          .get("ses_root") as { last_max_seq: number; last_message_id: string; last_time_updated: number }
+        expect(wm.last_max_seq).toBe(7)
+        expect(wm.last_message_id).toBe("msg_delta_a7")
+        expect(wm.last_time_updated).toBe(9999)
+      } finally {
+        index.close()
+      }
+    } finally {
+      source.close()
+    }
+  })
+
+  test("TWM-04: concurrent WAL reader/writer stress (1 writer + 4 readers across 50 operations) completes with 0 SQLITE_BUSY errors", async () => {
+    run()
+    const sqlitePath = path.join(archiveDir(), "index.sqlite")
+    const readers = Array.from({ length: 4 }, () => {
+      const r = new Database(sqlitePath, { readonly: true })
+      r.exec("PRAGMA busy_timeout = 5000;")
+      return r
+    })
+
+    let busyErrors = 0
+    let totalOps = 0
+
+    try {
+      const source = sqliteSource(dbPath)
+      try {
+        const tasks: Promise<void>[] = []
+        for (let i = 0; i < 15; i++) {
+          const seq = 6 + i
+          tasks.push(
+            (async () => {
+              await Bun.sleep(i * 1)
+              try {
+                db.query("UPDATE session_v2 SET time_updated = ? WHERE id = 'ses_root'").run(2000 + seq)
+                addMessage(db, {
+                  id: `msg_conc_${seq}`,
+                  session_id: "ses_root",
+                  type: "user",
+                  seq,
+                  time_created: 2000 + seq,
+                  time_updated: 2000 + seq,
+                  data: { time: { created: 2000 + seq }, text: `concurrent message ${seq}` },
+                })
+                persist({ sessionID: "ses_root", projectID: PROJECT_ID, projectRoot }, source)
+                totalOps += 1
+              } catch (err) {
+                if (String(err).includes("SQLITE_BUSY") || String(err).includes("database is locked")) {
+                  busyErrors += 1
+                } else {
+                  throw err
+                }
+              }
+            })(),
+          )
+
+          for (let rIdx = 0; rIdx < readers.length; rIdx++) {
+            const reader = readers[rIdx]!
+            tasks.push(
+              (async () => {
+                await Bun.sleep(i * 1)
+                try {
+                  const cnt = reader.query("SELECT COUNT(*) as c FROM message WHERE session_id = 'ses_root'").get() as {
+                    c: number
+                  }
+                  expect(cnt.c).toBeGreaterThanOrEqual(5)
+                  totalOps += 1
+                } catch (err) {
+                  if (String(err).includes("SQLITE_BUSY") || String(err).includes("database is locked")) {
+                    busyErrors += 1
+                  } else {
+                    throw err
+                  }
+                }
+              })(),
+            )
+          }
+        }
+        await Promise.all(tasks)
+      } finally {
+        source.close()
+      }
+
+      const jm = readers[0]!.query("PRAGMA journal_mode;").get() as { journal_mode: string }
+      expect(jm.journal_mode.toLowerCase()).toBe("wal")
+      expect(totalOps).toBeGreaterThanOrEqual(50)
+      expect(busyErrors).toBe(0)
+    } finally {
+      for (const r of readers) r.close()
+    }
+  })
+})
+
