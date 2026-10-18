@@ -1,63 +1,111 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { existsSync, readFileSync } from "node:fs"
-import type { Database } from "bun:sqlite"
-import { sha256hex } from "../src/archive/normalize.ts"
+import { mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { Database } from "bun:sqlite"
+import { sha256Hex } from "../src/archive/primitives.ts"
+import { ensureCodeGraphSchema, indexCodebase } from "../src/honeycomb/ast-skeleton.ts"
+import { ensureCochangeSchema } from "../src/honeycomb/cochange.ts"
+import { computeCodebasePageRank } from "../src/honeycomb/pagerank.ts"
 import { buildImplementorViewportBrief } from "../src/viewports/brief.ts"
-import {
-  DEFAULT_ARCHIVE_DIR,
-  DEFAULT_TARGET_DB_PATH,
-  DEFAULT_WF01_DB_PATH,
-  DEFAULT_WF03_DB_PATH,
-  DEFAULT_WF06_DB_PATH,
-  S1_SESSION_ID,
-  buildUnifiedContinuityDatabase,
-} from "../src/viewports/continuity.ts"
+import { ensureContinuitySchema, shortBlobRef } from "../src/viewports/continuity.ts"
 
-const STEWARD_ROOT = "/Users/MAC/Documents/coding-projects/hivemind-steward-oc-devin-dev"
-const BRIEF_TEST_DB_PATH =
-  "/Users/MAC/Documents/coding-projects/hivemind-substrate/scratch/prototypes/data/vsc-03-brief-test.sqlite"
+const TEST_SESSION_ID = "ses_brief_fixture_root"
 
-const PROTECTED_UPSTREAM_DBS = [
-  DEFAULT_WF01_DB_PATH,
-  DEFAULT_WF03_DB_PATH,
-  "/Users/MAC/Documents/coding-projects/hivemind-substrate/scratch/prototypes/data/wf-sub-05-codegraph.sqlite",
-  DEFAULT_WF06_DB_PATH,
-  `${DEFAULT_ARCHIVE_DIR}/index.sqlite`,
-] as const
-
-function hashFile(path: string): string {
-  return sha256hex(readFileSync(path))
-}
-
-describe("VSC-03: Cross-Harness Implementor Viewport Brief Helper (buildImplementorViewportBrief)", () => {
-  const upstreamHashesBefore = new Map<string, string>()
+describe("VSC-03 / VSC-R1: Cross-Harness Implementor Viewport Brief Helper (buildImplementorViewportBrief)", () => {
+  let tmpRoot: string
   let db: Database
 
   beforeAll(() => {
-    for (const p of PROTECTED_UPSTREAM_DBS) {
-      if (existsSync(p)) {
-        upstreamHashesBefore.set(p, hashFile(p))
-      }
-    }
-    db = buildUnifiedContinuityDatabase({
-      targetDbPath: BRIEF_TEST_DB_PATH || DEFAULT_TARGET_DB_PATH,
-    })
+    tmpRoot = join(tmpdir(), `hivemind-brief-${Date.now()}`)
+    mkdirSync(join(tmpRoot, "src", "delegation"), { recursive: true })
+
+    const driverSource = [
+      "export class NativeDelegationDriver {",
+      "  async turnStream(sessionId: string, prompt: string): Promise<string> {",
+      "    return `${sessionId}:${prompt}`",
+      "  }",
+      "}",
+      "",
+      "export function createNativeDelegationDriver(): NativeDelegationDriver {",
+      "  return new NativeDelegationDriver()",
+      "}",
+      "",
+    ].join("\n")
+
+    const execSource = [
+      "import { createNativeDelegationDriver } from './delegation/native-delegation.ts'",
+      "",
+      "export async function runDevinExecutable(input: string): Promise<string> {",
+      "  const driver = createNativeDelegationDriver()",
+      "  return driver.turnStream('ses_1', input)",
+      "}",
+      "",
+    ].join("\n")
+
+    const antigravitySource = [
+      "export function bridgeAntigravitySeat(seatId: string): string {",
+      "  return `seat:${seatId}`",
+      "}",
+      "",
+    ].join("\n")
+
+    writeFileSync(join(tmpRoot, "src/delegation/native-delegation.ts"), driverSource, "utf8")
+    writeFileSync(join(tmpRoot, "src/devin-executable.ts"), execSource, "utf8")
+    writeFileSync(join(tmpRoot, "src/harness-antigravity.ts"), antigravitySource, "utf8")
+
+    db = new Database(":memory:")
+    ensureContinuitySchema(db)
+    ensureCodeGraphSchema(db)
+    ensureCochangeSchema(db)
+
+    indexCodebase(db, tmpRoot)
+    computeCodebasePageRank(db)
+
+    db.prepare(`
+      INSERT INTO session (
+        id, root_id, project_id, depth, lane_kind, lane_path, title, harness, t_created, t_updated
+      ) VALUES (?, ?, 'proj_brief', 0, 'root', '', 'Brief Test Session', 'opencode', 1000, 2000)
+    `).run(TEST_SESSION_ID, TEST_SESSION_ID)
+
+    const driverSha = sha256Hex(driverSource)
+    db.prepare(`
+      INSERT INTO provenance_chain (
+        chain_id, root_session_id, finding_id, finding_summary, child_session_id,
+        decision_pivot_seq, target_path, read_or_review_blob_sha, repair_blob_sha,
+        verification_command, verification_exit_code, verification_blob_ref,
+        disk_blob_sha, staleness_status, updated_at
+      ) VALUES (
+        'chain_driver_seam', ?, 'F-MH28-DRIVER-SEAM',
+        'NativeDelegationDriver couples catalog observation and stream admission',
+        'ses_child_1', 4, 'src/delegation/native-delegation.ts',
+        ?, ?, 'bun test', 0, ?, ?, 'VERIFIED_FRESH', '2026-10-18T00:00:00Z'
+      )
+    `).run(TEST_SESSION_ID, driverSha, driverSha, shortBlobRef(driverSha), driverSha)
+
+    db.prepare(`
+      INSERT INTO git_cochange (
+        file_a, file_b, co_commits, commits_a, commits_b,
+        prob_a_given_b, prob_b_given_a, jaccard, has_static_edge, recent_subjects_json
+      ) VALUES (
+        'src/delegation/native-delegation.ts', 'src/harness-antigravity.ts',
+        6, 8, 6, 0.75, 1.0, 0.75, 0, '["align native delegation and antigravity harness"]'
+      )
+    `).run()
   })
 
   afterAll(() => {
     db?.close()
-    for (const [p, expectedHash] of upstreamHashesBefore.entries()) {
-      expect(hashFile(p)).toBe(expectedHash)
-    }
+    if (tmpRoot) rmSync(tmpRoot, { recursive: true, force: true })
   })
 
   test("1. REQ-SUB-18: packs Tier-1 RepoMap, Tier-2 AstSkeleton, Tier-3 SymbolSlice, Tier-4 CoChangeCoupling (has_static_edge=0), and ProvenanceChain constraints within default 1,500 tokens in < 5 ms", () => {
     const t0 = performance.now()
     const brief = buildImplementorViewportBrief(db, {
       targetPaths: ["src/delegation/native-delegation.ts", "src/devin-executable.ts"],
-      symbolNames: ["createNativeDelegationDriver.turnStream"],
-      sessionID: S1_SESSION_ID,
-      rootDir: STEWARD_ROOT,
+      symbolNames: ["NativeDelegationDriver.turnStream"],
+      sessionID: TEST_SESSION_ID,
+      rootDir: tmpRoot,
       maxTokens: 1500,
     })
     const elapsedMs = performance.now() - t0
@@ -73,15 +121,14 @@ describe("VSC-03: Cross-Harness Implementor Viewport Brief Helper (buildImplemen
       "src/delegation/native-delegation.ts",
       "src/devin-executable.ts",
     ])
-    expect(brief.includedSymbols).toContain("createNativeDelegationDriver.turnStream")
+    expect(brief.includedSymbols).toContain("NativeDelegationDriver.turnStream")
     expect(brief.coupledWarnings).toBeGreaterThanOrEqual(1)
     expect(brief.provenanceChains).toBeGreaterThanOrEqual(1)
 
-    // Verify all 5 structural sections appear in the brief markdown
     expect(brief.markdown).toContain("Tier-1 RepoMap")
     expect(brief.markdown).toContain("src/delegation/native-delegation.ts")
     expect(brief.markdown).toContain("src/devin-executable.ts")
-    expect(brief.markdown).toContain("createNativeDelegationDriver.turnStream")
+    expect(brief.markdown).toContain("NativeDelegationDriver.turnStream")
     expect(brief.markdown).toContain("src/harness-antigravity.ts")
     expect(brief.markdown).toContain("HIDDEN")
     expect(brief.markdown).toContain("F-MH28-DRIVER-SEAM")
@@ -89,29 +136,27 @@ describe("VSC-03: Cross-Harness Implementor Viewport Brief Helper (buildImplemen
 
   test("2. REQ-SUB-18: supports alias option shapes (writeLeasePaths, focusSymbols, projectRoot, maxTokensBudget, goal, verificationCommand)", () => {
     const brief = buildImplementorViewportBrief(db, {
-      projectRoot: STEWARD_ROOT,
-      sessionID: S1_SESSION_ID,
+      projectRoot: tmpRoot,
+      sessionID: TEST_SESSION_ID,
       goal: "Isolate native delegation admission stream error handling",
       writeLeasePaths: ["src/delegation/native-delegation.ts", "src/devin-executable.ts"],
       focusSymbols: [
         {
           path: "src/delegation/native-delegation.ts",
-          symbol: "createNativeDelegationDriver.turnStream",
+          symbol: "NativeDelegationDriver.turnStream",
         },
       ],
-      verificationCommand: "bun test test/native-init-settings.test.ts && bun run typecheck",
+      verificationCommand: "bun test && bun run typecheck",
       maxTokensBudget: 1800,
     })
 
     expect(brief.tokenEstimate).toBeLessThanOrEqual(1800)
     expect(Math.ceil(brief.markdown.length / 4)).toBeLessThanOrEqual(1800)
     expect(brief.goal).toBe("Isolate native delegation admission stream error handling")
-    expect(brief.verificationCommand).toBe(
-      "bun test test/native-init-settings.test.ts && bun run typecheck",
-    )
+    expect(brief.verificationCommand).toBe("bun test && bun run typecheck")
     expect(brief.markdown).toContain("Isolate native delegation admission stream error handling")
-    expect(brief.markdown).toContain("bun test test/native-init-settings.test.ts")
-    expect(brief.includedSymbols).toContain("createNativeDelegationDriver.turnStream")
+    expect(brief.markdown).toContain("bun test && bun run typecheck")
+    expect(brief.includedSymbols).toContain("NativeDelegationDriver.turnStream")
     expect(brief.coupledWarnings).toBeGreaterThan(0)
     expect(brief.provenanceChains).toBeGreaterThan(0)
   })
@@ -122,11 +167,11 @@ describe("VSC-03: Cross-Harness Implementor Viewport Brief Helper (buildImplemen
         targetPaths: [
           "src/delegation/native-delegation.ts",
           "src/devin-executable.ts",
-          "src/acp-session-core.ts",
+          "src/harness-antigravity.ts",
         ],
-        symbolNames: ["createNativeDelegationDriver.turnStream"],
-        sessionID: S1_SESSION_ID,
-        rootDir: STEWARD_ROOT,
+        symbolNames: ["NativeDelegationDriver.turnStream"],
+        sessionID: TEST_SESSION_ID,
+        rootDir: tmpRoot,
         maxTokens: tightBudget,
       })
 

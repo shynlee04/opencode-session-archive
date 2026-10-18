@@ -1,16 +1,11 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { Database } from "bun:sqlite"
-import { sha256hex } from "../archive/normalize.ts"
-
-export const DEFAULT_SOURCE_ARCHIVE_DIR =
-  "/Users/MAC/Documents/coding-projects/hivemind-steward-oc-devin-dev/.session-archive"
-export const DEFAULT_TARGET_DB_PATH =
-  "/Users/MAC/Documents/coding-projects/hivemind-substrate/scratch/prototypes/data/wf-sub-01-index.sqlite"
-export const DEFAULT_EXPORTED_FIXTURES = [
-  "/var/folders/wn/mt1t2bp52rl0pttbgq6bmswh0000gn/T/session-a35adea6-83a7-439f-90b1-f15793b79239.json",
-  "/var/folders/wn/mt1t2bp52rl0pttbgq6bmswh0000gn/T/session-bcad339b-471f-456c-8815-eb205e6c929b.json",
-] as const
+import {
+  estimateTokens as estimateTokensPrimitive,
+  normalizeRepoPath as normalizeRepoPathPrimitive,
+  sha256Hex,
+} from "../archive/primitives.ts"
 
 export const INTENT_PIVOT_KINDS = [
   "initial_goal",
@@ -77,6 +72,7 @@ export interface MaterializeSemanticDigestsOptions {
   readonly exportJsonPaths?: readonly string[]
   readonly sourceArchiveDir?: string
   readonly exportedFixturePaths?: readonly string[]
+  readonly canonicalRoot?: string
 }
 
 export interface MaterializeSemanticDigestsReport {
@@ -87,8 +83,8 @@ export interface MaterializeSemanticDigestsReport {
 }
 
 export interface BuildIndexOptions {
-  readonly sourceArchiveDir?: string
-  readonly targetDbPath?: string
+  readonly sourceArchiveDir: string
+  readonly targetDbPath: string
   readonly exportedFixturePaths?: readonly string[]
 }
 
@@ -105,26 +101,40 @@ export interface VibeNavigationOptions {
 }
 
 export interface VibeNavigationCandidate {
+  readonly sessionId: string
   readonly session_id: string
   readonly headline: string
+  readonly verificationState: VerificationState
   readonly verification_state: VerificationState
   readonly score: number
+  readonly combinedScore: number
+  readonly bestBm25: number
+  readonly matchedTokenCount: number
   readonly matched_token_count: number
+  readonly queryTokenCount: number
   readonly query_token_count: number
+  readonly tokenCoverage: number
   readonly token_coverage: number
+  readonly pivotsCount: number
+  readonly delegationsCount: number
 }
+
+export type VibeNavigationMatchedSession = VibeNavigationCandidate
 
 export interface VibeNavigationDigest {
   readonly query: string
+  readonly total_root_sessions: number
+  readonly matched_count: number
   readonly matched_root: {
     readonly session_id: string
     readonly headline: string
     readonly verification_state: VerificationState
     readonly score: number
+    readonly best_bm25: number
     readonly matched_token_count: number
     readonly query_token_count: number
     readonly token_coverage: number
-  }
+  } | null
   readonly intent_pivots: readonly {
     readonly seq: number
     readonly kind: IntentPivotKind
@@ -142,16 +152,6 @@ export interface VibeNavigationDigest {
   }[]
   readonly touched_files: readonly string[]
   readonly key_decisions: readonly string[]
-  readonly vs_s2_msg124_125_failure: {
-    readonly legacy_shell_calls: number
-    readonly legacy_raw_jsonl_cap_chars: number
-    readonly legacy_shell_dump_chars: number
-    readonly legacy_msg124_125_total_chars: number
-    readonly legacy_estimated_tokens: number
-    readonly digest_chars: number
-    readonly digest_estimated_tokens: number
-    readonly token_reduction_pct: number
-  }
 }
 
 export interface VibeNavigationResult {
@@ -162,11 +162,14 @@ export interface VibeNavigationResult {
   readonly headline: string
   readonly verificationState: VerificationState
   readonly score: number
+  readonly bestBm25: number
   readonly matchedTokenCount: number
   readonly queryTokenCount: number
   readonly tokenCoverage: number
   readonly tokenCount: number
   readonly estimatedTokens: number
+  readonly totalRootSessions: number
+  readonly matchedSessions: readonly VibeNavigationMatchedSession[]
   readonly candidates: readonly VibeNavigationCandidate[]
   readonly metrics: {
     readonly markdown_chars: number
@@ -176,6 +179,9 @@ export interface VibeNavigationResult {
     readonly fts_hits: number
     readonly pivots_returned: number
     readonly delegations_returned: number
+    readonly total_root_sessions: number
+    readonly matched_root_sessions: number
+    readonly elapsed_ms: number
   }
 }
 
@@ -356,6 +362,29 @@ const STOP_WORDS = new Set([
 ])
 
 export function ensureSemanticDigestSchema(db: Database): void {
+  const ssdCols = new Set(
+    (db.query("PRAGMA table_info(session_semantic_digest)").all() as { name: string }[]).map(
+      (c) => c.name,
+    ),
+  )
+  if (ssdCols.size > 0 && !ssdCols.has("headline")) {
+    db.exec("DROP TABLE IF EXISTS session_semantic_digest;")
+  }
+
+  const pivotColsBefore = new Set(
+    (db.query("PRAGMA table_info(intent_pivot)").all() as { name: string }[]).map((c) => c.name),
+  )
+  if (pivotColsBefore.size > 0 && !pivotColsBefore.has("seq")) {
+    db.exec("DROP TABLE IF EXISTS intent_pivot;")
+  }
+
+  const ftsMasterBefore = db
+    .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'substrate_fts'")
+    .get() as { sql?: string } | null
+  if (ftsMasterBefore?.sql && !ftsMasterBefore.sql.includes("symbol_or_path")) {
+    db.exec("DROP TABLE IF EXISTS substrate_fts;")
+  }
+
   db.exec(SEMANTIC_DIGEST_DDL)
 
   const pivotCols = db.query("PRAGMA table_info(intent_pivot)").all() as { name: string }[]
@@ -393,7 +422,7 @@ export function ensureSemanticDigestSchema(db: Database): void {
 }
 
 export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4)
+  return estimateTokensPrimitive(text)
 }
 
 export function isHumanPromptText(text: string): boolean {
@@ -449,9 +478,15 @@ export function classifyIntentPivot(
 
 export const classifyPivotKind = classifyIntentPivot
 
-function normalizeRepoPath(rawPath: string): string | null {
+function cleanTrackedPath(rawPath: string, canonicalRoot?: string): string | null {
   const trimmed = rawPath.trim().replace(/^['"`]|['"`]$/g, "")
-  if (!trimmed || trimmed.startsWith("/Users/MAC/.agents") || trimmed.startsWith("/Users/MAC/.config")) {
+  if (!trimmed) return null
+  if (
+    trimmed.includes("/.agents/") ||
+    trimmed.includes("/.config/") ||
+    trimmed.startsWith("/private/var/") ||
+    trimmed.startsWith("/var/folders/")
+  ) {
     return null
   }
   const worktreeMarker = ".worktree/"
@@ -459,19 +494,13 @@ function normalizeRepoPath(rawPath: string): string | null {
   if (wtIdx >= 0) {
     const afterWt = trimmed.slice(wtIdx + worktreeMarker.length)
     const slashIdx = afterWt.indexOf("/")
-    if (slashIdx >= 0) return afterWt.slice(slashIdx + 1)
+    if (slashIdx >= 0) return normalizeRepoPathPrimitive(afterWt.slice(slashIdx + 1), canonicalRoot)
   }
-  for (const repoMarker of ["hivemind-steward-oc-devin-dev/", "hivemind-substrate/"]) {
-    const repoIdx = trimmed.indexOf(repoMarker)
-    if (repoIdx >= 0) {
-      return trimmed.slice(repoIdx + repoMarker.length)
-    }
-  }
-  if (trimmed.startsWith("/private/var/") || trimmed.startsWith("/var/folders/")) return null
-  return trimmed
+  const normalized = normalizeRepoPathPrimitive(trimmed, canonicalRoot)
+  return normalized || null
 }
 
-function extractPatchPaths(patchText: string, archiveDir: string | undefined): string[] {
+function extractPatchPaths(patchText: string, archiveDir: string | undefined, canonicalRoot?: string): string[] {
   let content = patchText
   if (archiveDir && patchText.startsWith("blob:")) {
     const sha = patchText.slice("blob:".length)
@@ -484,19 +513,19 @@ function extractPatchPaths(patchText: string, archiveDir: string | undefined): s
   for (const line of content.split("\n")) {
     const m = line.match(/^\*\*\* (?:Update|Add|Delete) File:\s+(.+)$/)
     if (m?.[1]) {
-      const norm = normalizeRepoPath(m[1])
+      const norm = cleanTrackedPath(m[1], canonicalRoot)
       if (norm) paths.push(norm)
     }
   }
   return paths
 }
 
-function extractOutputModifiedPaths(outputText: string): string[] {
+function extractOutputModifiedPaths(outputText: string, canonicalRoot?: string): string[] {
   const paths: string[] = []
   for (const line of outputText.split("\n")) {
     const m = line.match(/^[AMD]\s+(.+)$/)
     if (m?.[1]) {
-      const norm = normalizeRepoPath(m[1])
+      const norm = cleanTrackedPath(m[1], canonicalRoot)
       if (norm) paths.push(norm)
     }
   }
@@ -538,6 +567,7 @@ function analyzeSessionData(params: {
   readonly sessionId: string
   readonly transcriptRelPath: string | null
   readonly archiveDir: string | undefined
+  readonly canonicalRoot: string | undefined
   readonly sessionOutcome: string | null
   readonly exportedFixture?: {
     readonly info: Record<string, unknown>
@@ -554,6 +584,7 @@ function analyzeSessionData(params: {
     sessionId,
     transcriptRelPath,
     archiveDir,
+    canonicalRoot,
     sessionOutcome,
     exportedFixture,
     hasMilestoneTable,
@@ -627,13 +658,13 @@ function analyzeSessionData(params: {
               : typeof input.filePath === "string"
                 ? input.filePath
                 : ""
-          const norm = normalizeRepoPath(p)
+          const norm = cleanTrackedPath(p, canonicalRoot)
           if (norm) touchedSet.add(norm)
         } else if (toolName === "patch") {
           if (typeof input.patchText === "string") {
-            for (const p of extractPatchPaths(input.patchText, archiveDir)) touchedSet.add(p)
+            for (const p of extractPatchPaths(input.patchText, archiveDir, canonicalRoot)) touchedSet.add(p)
           }
-          for (const p of extractOutputModifiedPaths(output)) touchedSet.add(p)
+          for (const p of extractOutputModifiedPaths(output, canonicalRoot)) touchedSet.add(p)
         } else if (toolName === "read") {
           const p =
             typeof input.path === "string"
@@ -641,10 +672,10 @@ function analyzeSessionData(params: {
               : typeof input.filePath === "string"
                 ? input.filePath
                 : ""
-          const norm = normalizeRepoPath(p)
+          const norm = cleanTrackedPath(p, canonicalRoot)
           if (norm) readSet.add(norm)
         } else if (toolName === "shell" || toolName === "execute") {
-          if (/1621 pass|zero failures|Freshness passes/i.test(output)) {
+          if (/\b\d+\s+pass\b[\s\S]*?\b0\s+fail\b|zero failures|Freshness passes/i.test(output)) {
             sawPassingTestGate = true
           }
           if (/0 tool parts in range, ~0 chars of output/i.test(output)) {
@@ -659,17 +690,6 @@ function analyzeSessionData(params: {
           ) {
             decisions.push(
               "Dual-plugin collision: archive.persist + context-prune collapsed 53 tool parts (~311,570 chars) into blind stubs",
-            )
-          }
-          const cmd = typeof input.command === "string" ? input.command : ""
-          if (cmd.includes("head -c 1600") && cmd.includes(".jsonl")) {
-            decisions.push(
-              "Ad-hoc shell scraping (msg[124]): head -c 1600 on raw session JSONL due to missing semantic read tool",
-            )
-          }
-          if (cmd.includes("python3 - <<'PY'") && cmd.includes("15000")) {
-            decisions.push(
-              "Inline Python JSONL dump (msg[125]): 15,000-char prompt slice cap dumping 5,915 chars of raw prompts into context",
             )
           }
         }
@@ -731,7 +751,7 @@ function analyzeSessionData(params: {
       .query("SELECT path, normalized_path FROM file_touch WHERE session_id = ? ORDER BY seq ASC")
       .all(sessionId) as { path: string; normalized_path: string | null }[]
     for (const t of touchRows) {
-      const norm = normalizeRepoPath(t.normalized_path ?? t.path)
+      const norm = cleanTrackedPath(t.normalized_path ?? t.path, canonicalRoot)
       if (norm) touchedSet.add(norm)
     }
   }
@@ -741,7 +761,7 @@ function analyzeSessionData(params: {
       .query("SELECT path FROM file_read_ledger WHERE session_id = ? ORDER BY read_seq ASC")
       .all(sessionId) as { path: string }[]
     for (const r of readRows) {
-      const norm = normalizeRepoPath(r.path)
+      const norm = cleanTrackedPath(r.path, canonicalRoot)
       if (norm) readSet.add(norm)
     }
   }
@@ -848,11 +868,10 @@ export function materializeSemanticDigests(
     options.archiveDir ??
     options.sourceArchiveDir ??
     (db.filename && db.filename !== ":memory:" ? dirname(db.filename) : undefined)
+  const canonicalRoot =
+    options.canonicalRoot ?? (archiveDir ? dirname(archiveDir) : undefined)
   const exportedPaths = options.exportJsonPaths ?? options.exportedFixturePaths ?? []
-  const shouldSinkBlobsToDisk =
-    Boolean(archiveDir) &&
-    archiveDir !== DEFAULT_SOURCE_ARCHIVE_DIR &&
-    existsSync(archiveDir!)
+  const shouldSinkBlobsToDisk = Boolean(archiveDir) && existsSync(archiveDir!)
 
   const exportedBySessionId = new Map<
     string,
@@ -1002,6 +1021,7 @@ export function materializeSemanticDigests(
         sessionId: s.id,
         transcriptRelPath: s.transcript_path,
         archiveDir,
+        canonicalRoot,
         sessionOutcome: s.outcome,
         exportedFixture: exported,
         hasMilestoneTable,
@@ -1024,7 +1044,7 @@ export function materializeSemanticDigests(
         })
         prevPromptSeq = p.seq
 
-        const sha = sha256hex(p.text)
+        const sha = sha256Hex(p.text)
         const blobRef = `blob:${sha}`
         if (shouldSinkBlobsToDisk && archiveDir) {
           const blobsDir = join(archiveDir, "blobs")
@@ -1142,15 +1162,13 @@ export function materializeSemanticDigests(
   }
 }
 
-export function buildSemanticDigestIndex(options: BuildIndexOptions = {}): {
+export function buildSemanticDigestIndex(options: BuildIndexOptions): {
   readonly dbPath: string
   readonly sessionsIndexed: number
   readonly intentPivotsIndexed: number
   readonly ftsRowsIndexed: number
 } {
-  const sourceArchiveDir = options.sourceArchiveDir ?? DEFAULT_SOURCE_ARCHIVE_DIR
-  const targetDbPath = options.targetDbPath ?? DEFAULT_TARGET_DB_PATH
-  const exportedPaths = options.exportedFixturePaths ?? DEFAULT_EXPORTED_FIXTURES
+  const { sourceArchiveDir, targetDbPath, exportedFixturePaths = [] } = options
 
   mkdirSync(dirname(targetDbPath), { recursive: true })
   for (const suffix of ["", "-wal", "-shm"]) {
@@ -1163,7 +1181,7 @@ export function buildSemanticDigestIndex(options: BuildIndexOptions = {}): {
   db.exec("PRAGMA journal_mode = WAL")
   const report = materializeSemanticDigests(db, {
     archiveDir: sourceArchiveDir,
-    exportJsonPaths: exportedPaths,
+    exportJsonPaths: exportedFixturePaths,
   })
   db.exec("PRAGMA wal_checkpoint(TRUNCATE)")
   db.close()
@@ -1188,7 +1206,7 @@ export function tokenizeVibeQuery(queryText: string): string[] {
 export function resolvePromptBlob(
   db: Database,
   blobRef: string,
-  archiveDir = DEFAULT_SOURCE_ARCHIVE_DIR,
+  archiveDir?: string,
 ): string | null {
   const normalized = blobRef.startsWith("blob:") ? blobRef : `blob:${blobRef}`
   if (hasTable(db, "substrate_fts")) {
@@ -1202,8 +1220,10 @@ export function resolvePromptBlob(
     }
   }
   const sha = normalized.slice("blob:".length)
-  if (archiveDir) {
-    const file = join(archiveDir, "blobs", `${sha}.txt`)
+  const effectiveArchiveDir =
+    archiveDir ?? (db.filename && db.filename !== ":memory:" ? dirname(db.filename) : undefined)
+  if (effectiveArchiveDir) {
+    const file = join(effectiveArchiveDir, "blobs", `${sha}.txt`)
     if (existsSync(file)) return readFileSync(file, "utf8")
   }
   return null
@@ -1256,6 +1276,7 @@ interface PreparedNavQueries {
   readonly ftsStmt: ReturnType<Database["query"]>
   readonly digestStmt: ReturnType<Database["query"]>
   readonly allRootDigestsStmt: ReturnType<Database["query"]>
+  readonly totalDigestsStmt: ReturnType<Database["query"]>
   readonly pivotsStmt: ReturnType<Database["query"]>
   readonly delegationsStmt: ReturnType<Database["query"]>
   readonly delegationTurnsStmt: ReturnType<Database["query"]> | null
@@ -1267,9 +1288,9 @@ function getPreparedNavQueries(db: Database): PreparedNavQueries {
     const hasTurns = hasTable(db, "delegation_turn")
     cached = {
       ftsStmt: db.query(
-        `SELECT f.session_id, s.root_id, s.depth, f.kind, substr(f.symbol_or_path, 1, 240) as sym, substr(f.body, 1, 600) as snippet, bm25(substrate_fts) as rank
+        `SELECT f.session_id, COALESCE(s.root_id, f.session_id) as root_id, COALESCE(s.depth, 0) as depth, f.kind, substr(f.symbol_or_path, 1, 240) as sym, substr(f.body, 1, 600) as snippet, bm25(substrate_fts) as rank
          FROM substrate_fts f
-         JOIN session s ON s.id = f.session_id
+         LEFT JOIN session s ON s.id = f.session_id
          WHERE substrate_fts MATCH ?
          ORDER BY rank
          LIMIT 50`,
@@ -1282,6 +1303,7 @@ function getPreparedNavQueries(db: Database): PreparedNavQueries {
          WHERE COALESCE(s.depth, 0) = 0
          ORDER BY COALESCE(s.t_updated, s.t_created, 0) DESC, d.session_id ASC`,
       ),
+      totalDigestsStmt: db.query("SELECT COUNT(*) as c FROM session_semantic_digest"),
       pivotsStmt: db.query(
         "SELECT seq, message_id, t, prompt_excerpt, blob_ref, pivot_kind FROM intent_pivot WHERE session_id = ? ORDER BY seq ASC LIMIT ?",
       ),
@@ -1320,6 +1342,9 @@ export function queryVibeNavigation(
   queryOrOptions: string | (VibeNavigationOptions & { readonly query: string }),
   maybeOptions: VibeNavigationOptions = {},
 ): VibeNavigationResult {
+  const t0Ns = Bun.nanoseconds()
+  ensureSemanticDigestSchema(db)
+
   const queryText = typeof queryOrOptions === "string" ? queryOrOptions : queryOrOptions.query
   const options: VibeNavigationOptions =
     typeof queryOrOptions === "string" ? maybeOptions : queryOrOptions
@@ -1335,10 +1360,15 @@ export function queryVibeNavigation(
     ftsStmt,
     digestStmt,
     allRootDigestsStmt,
+    totalDigestsStmt,
     pivotsStmt,
     delegationsStmt,
     delegationTurnsStmt,
   } = getPreparedNavQueries(db)
+
+  const allRootDigests = allRootDigestsStmt.all() as SessionSemanticDigestRow[]
+  const totalDigestCount = (totalDigestsStmt.get() as { c: number } | null)?.c ?? 0
+  const totalRootSessions = allRootDigests.length > 0 ? allRootDigests.length : totalDigestCount
 
   const tokens = tokenizeVibeQuery(queryText)
   const queryTokenCount = Math.max(1, tokens.length)
@@ -1364,6 +1394,7 @@ export function queryVibeNavigation(
       bestSingleRowMatchCount: number
       bestRowKindWeight: number
       bm25Sum: number
+      bestBm25: number
     }
   >()
 
@@ -1373,6 +1404,7 @@ export function queryVibeNavigation(
       bestSingleRowMatchCount: 0,
       bestRowKindWeight: 0,
       bm25Sum: 0,
+      bestBm25: 0,
     }
     const textLower = `${hit.sym} ${hit.snippet}`.toLowerCase()
     const kindWeight =
@@ -1399,72 +1431,138 @@ export function queryVibeNavigation(
       entry.bestSingleRowMatchCount = rowMatches
       entry.bestRowKindWeight = kindWeight
     }
-    entry.bm25Sum = Math.min(20, entry.bm25Sum + Math.min(3, Math.abs(hit.rank)))
+    const rawBm25 = Math.abs(hit.rank)
+    if (rawBm25 > entry.bestBm25) {
+      entry.bestBm25 = rawBm25
+    }
+    entry.bm25Sum = Math.min(20, entry.bm25Sum + Math.min(3, rawBm25))
     rootStats.set(hit.root_id, entry)
   }
 
   const scoredRoots: {
     readonly rootId: string
     readonly score: number
+    readonly bestBm25: number
     readonly matchedTokenCount: number
     readonly tokenCoverage: number
   }[] = []
 
   for (const [rootId, st] of rootStats.entries()) {
     const matchedTokenCount = st.matchedTokens.size
+    if (matchedTokenCount === 0) continue
     const tokenCoverage = Number((matchedTokenCount / queryTokenCount).toFixed(4))
     const total =
       matchedTokenCount * 30 +
       st.bestSingleRowMatchCount * 20 +
       st.bestRowKindWeight * 5 +
-      st.bm25Sum +
-      (rootId === "ses_eb23bfbf0ffesn5kT0yJI06h35" ? 0.5 : 0)
+      st.bm25Sum
     scoredRoots.push({
       rootId,
       score: Number(total.toFixed(2)),
+      bestBm25: Number(st.bestBm25.toFixed(2)),
       matchedTokenCount,
       tokenCoverage,
     })
   }
 
-  scoredRoots.sort((a, b) => b.score - a.score || b.tokenCoverage - a.tokenCoverage)
-
-  let bestRootId = scoredRoots[0]?.rootId ?? options.sessionID ?? null
-  let bestScore = scoredRoots[0]?.score ?? 0
-  let bestMatchedTokens = scoredRoots[0]?.matchedTokenCount ?? 0
-  let bestCoverage = scoredRoots[0]?.tokenCoverage ?? 0
-
-  let rootDigest = bestRootId ? (digestStmt.get(bestRootId) as SessionSemanticDigestRow | null) : null
-  if (!rootDigest) {
-    const allRoots = allRootDigestsStmt.all() as SessionSemanticDigestRow[]
-    rootDigest =
-      allRoots.find((r) => r.session_id === "ses_eb23bfbf0ffesn5kT0yJI06h35") ?? allRoots[0] ?? null
-    if (!rootDigest) {
-      throw new Error(`session_semantic_digest has no indexed root sessions`)
-    }
-    bestRootId = rootDigest.session_id
-  }
+  scoredRoots.sort((a, b) => b.score - a.score || b.tokenCoverage - a.tokenCoverage || b.bestBm25 - a.bestBm25)
 
   const candidates: VibeNavigationCandidate[] = scoredRoots
     .slice(0, candidateLimit)
     .flatMap((sr) => {
-      const d =
-        sr.rootId === rootDigest!.session_id
-          ? rootDigest!
-          : (digestStmt.get(sr.rootId) as SessionSemanticDigestRow | null)
+      const d = digestStmt.get(sr.rootId) as SessionSemanticDigestRow | null
       if (!d) return []
+      let pivotsCount = 0
+      try {
+        pivotsCount = (JSON.parse(d.intent_pivots_json) as unknown[]).length
+      } catch {}
+      const delRows = delegationsStmt.all(d.session_id, 20) as unknown[]
       return [
         {
+          sessionId: d.session_id,
           session_id: d.session_id,
           headline: d.headline,
+          verificationState: d.verification_state,
           verification_state: d.verification_state,
           score: sr.score,
+          combinedScore: sr.score,
+          bestBm25: sr.bestBm25,
+          matchedTokenCount: sr.matchedTokenCount,
           matched_token_count: sr.matchedTokenCount,
+          queryTokenCount,
           query_token_count: queryTokenCount,
+          tokenCoverage: sr.tokenCoverage,
           token_coverage: sr.tokenCoverage,
+          pivotsCount,
+          delegationsCount: delRows.length,
         },
       ]
     })
+
+  if (candidates.length === 0) {
+    const elapsedMs = (Bun.nanoseconds() - t0Ns) / 1_000_000
+    const bodyLines = [
+      `## Vibe Navigation Digest · \`0\` matches`,
+      `_Indexed root sessions: ${totalRootSessions} | Matched: 0 | Query tokens: [${tokens.join(", ")}] (${elapsedMs.toFixed(2)} ms)_`,
+      "",
+      `No matching sessions found for query "${queryText}" across ${totalRootSessions} indexed root session(s).`,
+    ]
+    const bodyText = bodyLines.join("\n")
+    const prelimFooter = `_Strategist Viewport search (000 tokens, ${elapsedMs.toFixed(2)} ms | matched 0 of ${totalRootSessions} indexed root session(s))._`
+    const prelimTokens = estimateTokens(`${bodyText}\n\n${prelimFooter}`)
+    const finalFooter = `_Strategist Viewport search (${prelimTokens} tokens, ${elapsedMs.toFixed(2)} ms | matched 0 of ${totalRootSessions} indexed root session(s))._`
+    const markdown = `${bodyText}\n\n${finalFooter}`
+    const markdownTokens = estimateTokens(markdown)
+    const emptyDigest: VibeNavigationDigest = {
+      query: queryText,
+      total_root_sessions: totalRootSessions,
+      matched_count: 0,
+      matched_root: null,
+      intent_pivots: [],
+      delegations: [],
+      touched_files: [],
+      key_decisions: [],
+    }
+    const jsonStr = JSON.stringify(emptyDigest)
+    return {
+      digest: emptyDigest,
+      markdown,
+      matchedRootSessionID: "",
+      session_id: "",
+      headline: "",
+      verificationState: "in_progress_or_unverified",
+      score: 0,
+      bestBm25: 0,
+      matchedTokenCount: 0,
+      queryTokenCount,
+      tokenCoverage: 0,
+      tokenCount: markdownTokens,
+      estimatedTokens: markdownTokens,
+      totalRootSessions,
+      matchedSessions: [],
+      candidates: [],
+      metrics: {
+        markdown_chars: markdown.length,
+        markdown_tokens: markdownTokens,
+        json_chars: jsonStr.length,
+        json_tokens: estimateTokens(jsonStr),
+        fts_hits: ftsHits.length,
+        pivots_returned: 0,
+        delegations_returned: 0,
+        total_root_sessions: totalRootSessions,
+        matched_root_sessions: 0,
+        elapsed_ms: Number(elapsedMs.toFixed(3)),
+      },
+    }
+  }
+
+  const primaryHit = candidates[0]!
+  const bestRootId = primaryHit.session_id
+  const bestScore = primaryHit.score
+  const bestBm25 = primaryHit.bestBm25
+  const bestMatchedTokens = primaryHit.matchedTokenCount
+  const bestCoverage = primaryHit.tokenCoverage
+  const rootDigest = digestStmt.get(bestRootId) as SessionSemanticDigestRow
 
   const pivots = pivotsStmt.all(bestRootId, maxPivots) as {
     seq: number
@@ -1543,11 +1641,24 @@ export function queryVibeNavigation(
     }
   }
 
-  const renderMarkdownWithLimit = (pivotCharCap: number, maxPivotsSlice: number): string => {
+  const elapsedMs = (Bun.nanoseconds() - t0Ns) / 1_000_000
+
+  const renderMarkdownWithLimit = (pivotCharCap: number, maxPivotsSlice: number, maxHitsSlice: number): string => {
     const slicedPivots = pivots.slice(0, maxPivotsSlice)
+    const slicedHits = candidates.slice(0, maxHitsSlice)
     const mdLines: string[] = [
       `## Vibe Navigation Digest · \`${bestRootId}\``,
-      `**Headline:** ${rootDigest!.headline} | **Gate:** \`${rootDigest!.verification_state}\``,
+      `_Indexed root sessions: ${totalRootSessions} | Matched: ${candidates.length} | Query tokens: [${tokens.join(", ")}] (${elapsedMs.toFixed(2)} ms)_`,
+      `**Headline:** ${rootDigest.headline} | **Gate:** \`${rootDigest.verification_state}\``,
+      `- **Score:** coverage=${primaryHit.matchedTokenCount}/${primaryHit.queryTokenCount} (${Math.round(primaryHit.tokenCoverage * 100)}%) | bm25=${primaryHit.bestBm25.toFixed(2)} | score=${primaryHit.combinedScore.toFixed(2)} | pivots=${primaryHit.pivotsCount} | delegations=${primaryHit.delegationsCount}`,
+      ...(slicedHits.length > 1
+        ? [
+            ...slicedHits.slice(1).map(
+              (hit) =>
+                `- **Alt \`${hit.sessionId}\`:** coverage=${hit.matchedTokenCount}/${hit.queryTokenCount} (${Math.round(hit.tokenCoverage * 100)}%) | bm25=${hit.bestBm25.toFixed(2)} | score=${hit.combinedScore.toFixed(2)}`,
+            ),
+          ]
+        : []),
       "",
       `### Intent Pivots (${slicedPivots.length})`,
       ...slicedPivots.map(
@@ -1565,28 +1676,23 @@ export function queryVibeNavigation(
       `- **Files:** ${touchedFiles.map((f) => `\`${f}\``).join(", ") || "none"}`,
       ...(keyDecisions.length > 0 ? keyDecisions.map((k) => `- **Note:** ${cleanExcerpt(k, 68)}`) : []),
     ]
-    const footerLine = `> **vs S2 \`msg[124..125]\`:** Replaced 2 shell/Python JSONL scrapes (\`15,000\`-char cap / \`~3,750\` tok) with 1 SQLite FTS5 query.`
-    return `${mdLines.join("\n")}\n\n${footerLine}`
+    const body = mdLines.join("\n")
+    const prelimFooter = `_Strategist Viewport search (000 tokens, ${elapsedMs.toFixed(2)} ms | matched ${candidates.length} of ${totalRootSessions} indexed root session(s))._`
+    const tokEst = estimateTokens(`${body}\n\n${prelimFooter}`)
+    const footerLine = `_Strategist Viewport search (${tokEst} tokens, ${elapsedMs.toFixed(2)} ms | matched ${candidates.length} of ${totalRootSessions} indexed root session(s))._`
+    return `${body}\n\n${footerLine}`
   }
 
-  let markdown = renderMarkdownWithLimit(46, pivots.length)
+  let markdown = renderMarkdownWithLimit(44, pivots.length, Math.min(candidates.length, 3))
   if (estimateTokens(markdown) >= maxTokens) {
-    markdown = renderMarkdownWithLimit(28, pivots.length)
+    markdown = renderMarkdownWithLimit(28, pivots.length, 1)
   }
   if (estimateTokens(markdown) >= maxTokens) {
-    markdown = renderMarkdownWithLimit(24, Math.max(1, Math.min(pivots.length, 5)))
+    markdown = renderMarkdownWithLimit(24, Math.max(1, Math.min(pivots.length, 5)), 1)
   }
-
-  const legacyRawJsonlCapChars = 15000
-  const legacyShellDumpChars = 11057
-  const legacyMsg124And125TotalChars = 30331
-  const legacyEstimatedTokens = Math.ceil(legacyRawJsonlCapChars / 4)
 
   const markdownChars = markdown.length
   const markdownTokens = estimateTokens(markdown)
-  const reductionPct = Number(
-    (((legacyEstimatedTokens - markdownTokens) / legacyEstimatedTokens) * 100).toFixed(1),
-  )
 
   const buildDigestWithCap = (
     pivotExcerptCap: number,
@@ -1596,11 +1702,14 @@ export function queryVibeNavigation(
     delegationCount: number,
   ): VibeNavigationDigest => ({
     query: queryText,
+    total_root_sessions: totalRootSessions,
+    matched_count: candidates.length,
     matched_root: {
-      session_id: bestRootId!,
-      headline: rootDigest!.headline,
-      verification_state: rootDigest!.verification_state,
+      session_id: bestRootId,
+      headline: rootDigest.headline,
+      verification_state: rootDigest.verification_state,
       score: Number(bestScore.toFixed(2)),
+      best_bm25: bestBm25,
       matched_token_count: bestMatchedTokens,
       query_token_count: queryTokenCount,
       token_coverage: bestCoverage,
@@ -1614,16 +1723,6 @@ export function queryVibeNavigation(
     delegations: compactDelegations.slice(0, delegationCount),
     touched_files: touchedFiles.slice(0, touchedFilesCount),
     key_decisions: keyDecisions.slice(0, decisionCount).map((k) => cleanExcerpt(k, decisionCap)),
-    vs_s2_msg124_125_failure: {
-      legacy_shell_calls: 2,
-      legacy_raw_jsonl_cap_chars: legacyRawJsonlCapChars,
-      legacy_shell_dump_chars: legacyShellDumpChars,
-      legacy_msg124_125_total_chars: legacyMsg124And125TotalChars,
-      legacy_estimated_tokens: legacyEstimatedTokens,
-      digest_chars: markdownChars,
-      digest_estimated_tokens: markdownTokens,
-      token_reduction_pct: reductionPct,
-    },
   })
 
   let digest = buildDigestWithCap(18, 32, Math.min(1, keyDecisions.length), Math.min(4, touchedFiles.length), compactDelegations.length)
@@ -1640,16 +1739,19 @@ export function queryVibeNavigation(
   return {
     digest,
     markdown,
-    matchedRootSessionID: bestRootId!,
-    session_id: bestRootId!,
+    matchedRootSessionID: bestRootId,
+    session_id: bestRootId,
     headline: rootDigest.headline,
     verificationState: rootDigest.verification_state,
     score: Number(bestScore.toFixed(2)),
+    bestBm25,
     matchedTokenCount: bestMatchedTokens,
     queryTokenCount,
     tokenCoverage: bestCoverage,
     tokenCount: markdownTokens,
     estimatedTokens: markdownTokens,
+    totalRootSessions,
+    matchedSessions: candidates,
     candidates,
     metrics: {
       markdown_chars: markdownChars,
@@ -1659,6 +1761,9 @@ export function queryVibeNavigation(
       fts_hits: ftsHits.length,
       pivots_returned: pivots.length,
       delegations_returned: compactDelegations.length,
+      total_root_sessions: totalRootSessions,
+      matched_root_sessions: candidates.length,
+      elapsed_ms: Number(elapsedMs.toFixed(3)),
     },
   }
 }
@@ -1704,7 +1809,7 @@ export function runSevenSampleBenchmark(
       max_ms: Number(sorted[sorted.length - 1]!.toFixed(3)),
       markdown_tokens: res.metrics.markdown_tokens,
       json_tokens: res.metrics.json_tokens,
-      matched_root: res.digest.matched_root.session_id,
+      matched_root: res.digest.matched_root?.session_id ?? "",
       limiter:
         "SQLite FTS5 BM25 inverted-index scan + 3 B-tree point lookups in-process (CPU-bound in bun:sqlite)",
     }

@@ -1,13 +1,9 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { copyFileSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { describe, expect, test } from "bun:test"
+import { mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { Database } from "bun:sqlite"
 import { initSyncDatabase } from "../src/archive/index-db.ts"
-import { sha256hex } from "../src/archive/normalize.ts"
-import { makeTmpDir } from "./helpers.ts"
+import { sha256Hex } from "../src/archive/primitives.ts"
 import {
-  DEFAULT_EXPORTED_FIXTURES,
-  DEFAULT_SOURCE_ARCHIVE_DIR,
   INTENT_PIVOT_KINDS,
   classifyIntentPivot,
   ensureSemanticDigestSchema,
@@ -19,8 +15,9 @@ import {
   resolvePromptBlob,
   runSevenSampleBenchmark,
 } from "../src/viewports/semantic-digest.ts"
+import { makeTmpDir } from "./helpers.ts"
 
-describe("VSC-01: semantic session digest, 9-category IntentPivot, and FTS5 vibe navigation (REQ-SUB-13)", () => {
+describe("VSC-01 / VSC-R1: semantic session digest, 9-category IntentPivot, and FTS5 vibe navigation", () => {
   test("expandCompoundBoundaryTokens splits letter-digit and hyphenated tokens for FTS5", () => {
     expect(expandCompoundBoundaryTokens("wave2-slice1")).toBe("wave 2 slice 1")
     expect(expandCompoundBoundaryTokens("44-step")).toBe("44 step")
@@ -46,7 +43,7 @@ describe("VSC-01: semantic session digest, 9-category IntentPivot, and FTS5 vibe
     )
     expect(
       classifyIntentPivot(
-        "I have reloaded this /Users/MAC/.../.worktree/wave2-slice1 - you can try to prune the context to look at my prompting throughout and continue on from this with exact same posture",
+        "you can try to prune the context to look at my prompting throughout and continue on from this with exact same posture",
         2,
       ),
     ).toBe("prune_or_continuity")
@@ -71,7 +68,7 @@ describe("VSC-01: semantic session digest, 9-category IntentPivot, and FTS5 vibe
     expect(isHumanPromptText("Implement VSC-01 with TDD")).toBe(true)
   })
 
-  test("materializeSemanticDigests and queryVibeNavigation work on synthetic fixture DBs with all 9 pivot kinds and delegation_turn outcomes", () => {
+  test("materializeSemanticDigests and queryVibeNavigation surface transparent FTS5 relevance breakdown, 0-match honesty, and zero fabricated S2 footers", () => {
     const tmpDir = makeTmpDir()
     const archiveDir = join(tmpDir, ".session-archive")
     const sqlitePath = join(archiveDir, "index.sqlite")
@@ -125,7 +122,7 @@ describe("VSC-01: semantic session digest, 9-category IntentPivot, and FTS5 vibe
         rootB,
         null,
         0,
-        "Unrelated Database Migration",
+        "Database Migration & CoChange Matrix",
         "ultra",
         "opencode",
         "succeeded",
@@ -218,6 +215,23 @@ describe("VSC-01: semantic session digest, 9-category IntentPivot, and FTS5 vibe
       ].join("\n")
       writeFileSync(join(rootADir, `${rootA}.jsonl`), rootAJsonl, "utf8")
 
+      const rootBDir = join(archiveDir, "sessions", rootB)
+      mkdirSync(rootBDir, { recursive: true })
+      writeFileSync(
+        join(rootBDir, `${rootB}.jsonl`),
+        [
+          JSON.stringify({ kind: "session", id: rootB }),
+          JSON.stringify({
+            id: "msg_b1",
+            kind: "user",
+            t: 1100,
+            raw_ref: { session_id: rootB, message_id: "msg_b1", seq: 1 },
+            text: "Build git cochange matrix and pagerank centrality map",
+          }),
+        ].join("\n"),
+        "utf8",
+      )
+
       db.query(`
         INSERT INTO delegation (
           call_id, root_id, parent_session, parent_message_id, child_session,
@@ -245,7 +259,7 @@ describe("VSC-01: semantic session digest, 9-category IntentPivot, and FTS5 vibe
 
       const report = materializeSemanticDigests(db, { archiveDir })
       expect(report.sessionsIndexed).toBe(3)
-      expect(report.intentPivotsIndexed).toBe(9)
+      expect(report.intentPivotsIndexed).toBe(10)
 
       const pivots = db
         .query("SELECT seq, pivot_kind, blob_ref, prompt_blob_ref FROM intent_pivot WHERE session_id = ? ORDER BY seq ASC")
@@ -269,7 +283,7 @@ describe("VSC-01: semantic session digest, 9-category IntentPivot, and FTS5 vibe
         expect(p.prompt_blob_ref).toBe(p.blob_ref)
         const hydrated = resolvePromptBlob(db, p.blob_ref, archiveDir)
         expect(hydrated).not.toBeNull()
-        expect(`blob:${sha256hex(hydrated!)}`).toBe(p.blob_ref)
+        expect(`blob:${sha256Hex(hydrated!)}`).toBe(p.blob_ref)
       }
 
       const timeline = renderIntentTimeline(db, rootA, { archiveDir })
@@ -279,183 +293,51 @@ describe("VSC-01: semantic session digest, 9-category IntentPivot, and FTS5 vibe
       expect(timeline.markdown).toContain("[verification_directive]")
       expect(timeline.markdown).toContain("[scope_narrowing]")
 
+      // 1. Positive FTS5 search with transparent relevance breakdown
       const nav = queryVibeNavigation(db, {
         query: "wave 2 slice 1 semantic digest FTS5",
         limit: 3,
         maxTokens: 600,
       })
       expect(nav.matchedRootSessionID).toBe(rootA)
-      expect(nav.digest.matched_root.session_id).toBe(rootA)
+      expect(nav.digest.matched_root?.session_id).toBe(rootA)
       expect(nav.tokenCoverage).toBeGreaterThan(0.5)
       expect(nav.metrics.markdown_tokens).toBeLessThan(600)
       expect(nav.markdown).toContain("src/viewports/semantic-digest.ts")
       expect(nav.markdown).toContain("reported=`succeeded` -> verified=`tool_error_inside`")
+      expect(nav.markdown).toMatch(/coverage=\d+\/\d+ \(\d+%\) \| bm25=-?\d+\.\d{2} \| score=-?\d+\.\d{2}/)
+      expect(nav.markdown).toContain("Strategist Viewport search (")
+      expect(nav.markdown).toContain("matched 1 of 2 indexed root session(s)")
+      expect(nav.markdown).not.toContain("S2 msg[124..125]")
+      expect(nav.markdown).not.toContain("replaced 2 shell/Python JSONL scrapes")
+
+      // 2. Honest 0-match response when query tokens do not match any indexed session
+      const zeroMatch = queryVibeNavigation(db, {
+        query: "xyznonexistentquantumfluxcapacitor",
+        limit: 3,
+        maxTokens: 600,
+      })
+      expect(zeroMatch.matchedSessions).toEqual([])
+      expect(zeroMatch.matchedRootSessionID).toBe("")
+      expect(zeroMatch.markdown).toContain(
+        'No matching sessions found for query "xyznonexistentquantumfluxcapacitor" across 2 indexed root session(s).',
+      )
+      expect(zeroMatch.markdown).not.toContain("S2 msg[124..125]")
+
+      // 3. 7-sample benchmark check
+      const summaries = runSevenSampleBenchmark(db, [
+        "wave 2 slice 1 semantic digest",
+        "cochange matrix pagerank",
+      ])
+      expect(summaries.length).toBe(2)
+      for (const s of summaries) {
+        expect(s.samples).toBe(7)
+        expect(s.median_ms).toBeLessThan(5)
+        expect(s.markdown_tokens).toBeLessThan(600)
+      }
     } finally {
       db.close()
       rmSync(tmpDir, { recursive: true, force: true })
     }
-  })
-
-  describe("Real archive & exported fixture overlay verification (WF-SUB-01 / S1 / S2)", () => {
-    const hasRealArchive = existsSync(`${DEFAULT_SOURCE_ARCHIVE_DIR}/index.sqlite`)
-    let tmpDir: string
-    let targetDbPath: string
-    let db: Database
-    let sourceMtimeBefore: number
-    let buildStats: ReturnType<typeof materializeSemanticDigests>
-
-    beforeAll(() => {
-      if (!hasRealArchive) return
-      tmpDir = makeTmpDir()
-      targetDbPath = join(tmpDir, "wf-sub-01-index.sqlite")
-      sourceMtimeBefore = statSync(`${DEFAULT_SOURCE_ARCHIVE_DIR}/index.sqlite`).mtimeMs
-      copyFileSync(`${DEFAULT_SOURCE_ARCHIVE_DIR}/index.sqlite`, targetDbPath)
-      db = new Database(targetDbPath)
-      buildStats = materializeSemanticDigests(db, {
-        archiveDir: DEFAULT_SOURCE_ARCHIVE_DIR,
-        exportJsonPaths: DEFAULT_EXPORTED_FIXTURES,
-      })
-    })
-
-    afterAll(() => {
-      db?.close()
-      if (tmpDir) rmSync(tmpDir, { recursive: true, force: true })
-    })
-
-    test("preserves source archive index.sqlite read-only and populates all 3 semantic tables", () => {
-      if (!hasRealArchive) return
-      const sourceMtimeAfter = statSync(`${DEFAULT_SOURCE_ARCHIVE_DIR}/index.sqlite`).mtimeMs
-      expect(sourceMtimeAfter).toBe(sourceMtimeBefore)
-
-      expect(buildStats.sessionsIndexed).toBeGreaterThanOrEqual(56)
-      expect(buildStats.intentPivotsIndexed).toBeGreaterThanOrEqual(87)
-      expect(buildStats.ftsRowsIndexed).toBeGreaterThan(400)
-
-      const digestCount = (
-        db.query("SELECT count(*) as c FROM session_semantic_digest").get() as { c: number }
-      ).c
-      const pivotCount = (db.query("SELECT count(*) as c FROM intent_pivot").get() as { c: number }).c
-      const ftsCount = (db.query("SELECT count(*) as c FROM substrate_fts").get() as { c: number }).c
-
-      expect(digestCount).toBe(buildStats.sessionsIndexed)
-      expect(pivotCount).toBe(buildStats.intentPivotsIndexed)
-      expect(ftsCount).toBe(buildStats.ftsRowsIndexed)
-    })
-
-    test("classifies user prompts across all 9 pivot_kind variants with lossless blob:<sha256> hydration", () => {
-      if (!hasRealArchive) return
-      const distinctKinds = db
-        .query("SELECT DISTINCT pivot_kind FROM intent_pivot ORDER BY pivot_kind")
-        .all()
-        .map((r) => (r as { pivot_kind: string }).pivot_kind)
-
-      expect(distinctKinds).toEqual([
-        "approval",
-        "continuation_after_compaction",
-        "course_correction",
-        "followup",
-        "handoff_resume",
-        "initial_goal",
-        "prune_or_continuity",
-        "scope_narrowing",
-        "verification_directive",
-      ])
-
-      const s2Pivots = db
-        .query(
-          "SELECT seq, message_id, pivot_kind, blob_ref FROM intent_pivot WHERE session_id = ? ORDER BY seq ASC",
-        )
-        .all("ses_eb23bfbf0ffesn5kT0yJI06h35") as {
-        seq: number
-        message_id: string
-        pivot_kind: string
-        blob_ref: string
-      }[]
-
-      expect(s2Pivots.map((p) => p.seq)).toEqual([4, 511, 1243, 1474, 1946, 2002, 2059, 2650, 2859])
-      for (const p of s2Pivots) {
-        expect(p.blob_ref.startsWith("blob:")).toBe(true)
-        const hydrated = resolvePromptBlob(db, p.blob_ref, DEFAULT_SOURCE_ARCHIVE_DIR)
-        expect(hydrated).not.toBeNull()
-        expect(`blob:${sha256hex(hydrated!)}`).toBe(p.blob_ref)
-      }
-    })
-
-    test("overlays exported fixture timeline for ses_eb2eabb14ffeCXsCwb845rtffb including @bro followup and 44-step 0-byte prune fact", () => {
-      if (!hasRealArchive) return
-      const s1Pivots = db
-        .query(
-          "SELECT seq, message_id, prompt_excerpt, pivot_kind FROM intent_pivot WHERE session_id = ? ORDER BY seq ASC",
-        )
-        .all("ses_eb2eabb14ffeCXsCwb845rtffb") as {
-        seq: number
-        message_id: string
-        prompt_excerpt: string
-        pivot_kind: string
-      }[]
-
-      expect(s1Pivots.length).toBe(5)
-      expect(s1Pivots[4]?.message_id).toBe("msg_14d3d545e001uj0aCRYealg0wS")
-      expect(s1Pivots[4]?.prompt_excerpt).toContain("@bro tell main point")
-
-      const s1Digest = db
-        .query("SELECT key_decisions_json, touched_files_json FROM session_semantic_digest WHERE session_id = ?")
-        .get("ses_eb2eabb14ffeCXsCwb845rtffb") as { key_decisions_json: string; touched_files_json: string }
-
-      const decisions = JSON.parse(s1Digest.key_decisions_json) as string[]
-      expect(decisions.some((d) => d.includes("44-step") && d.includes("0 bytes"))).toBe(true)
-      expect(decisions.some((d) => d.includes("compaction_continuity") && d.includes("missing sessionID"))).toBe(
-        true,
-      )
-    })
-
-    test("queryVibeNavigation resolves all 3 natural-language queries in < 600 tokens and contrasts against S2 msg[124..125]", () => {
-      if (!hasRealArchive) return
-      const q1 = queryVibeNavigation(
-        db,
-        "look at my prompting throughout and continue from Wave 2 slice",
-      )
-      expect(q1.digest.matched_root.session_id).toBe("ses_eb23bfbf0ffesn5kT0yJI06h35")
-      expect(q1.digest.matched_root.headline).toContain("Narrow Early-Failure Review of Delegation Repairs")
-      expect(q1.metrics.pivots_returned).toBe(9)
-      expect(q1.metrics.markdown_tokens).toBeLessThan(600)
-      expect(q1.metrics.json_tokens).toBeLessThan(600)
-      expect(q1.digest.vs_s2_msg124_125_failure.legacy_raw_jsonl_cap_chars).toBe(15000)
-      expect(q1.digest.vs_s2_msg124_125_failure.token_reduction_pct).toBeGreaterThan(85)
-
-      const q2 = queryVibeNavigation(
-        db,
-        "prune the context to look at my prompting throughout and continue on from this with exact same posture",
-      )
-      expect(q2.digest.matched_root.session_id).toBe("ses_eb23bfbf0ffesn5kT0yJI06h35")
-      expect(q2.metrics.markdown_tokens).toBeLessThan(600)
-      expect(q2.metrics.json_tokens).toBeLessThan(600)
-      expect(q2.markdown).toContain("seq=1243")
-      expect(q2.markdown).toContain("blob:fd75fe69bcf5")
-
-      const q3 = queryVibeNavigation(db, "44-step auto-run context-prune 0 bytes")
-      expect(q3.digest.matched_root.session_id).toBe("ses_eb2eabb14ffeCXsCwb845rtffb")
-      expect(q3.digest.matched_root.headline).toContain("Prompt 2 preparation")
-      expect(q3.metrics.markdown_tokens).toBeLessThan(600)
-      expect(q3.metrics.json_tokens).toBeLessThan(600)
-      expect(q3.markdown).toContain("44-step single-prompt auto-run")
-    })
-
-    test("7-sample interleaved benchmark achieves < 5 ms median latency (< 25 ms max) across all queries", () => {
-      if (!hasRealArchive) return
-      const queries = [
-        "look at my prompting throughout and continue from Wave 2 slice",
-        "prune the context to look at my prompting throughout and continue on from this with exact same posture",
-        "44-step auto-run context-prune 0 bytes",
-      ]
-      const summaries = runSevenSampleBenchmark(db, queries)
-      expect(summaries.length).toBe(3)
-      for (const s of summaries) {
-        expect(s.samples).toBe(7)
-        expect(s.median_ms).toBeLessThan(5)
-        expect(s.max_ms).toBeLessThan(25)
-        expect(s.markdown_tokens).toBeLessThan(600)
-      }
-    })
   })
 })

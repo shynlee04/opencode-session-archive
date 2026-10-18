@@ -1,11 +1,10 @@
 import { existsSync, readFileSync, statSync } from "node:fs"
 import path from "node:path"
 import { Database } from "bun:sqlite"
+import { estimateTokens, normalizeRepoPath } from "../archive/primitives.ts"
 import {
   type CodeSymbolRow,
   ensureCodeGraphSchema,
-  estimateTokens,
-  normalizeRelPath,
   readAstSkeleton,
   readSymbolSlice,
   skeletonizeSource,
@@ -100,26 +99,9 @@ export interface ImplementorViewportBriefResult {
 
 export type ImplementorViewportBrief = ImplementorViewportBriefResult
 
-const DEFAULT_FALLBACK_ROOTS = [
-  "/Users/MAC/Documents/coding-projects/hivemind-steward-oc-devin-dev",
-  "/Users/MAC/Documents/coding-projects/hivemind-substrate",
-] as const
-
-function resolveEffectiveRootDir(
-  explicitRootDir: string | undefined,
-  targetPaths: readonly string[],
-): string {
+function resolveEffectiveRootDir(explicitRootDir: string | undefined): string {
   if (explicitRootDir) return explicitRootDir
-  const cwd = process.cwd()
-  for (const p of targetPaths) {
-    if (existsSync(path.join(cwd, p))) return cwd
-  }
-  for (const candidate of DEFAULT_FALLBACK_ROOTS) {
-    for (const p of targetPaths) {
-      if (existsSync(path.join(candidate, p))) return candidate
-    }
-  }
-  return cwd
+  return process.cwd()
 }
 
 function truncateLinesToBudget(
@@ -157,7 +139,7 @@ interface CachedDiskFile {
 const diskFileCache = new Map<string, CachedDiskFile>()
 
 function getCachedDiskFile(rootDir: string, relPath: string): CachedDiskFile | null {
-  const normPath = normalizeRelPath(relPath)
+  const normPath = normalizeRepoPath(relPath, rootDir)
   const absPath = path.join(rootDir, normPath)
   if (!existsSync(absPath)) return null
   try {
@@ -206,12 +188,13 @@ export function buildImplementorViewportBrief(
   const maxChars = maxTokens * 4
   const minProbability = options.minCouplingProbability ?? options.minProbability ?? 0.3
 
-  const rawPaths = options.targetPaths ?? options.writeLeasePaths ?? []
-  const targetPaths = [...new Set(rawPaths.map(normalizeRelPath).filter(Boolean))]
   const effectiveRootDir = resolveEffectiveRootDir(
     options.rootDir ?? options.projectRoot ?? options.canonicalRoot,
-    targetPaths,
   )
+  const rawPaths = options.targetPaths ?? options.writeLeasePaths ?? []
+  const targetPaths = [
+    ...new Set(rawPaths.map((p) => normalizeRepoPath(p, effectiveRootDir)).filter(Boolean)),
+  ]
 
   const rawSessionId = options.sessionID ?? options.sessionId
   const resolvedSession = rawSessionId
@@ -228,12 +211,12 @@ export function buildImplementorViewportBrief(
     const colonIdx = trimmed.indexOf(":")
     if (hashIdx > 0) {
       requestedSymbolRefs.push({
-        path: normalizeRelPath(trimmed.slice(0, hashIdx)),
+        path: normalizeRepoPath(trimmed.slice(0, hashIdx), effectiveRootDir),
         symbol: trimmed.slice(hashIdx + 1).trim(),
       })
     } else if (colonIdx > 0 && trimmed.slice(0, colonIdx).includes("/")) {
       requestedSymbolRefs.push({
-        path: normalizeRelPath(trimmed.slice(0, colonIdx)),
+        path: normalizeRepoPath(trimmed.slice(0, colonIdx), effectiveRootDir),
         symbol: trimmed.slice(colonIdx + 1).trim(),
       })
     } else {
@@ -245,7 +228,7 @@ export function buildImplementorViewportBrief(
       if (fs.trim()) requestedSymbolRefs.push({ symbol: fs.trim() })
     } else if (fs && typeof fs === "object" && fs.symbol) {
       requestedSymbolRefs.push({
-        path: fs.path ? normalizeRelPath(fs.path) : undefined,
+        path: fs.path ? normalizeRepoPath(fs.path, effectiveRootDir) : undefined,
         symbol: fs.symbol.trim(),
       })
     }
@@ -267,10 +250,9 @@ export function buildImplementorViewportBrief(
           .all(JSON.stringify(targetPaths))
   ) as ProvenanceChainRow[]
 
-  // Prioritize chains matching targetPaths first, then remaining session chains
   const sortedChains = [...allChains].sort((a, b) => {
-    const aMatch = targetSet.has(normalizeRelPath(a.target_path)) ? 1 : 0
-    const bMatch = targetSet.has(normalizeRelPath(b.target_path)) ? 1 : 0
+    const aMatch = targetSet.has(normalizeRepoPath(a.target_path, effectiveRootDir)) ? 1 : 0
+    const bMatch = targetSet.has(normalizeRepoPath(b.target_path, effectiveRootDir)) ? 1 : 0
     return bMatch - aMatch || a.chain_id.localeCompare(b.chain_id)
   })
 
@@ -324,7 +306,7 @@ export function buildImplementorViewportBrief(
     }
   }
 
-  // 3. Tier-2 AstSkeleton outlines for each path in targetPaths (also populates diskFileCache if unindexed)
+  // 3. Tier-2 AstSkeleton outlines for each path in targetPaths
   const skeletons: ImplementorBriefSkeletonEntry[] = []
   for (const p of targetPaths) {
     const view = readAstSkeleton(db, p)
@@ -394,7 +376,6 @@ export function buildImplementorViewportBrief(
         break
       }
 
-      // Check cached on-disk skeleton if not in code_symbol table
       const diskFile = getCachedDiskFile(effectiveRootDir, p)
       if (diskFile) {
         const matched =
@@ -439,7 +420,6 @@ export function buildImplementorViewportBrief(
     budgetTokens: repoMapBudgetTokens,
   })
 
-  // Allocate proportional character budgets per section so all 5 sections remain visible within maxTokens
   const headerLines: string[] = [
     `# Implementor Viewport Brief (${targetPaths.length} target paths, budget=${maxTokens} tok)`,
   ]
@@ -465,7 +445,6 @@ export function buildImplementorViewportBrief(
 
   const sectionBlocks: string[] = [headerBlock]
 
-  // Section 1: Provenance constraints
   const provSectionLines = [
     `## 1. Active Provenance Constraints (${provenanceConstraints.length})`,
     ...(provenanceConstraints.length > 0
@@ -474,7 +453,6 @@ export function buildImplementorViewportBrief(
   ]
   sectionBlocks.push(truncateLinesToBudget(provSectionLines, provBudgetChars))
 
-  // Section 2: Tier-4 Co-Change Couplings
   const cochangeSectionLines = [
     `## 2. Tier-4 Co-Change Couplings (${cochangeWarnings.length} coupled, ${hiddenCouplingWarnings.length} HIDDEN)`,
     ...(warningLines.length > 0
@@ -483,7 +461,6 @@ export function buildImplementorViewportBrief(
   ]
   sectionBlocks.push(truncateLinesToBudget(cochangeSectionLines, cochangeBudgetChars))
 
-  // Section 3: Tier-3 Symbol Slices
   if (symbolSlices.length > 0) {
     const perSliceChars = Math.max(
       80,
@@ -497,7 +474,6 @@ export function buildImplementorViewportBrief(
     sectionBlocks.push(truncateLinesToBudget(sliceSectionLines, sliceBudgetChars))
   }
 
-  // Section 4: Tier-2 AST Skeletons
   const skelSectionLines: string[] = [`## 4. Tier-2 AST Skeletons (${skeletons.length})`]
   if (skeletons.length > 0) {
     const perSkelChars = Math.max(
@@ -513,7 +489,6 @@ export function buildImplementorViewportBrief(
   }
   sectionBlocks.push(truncateLinesToBudget(skelSectionLines, skelBudgetChars))
 
-  // Section 5: Tier-1 RepoMap
   const repoMapLines = repoMapView.text.split("\n")
   sectionBlocks.push(truncateLinesToBudget(repoMapLines, repoMapBudgetChars))
 

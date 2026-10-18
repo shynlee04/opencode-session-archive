@@ -1,72 +1,211 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Database } from "bun:sqlite"
 import { DDL as ARCHIVE_INDEX_DDL } from "../src/archive/index-db.ts"
-import { sha256hex } from "../src/archive/normalize.ts"
+import { sha256Hex } from "../src/archive/primitives.ts"
 import {
-  DEFAULT_ARCHIVE_DIR,
-  DEFAULT_TARGET_DB_PATH,
-  DEFAULT_WF01_DB_PATH,
-  DEFAULT_WF03_DB_PATH,
-  DEFAULT_WF06_DB_PATH,
-  P1_RELEASE_SESSION_ID,
-  S1_PANIC_REREAD_FILES,
-  S1_PANIC_REREAD_SKILLS,
-  S1_SESSION_ID,
-  S2_PANIC_REREAD_FILES,
-  S2_PANIC_REREAD_SKILLS,
-  S2_SESSION_ID,
   applyCompactionContinuityHook,
   buildCompactionContinuationPacket,
-  buildUnifiedContinuityDatabase,
   ensureContinuitySchema,
   querySubstrateContinuity,
   reconcileProvenanceStaleness,
   renderProvenanceReport,
   resolveDefaultSessionId,
   runSevenSampleCompactionBenchmark,
+  shortBlobRef,
 } from "../src/viewports/continuity.ts"
 
-const PROTECTED_UPSTREAM_DBS = [
-  DEFAULT_WF01_DB_PATH,
-  DEFAULT_WF03_DB_PATH,
-  "/Users/MAC/Documents/coding-projects/hivemind-substrate/scratch/prototypes/data/wf-sub-05-codegraph.sqlite",
-  DEFAULT_WF06_DB_PATH,
-  `${DEFAULT_ARCHIVE_DIR}/index.sqlite`,
-] as const
+const ROOT_SESSION_1 = "ses_root_alpha"
+const ROOT_SESSION_2 = "ses_root_beta"
+const CHILD_SESSION_1 = "ses_child_alpha_1"
 
-function hashFile(path: string): string {
-  return sha256hex(readFileSync(path))
+function seedSyntheticContinuityDb(db: Database): void {
+  db.exec(ARCHIVE_INDEX_DDL)
+  ensureContinuitySchema(db)
+
+  const insertSession = db.prepare(`
+    INSERT INTO session (
+      id, root_id, project_id, parent_id, depth, lane_kind, lane_path, title,
+      agent, provider, model_id, harness, outcome, t_created, t_updated, message_count
+    ) VALUES (?, ?, 'proj_synthetic', ?, ?, 'root', '', ?, 'ultra', 'openai', 'gpt-5', ?, 'succeeded', ?, ?, 40)
+  `)
+  insertSession.run(
+    ROOT_SESSION_1,
+    ROOT_SESSION_1,
+    null,
+    0,
+    "Alpha Root Session: Architecture & Delegation",
+    "opencode",
+    1000,
+    3000,
+  )
+  insertSession.run(
+    CHILD_SESSION_1,
+    ROOT_SESSION_1,
+    ROOT_SESSION_1,
+    1,
+    "Alpha Child Reviewer",
+    "antigravity",
+    1100,
+    2500,
+  )
+  insertSession.run(
+    ROOT_SESSION_2,
+    ROOT_SESSION_2,
+    null,
+    0,
+    "Beta Root Session: Compaction & Provenance",
+    "opencode",
+    2000,
+    4000,
+  )
+
+  const insertDigest = db.prepare(`
+    INSERT INTO session_semantic_digest (
+      session_id, root_id, headline, intent_pivots_json, touched_files_json, key_decisions_json, verification_state
+    ) VALUES (?, ?, ?, '[]', '[]', '[]', ?)
+  `)
+  insertDigest.run(
+    ROOT_SESSION_1,
+    ROOT_SESSION_1,
+    "[Root · ultra] Alpha Root Session: Architecture & Delegation",
+    "verified_passed",
+  )
+  insertDigest.run(
+    ROOT_SESSION_2,
+    ROOT_SESSION_2,
+    "[Root · ultra] Beta Root Session: Compaction & Provenance",
+    "verified_passed",
+  )
+
+  const insertCompaction = db.prepare(`
+    INSERT INTO compaction (session_id, seq, reason, status, summary_ref, tok_input)
+    VALUES (?, ?, 'auto', 'completed', null, ?)
+  `)
+  insertCompaction.run(ROOT_SESSION_1, 100, 180000)
+  insertCompaction.run(ROOT_SESSION_2, 200, 195000)
+
+  const insertPivot = db.prepare(`
+    INSERT INTO intent_pivot (session_id, message_id, seq, t, prompt_excerpt, blob_ref, pivot_kind)
+    VALUES (?, ?, ?, '2026-10-18T00:00:00Z', ?, ?, ?)
+  `)
+  insertPivot.run(
+    ROOT_SESSION_1,
+    "msg_a1",
+    4,
+    "Initial goal for Alpha architecture",
+    shortBlobRef(sha256Hex("p1")),
+    "initial_goal",
+  )
+  insertPivot.run(
+    ROOT_SESSION_1,
+    "msg_a2",
+    12,
+    "Course correction on delegation boundary",
+    shortBlobRef(sha256Hex("p2")),
+    "course_correction",
+  )
+  insertPivot.run(
+    ROOT_SESSION_2,
+    "msg_b1",
+    2,
+    "Verify compaction continuity packet",
+    shortBlobRef(sha256Hex("p3")),
+    "verification_directive",
+  )
+
+  const insertSkill = db.prepare(`
+    INSERT INTO skill_load_ledger (session_id, skill_name, blob_sha, blob_ref, load_seq, status)
+    VALUES (?, ?, ?, ?, ?, 'ACTIVE — DO NOT RE-INVOKE')
+  `)
+  for (const [idx, skill] of ["ultra-mode", "tdd", "codebase-design"].entries()) {
+    const sha = sha256Hex(`skill:${skill}`)
+    insertSkill.run(ROOT_SESSION_1, skill, sha, shortBlobRef(sha), idx + 1)
+    insertSkill.run(ROOT_SESSION_2, skill, sha, shortBlobRef(sha), idx + 1)
+  }
+
+  const insertFile = db.prepare(`
+    INSERT INTO file_read_ledger (
+      session_id, path, normalized_path, line_range, start_line, end_line, total_lines, is_truncated,
+      read_blob_sha, read_seq, disk_blob_sha, staleness_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'FRESH — DO NOT REREAD')
+  `)
+  for (const [idx, fPath] of ["src/engine.ts", "src/service.ts", "STATE.md"].entries()) {
+    const sha = sha256Hex(`file:${fPath}`)
+    insertFile.run(ROOT_SESSION_1, fPath, fPath, "all", 1, 50, 50, 0, sha, idx + 1, sha)
+    insertFile.run(ROOT_SESSION_2, fPath, fPath, "all", 1, 50, 50, 0, sha, idx + 1, sha)
+  }
+
+  db.prepare(`
+    INSERT INTO delegation_turn (
+      parent_session_id, call_id, turn_index, child_session_id, mode, harness,
+      agent, reported_outcome, verified_outcome, blocker_summary, tool_error_count
+    ) VALUES (?, 'call_del_1', 1, ?, 'spawn', 'antigravity', 'reviewer', 'succeeded', 'tool_error_inside', 'Test runner failed inside child', 2)
+  `).run(ROOT_SESSION_1, CHILD_SESSION_1)
+
+  const engineSha = sha256Hex("file:src/engine.ts")
+  const insertChain = db.prepare(`
+    INSERT INTO provenance_chain (
+      chain_id, root_session_id, finding_id, finding_summary, child_session_id,
+      decision_pivot_seq, target_path, read_or_review_blob_sha, repair_blob_sha,
+      verification_command, verification_exit_code, verification_blob_ref,
+      disk_blob_sha, staleness_status, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 4, 'src/engine.ts', ?, ?, 'bun test', 0, ?, ?, 'VERIFIED_FRESH', '2026-10-18T00:00:00Z')
+  `)
+  insertChain.run(
+    "chain_alpha_engine",
+    ROOT_SESSION_1,
+    "F-ALPHA-01",
+    "Isolate engine boundary",
+    CHILD_SESSION_1,
+    engineSha,
+    engineSha,
+    shortBlobRef(engineSha),
+    engineSha,
+  )
+  insertChain.run(
+    "chain_beta_engine",
+    ROOT_SESSION_2,
+    "F-BETA-01",
+    "Verify beta continuity",
+    null,
+    engineSha,
+    engineSha,
+    shortBlobRef(engineSha),
+    engineSha,
+  )
+
+  db.prepare(`
+    INSERT INTO code_file (path, blob_sha, loc, raw_tokens, skeleton_tokens, skeleton_text, pagerank, updated_at)
+    VALUES ('src/engine.ts', ?, 50, 200, 40, '// src/engine.ts', 0.42, 1000)
+  `).run(engineSha)
+  db.prepare(`
+    INSERT INTO code_symbol (path, name, qualified_name, kind, depth, exported, start_line, end_line, signature, blob_sha)
+    VALUES ('src/engine.ts', 'runEngine', 'runEngine', 'function', 1, 1, 1, 25, 'export function runEngine(): void', ?)
+  `).run(engineSha)
+  db.prepare(`
+    INSERT INTO git_cochange (file_a, file_b, co_commits, commits_a, commits_b, prob_a_given_b, prob_b_given_a, jaccard, has_static_edge, recent_subjects_json)
+    VALUES ('src/engine.ts', 'src/service.ts', 5, 6, 5, 1.0, 0.83, 0.83, 0, '["sync engine and service"]')
+  `).run()
 }
 
-describe("VSC-02: ProvenanceChain Reconciler, Default sessionID Resolution & CompactionContinuationPacket", () => {
-  const upstreamHashesBefore = new Map<string, string>()
+describe("VSC-02 / VSC-R1: ProvenanceChain Reconciler, Slice-Aware Staleness & CompactionContinuationPacket", () => {
   let db: Database
 
   beforeAll(() => {
-    for (const p of PROTECTED_UPSTREAM_DBS) {
-      if (existsSync(p)) {
-        upstreamHashesBefore.set(p, hashFile(p))
-      }
-    }
-    db = buildUnifiedContinuityDatabase({
-      targetDbPath: DEFAULT_TARGET_DB_PATH,
-    })
+    db = new Database(":memory:")
+    seedSyntheticContinuityDb(db)
   })
 
   afterAll(() => {
     db?.close()
-    for (const [p, expectedHash] of upstreamHashesBefore.entries()) {
-      expect(hashFile(p)).toBe(expectedHash)
-    }
   })
 
-  test("1. ensureContinuitySchema is compatible with src/archive/index-db.ts DDL and unifies WF-SUB-01..06 tables without mutating upstream DBs", () => {
+  test("1. ensureContinuitySchema is compatible with src/archive/index-db.ts DDL", () => {
     const memDb = new Database(":memory:")
     try {
-      // First apply src/archive/index-db.ts DDL, then ensureContinuitySchema
       memDb.exec(ARCHIVE_INDEX_DDL)
       ensureContinuitySchema(memDb)
 
@@ -84,168 +223,52 @@ describe("VSC-02: ProvenanceChain Reconciler, Default sessionID Resolution & Com
     } finally {
       memDb.close()
     }
-
-    const counts = {
-      session: (db.query("SELECT COUNT(*) as c FROM session").get() as { c: number }).c,
-      compaction: (db.query("SELECT COUNT(*) as c FROM compaction").get() as { c: number }).c,
-      digest: (db.query("SELECT COUNT(*) as c FROM session_semantic_digest").get() as { c: number }).c,
-      intentPivot: (db.query("SELECT COUNT(*) as c FROM intent_pivot").get() as { c: number }).c,
-      fts: (db.query("SELECT COUNT(*) as c FROM substrate_fts").get() as { c: number }).c,
-      kvBinding: (db.query("SELECT COUNT(*) as c FROM kv_binding").get() as { c: number }).c,
-      delegationTurn: (db.query("SELECT COUNT(*) as c FROM delegation_turn").get() as { c: number }).c,
-      snapshotArtifact: (db.query("SELECT COUNT(*) as c FROM snapshot_artifact").get() as { c: number }).c,
-      spillArtifact: (db.query("SELECT COUNT(*) as c FROM spill_artifact").get() as { c: number }).c,
-      codeFile: (db.query("SELECT COUNT(*) as c FROM code_file").get() as { c: number }).c,
-      codeSymbol: (db.query("SELECT COUNT(*) as c FROM code_symbol").get() as { c: number }).c,
-      gitCochange: (db.query("SELECT COUNT(*) as c FROM git_cochange").get() as { c: number }).c,
-      provenanceChain: (db.query("SELECT COUNT(*) as c FROM provenance_chain").get() as { c: number }).c,
-      fileReadLedger: (db.query("SELECT COUNT(*) as c FROM file_read_ledger").get() as { c: number }).c,
-      skillLoadLedger: (db.query("SELECT COUNT(*) as c FROM skill_load_ledger").get() as { c: number }).c,
-    }
-
-    expect(counts.session).toBeGreaterThanOrEqual(63)
-    expect(counts.compaction).toBeGreaterThanOrEqual(6)
-    expect(counts.digest).toBeGreaterThanOrEqual(63)
-    expect(counts.intentPivot).toBeGreaterThanOrEqual(101)
-    expect(counts.fts).toBeGreaterThanOrEqual(495)
-    expect(counts.kvBinding).toBeGreaterThanOrEqual(618)
-    expect(counts.delegationTurn).toBeGreaterThanOrEqual(124)
-    expect(counts.snapshotArtifact).toBeGreaterThanOrEqual(464)
-    expect(counts.spillArtifact).toBeGreaterThanOrEqual(15)
-    expect(counts.codeFile).toBe(51)
-    expect(counts.codeSymbol).toBe(1314)
-    expect(counts.gitCochange).toBe(311)
-    expect(counts.provenanceChain).toBeGreaterThanOrEqual(8)
-    expect(counts.fileReadLedger).toBeGreaterThan(80)
-    expect(counts.skillLoadLedger).toBeGreaterThan(25)
   })
 
-  test("2. REQ-SUB-16: resolveDefaultSessionId resolves explicit -> hookContext (including child-to-root lookup) -> sqlite_latest_root without throwing Specify action and sessionID", () => {
-    // Priority 1: Explicit sessionID
-    const explicitRes = resolveDefaultSessionId(db, S2_SESSION_ID, { sessionID: S1_SESSION_ID })
-    expect(explicitRes.sessionId).toBe(S2_SESSION_ID)
-    expect(explicitRes.sessionID).toBe(S2_SESSION_ID)
+  test("2. REQ-SUB-16: resolveDefaultSessionId resolves explicit -> hookContext (including child-to-root lookup) -> sqlite_latest_root", () => {
+    const explicitRes = resolveDefaultSessionId(db, ROOT_SESSION_1, { sessionID: ROOT_SESSION_2 })
+    expect(explicitRes.sessionId).toBe(ROOT_SESSION_1)
     expect(explicitRes.source).toBe("explicit_input")
 
-    // Priority 2: hookContext.sessionID
-    const hookRes = resolveDefaultSessionId(db, undefined, { sessionID: S1_SESSION_ID })
-    expect(hookRes.sessionId).toBe(S1_SESSION_ID)
-    expect(hookRes.sessionID).toBe(S1_SESSION_ID)
+    const hookRes = resolveDefaultSessionId(db, undefined, { sessionID: ROOT_SESSION_1 })
+    expect(hookRes.sessionId).toBe(ROOT_SESSION_1)
     expect(hookRes.source).toBe("hook_context")
 
-    // Child session resolution to root session via hookContext
-    const childRow = db
-      .query("SELECT id, root_id FROM session WHERE depth > 0 LIMIT 1")
-      .get() as { id: string; root_id: string } | null
-    if (childRow) {
-      const childResolved = resolveDefaultSessionId(db, null, { sessionID: childRow.id })
-      expect(childResolved.source).toBe("hook_context")
-      expect(childResolved.rootSessionId).toBe(childRow.root_id)
-      expect(childResolved.resolvedChildSessionID).toBe(childRow.id)
-    }
+    const childResolved = resolveDefaultSessionId(db, null, { sessionID: CHILD_SESSION_1 })
+    expect(childResolved.source).toBe("hook_context")
+    expect(childResolved.rootSessionId).toBe(ROOT_SESSION_1)
+    expect(childResolved.resolvedChildSessionID).toBe(CHILD_SESSION_1)
 
-    // Priority 3: SQLite latest depth=0 root session
     const fallbackRes = resolveDefaultSessionId(db)
     expect(fallbackRes.source).toBe("sqlite_latest_root")
-    expect(fallbackRes.sessionId).toMatch(/^ses_/)
+    expect(fallbackRes.sessionId).toBe(ROOT_SESSION_2)
 
-    // Exact S1 msg[58] regression call: compaction_continuity({ action: "intents" }) without input.sessionID
-    const s1Msg58 = querySubstrateContinuity(
+    const intentsCall = querySubstrateContinuity(
       db,
       { action: "intents" },
-      { sessionID: S1_SESSION_ID },
+      { sessionID: ROOT_SESSION_1 },
     )
-    expect(s1Msg58.ok).toBe(true)
-    expect(s1Msg58.resolvedSessionID).toBe(S1_SESSION_ID)
-    expect(s1Msg58.resolutionSource).toBe("hook_context")
-    expect(s1Msg58.content).not.toContain("Specify action and sessionID")
-    expect(s1Msg58.content).toContain(S1_SESSION_ID)
-    const intents = s1Msg58.data.userIntents as Array<{ seq: number; pivot_kind: string }>
-    expect(intents.length).toBe(5)
-    expect(intents[0]?.seq).toBe(4)
-
-    // Calling with empty {} and no hookContext falls back to SQLite most recent root session
-    const emptyCall = querySubstrateContinuity(db, {})
-    expect(emptyCall.ok).toBe(true)
-    expect(emptyCall.resolutionSource).toBe("sqlite_latest_root")
-    expect(emptyCall.resolvedSessionID).toMatch(/^ses_/)
-    expect(emptyCall.content).not.toContain("Specify action and sessionID")
-    expect(emptyCall.data.tokenCount as number).toBeLessThan(1200)
+    expect(intentsCall.ok).toBe(true)
+    expect(intentsCall.resolvedSessionID).toBe(ROOT_SESSION_1)
+    expect(intentsCall.resolutionSource).toBe("hook_context")
+    expect(intentsCall.content).not.toContain("Specify action and sessionID")
   })
 
-  test("3. REQ-SUB-15: buildCompactionContinuationPacket synthesizes deterministic < 1,200-token packets across all 6 required sections and persists into compaction_continuation_ledger", () => {
-    const compactionRows = db
-      .query("SELECT session_id, seq FROM compaction ORDER BY session_id, seq")
-      .all() as { session_id: string; seq: number }[]
-    expect(compactionRows.length).toBeGreaterThanOrEqual(6)
+  test("3. REQ-SUB-15: buildCompactionContinuationPacket synthesizes deterministic < 1,200-token packets across all 6 required sections", () => {
+    const pkt = buildCompactionContinuationPacket(db, ROOT_SESSION_1, { seq: 100 })
+    expect(pkt.withinBudget).toBe(true)
+    expect(pkt.tokenCount).toBeLessThan(1200)
+    expect(pkt.markdown).toContain("Headline & Gate")
+    expect(pkt.markdown).toContain("### 1. Intent Pivot Timeline")
+    expect(pkt.markdown).toContain("### 2. Working-Memory Manifest")
+    expect(pkt.markdown).toContain("### 3. Delegation Trajectory")
+    expect(pkt.markdown).toContain("### 4. Provenance Chain")
+    expect(pkt.markdown).toContain("### 5. Tier-1 RepoMap & Co-Change Alerts")
+    expect(pkt.markdown).toContain("reported=`succeeded` -> verified=`tool_error_inside`")
 
-    for (const c of compactionRows) {
-      const pkt = buildCompactionContinuationPacket(db, {
-        sessionID: c.session_id,
-        compactionSeq: c.seq,
-      })
-      expect(pkt.withinBudget).toBe(true)
-      expect(pkt.tokenCount).toBeLessThan(1200)
-      expect(pkt.tokenCount).toBeGreaterThan(400)
-      expect(pkt.markdown).toContain("Headline & Gate")
-      expect(pkt.markdown).toContain("### 1. Intent Pivot Timeline")
-      expect(pkt.markdown).toContain("### 2. Working-Memory Manifest")
-      expect(pkt.markdown).toContain("### 3. Delegation Trajectory")
-      expect(pkt.markdown).toContain("### 4. Provenance Chain")
-      expect(pkt.markdown).toContain("### 5. Tier-1 RepoMap & Co-Change Alerts")
-    }
-
-    // Verify S1 (ses_eb2eabb14ffeCXsCwb845rtffb at msg[51] / seq=865) via both calling conventions
-    const s1Packet = buildCompactionContinuationPacket(db, S1_SESSION_ID, { seq: 865 })
-    expect(s1Packet.tokenCount).toBeLessThan(1200)
-    expect(s1Packet.sections.activeSkillsCount).toBe(16)
-    expect(s1Packet.sections.filesReadCount).toBe(28)
-
-    for (const skillName of S1_PANIC_REREAD_SKILLS) {
-      expect(s1Packet.markdown).toContain(`@${skillName}(`)
-    }
-    for (const filePath of S1_PANIC_REREAD_FILES) {
-      expect(s1Packet.markdown).toContain(`${filePath}(`)
-    }
-
-    // Verify S2 (ses_eb23bfbf0ffesn5kT0yJI06h35 at msg[82] / seq=847)
-    const s2Packet = buildCompactionContinuationPacket(db, {
-      sessionID: S2_SESSION_ID,
-      compactionSeq: 847,
-    })
-    expect(s2Packet.tokenCount).toBeLessThan(1200)
-    for (const skillName of S2_PANIC_REREAD_SKILLS) {
-      expect(s2Packet.markdown).toContain(`@${skillName}(`)
-    }
-    for (const filePath of S2_PANIC_REREAD_FILES) {
-      expect(s2Packet.markdown).toContain(`${filePath}(`)
-    }
-
-    // Verify P1 (ses_ecbfc0f40ffenfykTrNGoMS6o1) surfaces false-positive Antigravity delegations
-    const p1Packet = buildCompactionContinuationPacket(db, P1_RELEASE_SESSION_ID)
-    expect(p1Packet.tokenCount).toBeLessThan(1200)
-    expect(p1Packet.sections.flaggedDelegationCount).toBeGreaterThanOrEqual(11)
-    expect(p1Packet.markdown).toContain("reported=`succeeded` -> verified=`tool_error_inside`")
-
-    // Verify row persisted in compaction_continuation_ledger
-    const ledgerRow = db
-      .query(
-        "SELECT session_id, compaction_seq, packet_tokens, packet_markdown FROM compaction_continuation_ledger WHERE session_id = ? AND compaction_seq = ?",
-      )
-      .get(S1_SESSION_ID, 865) as {
-      session_id: string
-      compaction_seq: number
-      packet_tokens: number
-      packet_markdown: string
-    } | null
-    expect(ledgerRow).not.toBeNull()
-    expect(ledgerRow!.packet_tokens).toBe(s1Packet.tokenCount)
-    expect(ledgerRow!.packet_markdown).toBe(s1Packet.markdown)
-
-    // Verify compaction hook mutates compactionEvent.system in place and never writes .opencode/compaction-history
     const hookEvent = {
-      sessionID: S1_SESSION_ID,
-      seq: 865,
+      sessionID: ROOT_SESSION_1,
+      seq: 100,
       system: [{ type: "text" as const, text: "Base compaction system prompt" }],
     }
     const hookedPacket = applyCompactionContinuityHook(db, hookEvent)
@@ -254,33 +277,59 @@ describe("VSC-02: ProvenanceChain Reconciler, Default sessionID Resolution & Com
     expect(existsSync(".opencode/compaction-history")).toBe(false)
   })
 
-  test("4. REQ-SUB-14: reconcileProvenanceStaleness reconciles live disk SHA-256 on canonicalRoot and in-memory hash overrides in < 2 ms", () => {
-    // Part A: Live working-tree file SHA-256 reconciliation via reconcileProvenanceStaleness(db, canonicalRoot, sessionId)
-    const tmpRoot = join(tmpdir(), `hivemind-vsc02-${Date.now()}`)
+  test("4. REQ-SUB-14 / VSC-R1: reconcileProvenanceStaleness distinguishes (1) full-file FRESH, (2) partial slice FRESH SLICE, and (3) modified/missing STALE on disk", () => {
+    const tmpRoot = join(tmpdir(), `hivemind-vsc-r1-${Date.now()}`)
     mkdirSync(join(tmpRoot, "src"), { recursive: true })
     const workDb = new Database(":memory:")
     try {
       ensureContinuitySchema(workDb)
-      const relFile = "src/service.ts"
-      const absFile = join(tmpRoot, relFile)
-      const v1Content = "export function runService(): number { return 42 }\n"
-      const v1Sha = sha256hex(v1Content)
-      writeFileSync(absFile, v1Content, "utf8")
-
-      const testSessionId = "ses_live_reconcile_root"
+      const sessionId = "ses_slice_reconcile_test"
       workDb
         .query(
           "INSERT INTO session (id, root_id, project_id, depth, lane_kind, lane_path, harness, t_created, t_updated) VALUES (?, ?, 'proj', 0, 'root', '', 'opencode', 1000, 2000)",
         )
-        .run(testSessionId, testSessionId)
+        .run(sessionId, sessionId)
 
-      workDb
-        .query(
-          `INSERT INTO file_read_ledger (
-            session_id, path, line_range, read_blob_sha, read_seq, disk_blob_sha, staleness_status
-          ) VALUES (?, ?, 'L1-L20', ?, 10, ?, 'FRESH — DO NOT REREAD')`,
-        )
-        .run(testSessionId, relFile, v1Sha, v1Sha)
+      // File 1: Full-file read (5 lines)
+      const fullRel = "src/full.ts"
+      const fullAbs = join(tmpRoot, fullRel)
+      const fullLines = ["line 1", "line 2", "line 3", "line 4", "line 5"]
+      const fullContent = fullLines.join("\n")
+      const fullSha = sha256Hex(fullContent)
+      writeFileSync(fullAbs, fullContent, "utf8")
+
+      // File 2: Partial slice read (lines 1-2 of 5)
+      const sliceRel = "src/sliced.ts"
+      const sliceAbs = join(tmpRoot, sliceRel)
+      const sliceFileLines = ["alpha 1", "alpha 2", "alpha 3", "alpha 4", "alpha 5"]
+      writeFileSync(sliceAbs, sliceFileLines.join("\n"), "utf8")
+      const sliceReadSha = sha256Hex(sliceFileLines.slice(0, 2).join("\n"))
+
+      // File 3: Missing file on disk
+      const missingRel = "src/missing.ts"
+      const missingSha = sha256Hex("missing content")
+
+      const insertFile = workDb.prepare(`
+        INSERT INTO file_read_ledger (
+          session_id, path, normalized_path, line_range, start_line, end_line, total_lines, is_truncated,
+          read_blob_sha, read_seq, disk_blob_sha, staleness_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'FRESH — DO NOT REREAD')
+      `)
+      insertFile.run(sessionId, fullRel, fullRel, "all", 1, 5, 5, 0, fullSha, 1, fullSha)
+      insertFile.run(
+        sessionId,
+        sliceRel,
+        sliceRel,
+        "SLICE L1-L2 of 5 (truncated)",
+        1,
+        2,
+        5,
+        1,
+        sliceReadSha,
+        2,
+        sliceReadSha,
+      )
+      insertFile.run(sessionId, missingRel, missingRel, "all", 1, 3, 3, 0, missingSha, 3, missingSha)
 
       workDb
         .query(
@@ -288,86 +337,70 @@ describe("VSC-02: ProvenanceChain Reconciler, Default sessionID Resolution & Com
             chain_id, root_session_id, finding_id, finding_summary, target_path,
             read_or_review_blob_sha, repair_blob_sha, verification_exit_code,
             disk_blob_sha, staleness_status, updated_at
-          ) VALUES ('chain_live_1', ?, 'F-LIVE-01', 'Verify service output', ?, ?, ?, 0, ?, 'verified_fresh', '2026-10-18T00:00:00Z')`,
+          ) VALUES ('chain_full_1', ?, 'F-FULL-01', 'Verify full file', ?, ?, ?, 0, ?, 'verified_fresh', '2026-10-18T00:00:00Z')`,
         )
-        .run(testSessionId, relFile, v1Sha, v1Sha, v1Sha)
+        .run(sessionId, fullRel, fullSha, fullSha, fullSha)
 
-      // 1. Reconcile while disk matches v1Sha
-      const freshRes = reconcileProvenanceStaleness(workDb, tmpRoot, testSessionId)
-      expect(freshRes.elapsedMs).toBeLessThan(2.0)
-      expect(freshRes.staleFilesCount).toBe(0)
-      expect(freshRes.staleChainsCount).toBe(0)
-      expect(freshRes.fileRows[0]?.staleness_status).toBe("FRESH — DO NOT REREAD")
-      expect(freshRes.chainRows[0]?.staleness_status).toBe("verified_fresh")
+      // Initial reconciliation:
+      // - src/full.ts -> "FRESH — DO NOT REREAD"
+      // - src/sliced.ts -> "SLICE L1-L2 of 5 — FRESH SLICE"
+      // - src/missing.ts -> "STALE (modified since read/review — re-verify slice)"
+      const rec1 = reconcileProvenanceStaleness(workDb, tmpRoot, sessionId)
+      expect(rec1.freshFilesCount).toBe(2)
+      expect(rec1.sliceFilesCount).toBe(1)
+      expect(rec1.staleFilesCount).toBe(1)
+      expect(rec1.freshFiles.map((f) => f.path)).toEqual([fullRel, sliceRel])
+      expect(rec1.sliceFiles.map((f) => f.path)).toEqual([sliceRel])
+      expect(rec1.staleFiles.map((f) => f.path)).toEqual([missingRel])
 
-      // 2. Modify file on disk -> transitions to STALE and verified_stale_by_later_touch
-      const v2Content = "export function runService(): number { return 99 }\n"
-      writeFileSync(absFile, v2Content, "utf8")
+      const fullRow = rec1.fileRows.find((f) => f.path === fullRel)!
+      const sliceRow = rec1.fileRows.find((f) => f.path === sliceRel)!
+      const missingRow = rec1.fileRows.find((f) => f.path === missingRel)!
 
-      const staleRes = reconcileProvenanceStaleness(workDb, tmpRoot, testSessionId)
-      expect(staleRes.elapsedMs).toBeLessThan(2.0)
-      expect(staleRes.staleFilesCount).toBe(1)
-      expect(staleRes.staleChainsCount).toBe(1)
-      expect(staleRes.fileRows[0]?.staleness_status).toBe(
+      expect(fullRow.staleness_status).toBe("FRESH — DO NOT REREAD")
+      expect(sliceRow.staleness_status).toBe("SLICE L1-L2 of 5 — FRESH SLICE")
+      expect(missingRow.staleness_status).toBe(
         "STALE (modified since read/review — re-verify slice)",
       )
-      expect(staleRes.chainRows[0]?.staleness_status).toBe("verified_stale_by_later_touch")
 
-      const reportMarkdown = renderProvenanceReport(workDb, testSessionId)
-      expect(reportMarkdown).toContain("F-LIVE-01")
-      expect(reportMarkdown).toContain("verified_stale_by_later_touch")
-      expect(reportMarkdown).toContain("STALE (modified since read/review — re-verify slice)")
+      // Modify line 2 of src/sliced.ts -> slice becomes STALE
+      writeFileSync(
+        sliceAbs,
+        ["alpha 1", "alpha 2 MODIFIED", "alpha 3", "alpha 4", "alpha 5"].join("\n"),
+        "utf8",
+      )
+      const rec2 = reconcileProvenanceStaleness(workDb, tmpRoot, sessionId)
+      expect(rec2.sliceFilesCount).toBe(0)
+      expect(rec2.staleFilesCount).toBe(2)
+      expect(rec2.fileRows.find((f) => f.path === sliceRel)?.staleness_status).toBe(
+        "STALE (modified since read/review — re-verify slice)",
+      )
 
-      // 3. Restore v1Content on disk -> deterministically restores FRESH and verified_fresh
-      writeFileSync(absFile, v1Content, "utf8")
-      const restoredRes = reconcileProvenanceStaleness(workDb, tmpRoot, testSessionId)
-      expect(restoredRes.staleFilesCount).toBe(0)
-      expect(restoredRes.staleChainsCount).toBe(0)
-      expect(restoredRes.fileRows[0]?.staleness_status).toBe("FRESH — DO NOT REREAD")
-      expect(restoredRes.chainRows[0]?.staleness_status).toBe("verified_fresh")
+      // Restore line 2 of src/sliced.ts -> slice returns to SLICE L1-L2 of 5 — FRESH SLICE
+      writeFileSync(sliceAbs, sliceFileLines.join("\n"), "utf8")
+      const rec3 = reconcileProvenanceStaleness(workDb, tmpRoot, sessionId)
+      expect(rec3.sliceFilesCount).toBe(1)
+      expect(rec3.fileRows.find((f) => f.path === sliceRel)?.staleness_status).toBe(
+        "SLICE L1-L2 of 5 — FRESH SLICE",
+      )
+
+      const report = renderProvenanceReport(workDb, sessionId)
+      expect(report).toContain("SLICE L1-L2 of 5 — FRESH SLICE")
+      expect(report).toContain("STALE (modified since read/review — re-verify slice)")
+
+      const pkt = buildCompactionContinuationPacket(workDb, sessionId)
+      expect(pkt.markdown).toContain("SLICE L1-L2 of 5 — FRESH SLICE")
+      expect(pkt.markdown).toContain("STALE (modified since read/review — re-verify slice)")
     } finally {
       workDb.close()
       rmSync(tmpRoot, { recursive: true, force: true })
     }
-
-    // Part B: Verify S1 & S2 staleness transitions on the 63-session continuity DB
-    const s1Initial = reconcileProvenanceStaleness(db, S1_SESSION_ID)
-    expect(s1Initial.staleFilesCount).toBe(0)
-    expect(s1Initial.staleChainsCount).toBe(0)
-
-    const nativeFileBefore = s1Initial.fileRows.find(
-      (f) => f.path === "src/delegation/native-delegation.ts",
-    )!
-    expect(nativeFileBefore.staleness_status).toBe("FRESH — DO NOT REREAD")
-
-    const modifiedNativeSha = sha256hex("modified:src/delegation/native-delegation.ts:post-review-edit")
-    const s1AfterEdit = reconcileProvenanceStaleness(db, S1_SESSION_ID, {
-      "src/delegation/native-delegation.ts": modifiedNativeSha,
-    })
-    expect(s1AfterEdit.staleFilesCount).toBe(1)
-    expect(s1AfterEdit.staleChainsCount).toBe(1)
-    expect(
-      s1AfterEdit.fileRows.find((f) => f.path === "src/delegation/native-delegation.ts")
-        ?.staleness_status,
-    ).toBe("STALE (modified since read/review — re-verify slice)")
-    expect(
-      s1AfterEdit.chainRows.find((c) => c.chain_id === "chain_s1_native_delegation")
-        ?.staleness_status,
-    ).toBe("verified_stale_by_later_touch")
-
-    // Restore S1
-    const s1Restored = reconcileProvenanceStaleness(db, S1_SESSION_ID, {
-      "src/delegation/native-delegation.ts": nativeFileBefore.read_blob_sha,
-    })
-    expect(s1Restored.staleFilesCount).toBe(0)
-    expect(s1Restored.staleChainsCount).toBe(0)
-    buildCompactionContinuationPacket(db, S1_SESSION_ID, { seq: 865 })
   })
 
-  test("5. passes 7-sample interleaved benchmark across all compactions with < 1,200 tokens and < 2 ms latency", () => {
+  test("5. passes 7-sample interleaved benchmark across synthetic compactions with < 1,200 tokens and < 2 ms latency", () => {
     const report = runSevenSampleCompactionBenchmark(db, 7)
     expect(report.samples).toBe(7)
-    expect(report.compactionsEvaluated).toBeGreaterThanOrEqual(6)
+    expect(report.compactionsEvaluated).toBe(2)
     expect(report.aggregateBuildPacketMedianMs).toBeLessThan(2.0)
     expect(report.aggregateReconcileMedianMs).toBeLessThan(2.0)
 

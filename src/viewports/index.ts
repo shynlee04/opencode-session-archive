@@ -62,9 +62,10 @@ export {
 export {
   applyCompactionContinuityHook,
   buildCompactionContinuationPacket,
-  buildUnifiedContinuityDatabase,
   ensureContinuitySchema,
   formatProvenanceStatusLabel,
+  isFreshOrSliceStatus,
+  isSliceStatus,
   querySubstrateContinuity,
   reconcileProvenanceStaleness,
   recordCompactionSummaryHash,
@@ -72,8 +73,12 @@ export {
   resolveDefaultSessionId,
   shortBlobRef,
   type CompactionContinuationPacket,
+  type FileReadLedgerRow,
+  type FileStalenessStatus,
   type ProvenanceChainRow,
+  type ReconcileResult,
   type ResolvedSessionId,
+  type StalenessReconciliationResult,
 } from "./continuity.ts"
 
 export {
