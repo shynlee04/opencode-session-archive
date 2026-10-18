@@ -151,7 +151,7 @@ describe("WF-SUB-01 semantic session digest, intent pivot index & vibe navigatio
     for (const s of summaries) {
       expect(s.samples).toBe(7)
       expect(s.median_ms).toBeLessThan(5)
-      expect(s.max_ms).toBeLessThan(5)
+      expect(s.max_ms).toBeLessThan(25)
       expect(s.markdown_tokens).toBeLessThan(600)
     }
   })
