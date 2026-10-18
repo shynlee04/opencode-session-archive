@@ -127,9 +127,28 @@ export interface SkillRef {
 export interface UserRecord extends RecordBase {
   readonly kind: "user"
   readonly text: string
+  readonly text_ref?: string | null
   readonly agents: readonly string[]
   readonly files: readonly FileRef[]
   readonly skills: readonly SkillRef[]
+}
+
+export interface SkillRecord extends RecordBase {
+  readonly kind: "skill"
+  readonly name: string | null
+  readonly description: string | null
+  readonly text: string
+  readonly text_ref: string | null
+  readonly chars: number
+}
+
+export interface ShellRecord extends RecordBase {
+  readonly kind: "shell"
+  readonly command: string | null
+  readonly cwd: string | null
+  readonly exit_code: number | null
+  readonly output: string
+  readonly output_ref: string | null
 }
 
 export type AssistantPart =
@@ -188,6 +207,7 @@ export interface CompactionRecord extends RecordBase {
   readonly reason: string | null
   readonly status: string | null
   readonly summary: string | null
+  readonly summary_ref?: string | null
   readonly recent: string | null
   readonly tokens: unknown
   readonly covers_through_seq: number | null
@@ -214,6 +234,8 @@ export interface UnknownRecord extends RecordBase {
 export type MessageRecord =
   | UserRecord
   | AssistantRecord
+  | SkillRecord
+  | ShellRecord
   | ContextRecord
   | CompactionRecord
   | BoundaryRecord
@@ -242,9 +264,189 @@ export interface DelegationFact {
   readonly t_completed: number | null
 }
 
+export type ReportedOutcome = "succeeded" | "failed" | "interrupted" | "running" | null
+
+export type VerifiedOutcome =
+  | "clean"
+  | "verified_pass"
+  | "verified_fail"
+  | "tool_error_inside"
+  | "blocked_in_text"
+  | "reported_only"
+  | "empty_output"
+
+export interface ChildStopSegment {
+  readonly turn_index: number
+  readonly start_seq: number
+  readonly end_seq: number
+  readonly start_message_id: string
+  readonly end_message_id: string
+  readonly prompt_text: string
+  readonly response_text: string
+  readonly reported_outcome: ReportedOutcome
+  readonly verified_outcome: VerifiedOutcome
+  readonly blocker_summary: string | null
+  readonly tool_error_count: number
+  readonly tool_completed_count: number
+  readonly text_char_count: number
+}
+
+export interface DelegationTurnRow {
+  readonly parent_session_id: string
+  readonly call_id: string
+  readonly turn_index: number
+  readonly child_session_id: string
+  readonly mode: "spawn" | "send" | "continue"
+  readonly harness: Harness
+  readonly agent: string | null
+  readonly model: string | null
+  readonly foreign_session_id: string | null
+  readonly start_seq: number
+  readonly end_seq: number
+  readonly start_message_id: string
+  readonly end_message_id: string
+  readonly reported_outcome: ReportedOutcome
+  readonly verified_outcome: VerifiedOutcome
+  readonly blocker_summary: string | null
+  readonly tool_error_count: number
+  readonly tool_completed_count: number
+  readonly text_char_count: number
+  readonly prompt_blob: string | null
+  readonly response_blob: string | null
+  readonly source_origin: string
+}
+
+export interface FileReadLedgerRow {
+  readonly session_id: string
+  readonly path: string
+  readonly normalized_path: string
+  readonly call_id: string
+  readonly message_id: string
+  readonly seq: number
+  readonly read_seq: number
+  readonly line_range: string
+  readonly start_line: number | null
+  readonly end_line: number | null
+  readonly chars: number
+  readonly char_len: number
+  readonly blob_sha: string
+  readonly blob_sha256: string
+  readonly read_blob_sha: string
+  readonly disk_blob_sha: string
+  readonly summary: string
+  readonly staleness_status: string
+  readonly t: number
+  readonly updated_at: string
+}
+
+export interface SkillLoadLedgerRow {
+  readonly session_id: string
+  readonly skill_name: string
+  readonly call_id: string
+  readonly message_id: string
+  readonly seq: number
+  readonly loaded_seq: number
+  readonly load_seq: number
+  readonly chars: number
+  readonly char_len: number
+  readonly blob_sha: string
+  readonly blob_sha256: string
+  readonly skill_blob_sha: string
+  readonly blob_ref: string
+  readonly summary: string
+  readonly status: string
+  readonly t: number
+}
+
+export interface FileTouchRow {
+  readonly session_id: string
+  readonly message_id: string
+  readonly call_id: string
+  readonly seq: number
+  readonly tool: string
+  readonly op: string
+  readonly operation: string
+  readonly path: string
+  readonly normalized_path: string
+  readonly detail?: string | null
+  readonly blob_sha256: string
+  readonly t: number
+}
+
+export interface SnapshotArtifactRow {
+  readonly session_id: string
+  readonly message_id: string
+  readonly seq: number
+  readonly path: string
+  readonly start_tree_sha: string
+  readonly end_tree_sha: string
+  readonly start_blob_sha: string | null
+  readonly end_blob_sha: string | null
+  readonly start_git_blob_sha: string | null
+  readonly end_git_blob_sha: string | null
+  readonly start_byte_len: number | null
+  readonly end_byte_len: number | null
+  readonly byte_len: number
+  readonly source_origin: string
+}
+
+export interface SpillArtifactRow {
+  readonly session_id: string
+  readonly call_id: string
+  readonly message_id: string
+  readonly seq: number
+  readonly tool_name: string
+  readonly spill_kind: "tool-output" | "shell"
+  readonly spill_source: string
+  readonly inline_byte_len: number
+  readonly full_byte_len: number
+  readonly blob_sha: string
+  readonly source_origin: string
+}
+
+export interface SyncWatermarkRow {
+  readonly session_id: string
+  readonly root_id: string
+  readonly last_time_updated: number
+  readonly last_max_seq: number
+  readonly last_message_id: string
+  readonly last_kv_updated: number
+  readonly synced_at: string
+}
+
+export interface HostSessionRow {
+  readonly id: string
+  readonly project_id: string
+  readonly parent_id: string | null
+  readonly slug?: string | null
+  readonly directory: string
+  readonly title: string | null
+  readonly version?: string | null
+  readonly agent?: string | null
+  readonly model_id?: string | null
+  readonly provider_id?: string | null
+  readonly variant?: string | null
+  readonly idle_outcome?: string | null
+  readonly time_created: number
+  readonly time_updated: number
+}
+
+export interface HostMessageRow {
+  readonly id: string
+  readonly session_id: string
+  readonly seq: number
+  readonly type: string
+  readonly time_created: number
+  readonly time_updated: number
+  readonly data: Record<string, unknown>
+}
+
 export interface NormalizedMessage {
   readonly record: MessageRecord
   readonly delegations: readonly DelegationFact[]
+  readonly fileReads: readonly FileReadLedgerRow[]
+  readonly skillLoads: readonly SkillLoadLedgerRow[]
+  readonly fileTouches: readonly FileTouchRow[]
 }
 
 export interface KvBindingRow {
@@ -275,6 +477,7 @@ export interface KvBindingRow {
   readonly consumed_inputs_json: string | null
   readonly created_at: number | null
   readonly updated_at: number | null
+  readonly source_origin?: string
 }
 
 export interface KvForeignIndexRow {
