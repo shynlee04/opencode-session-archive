@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite"
-import { ensureCodeGraphSchema, estimateTokens, normalizeRelPath } from "./ast-skeleton.ts"
+import { estimateTokens, normalizeRepoPath } from "../archive/primitives.ts"
+import { ensureCodeGraphSchema, normalizeRelPath } from "./ast-skeleton.ts"
 
 export interface PageRankOptions {
   readonly iterations?: number

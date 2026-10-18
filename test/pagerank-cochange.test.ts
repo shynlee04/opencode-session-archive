@@ -341,8 +341,18 @@ describe("CSG-02 & CSG-03: PageRank RepoMap & Git Temporal Co-Change Couplings",
 
       const coStats = mineGitCochange(db, SUBSTRATE_ROOT, { maxCommits: 100, maxFilesPerCommit: 15 })
       expect(coStats.commitsScanned).toBeGreaterThanOrEqual(1)
+
+      // T-6: calling mineGitCochange(db, { maxCommits: 10 }) with no repoRoot defaults to process.cwd()
+      const cwdDb = new Database(":memory:")
+      try {
+        const cwdStats = mineGitCochange(cwdDb, { maxCommits: 10 })
+        expect(cwdStats.commitsScanned).toBeGreaterThanOrEqual(1)
+      } finally {
+        cwdDb.close()
+      }
     } finally {
       db.close()
     }
   })
 })
+

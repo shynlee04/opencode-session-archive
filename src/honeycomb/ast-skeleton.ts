@@ -1,6 +1,14 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs"
 import path from "node:path"
 import { Database } from "bun:sqlite"
+import { ensureHoneycombSchema } from "../archive/index-db.ts"
+import {
+  estimateTokens as estimateTokensPrimitive,
+  JIT_SKELETON_MARKER,
+  normalizeRepoPath,
+  resolveDiskPath,
+  sha256Hex,
+} from "../archive/primitives.ts"
 
 export type SymbolKind =
   | "function"
@@ -226,6 +234,7 @@ const tsTranspiler = new Bun.Transpiler({ loader: "ts" })
 const tsxTranspiler = new Bun.Transpiler({ loader: "tsx" })
 
 export function ensureCodeGraphSchema(db: Database): void {
+  ensureHoneycombSchema(db)
   if (initializedCodeGraphDbs.has(db)) {
     const hasTable = db
       .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'code_file'")
@@ -275,16 +284,19 @@ export function ensureCodeGraphSchema(db: Database): void {
   initializedCodeGraphDbs.add(db)
 }
 
-export function normalizeRelPath(filePath: string): string {
-  return filePath.replaceAll("\\", "/").replace(/^\.\//, "")
+export function normalizeRelPath(filePath: string, canonicalRoot?: unknown): string {
+  return normalizeRepoPath(
+    filePath,
+    typeof canonicalRoot === "string" ? canonicalRoot : undefined,
+  )
 }
 
 export function computeBlobSha(content: string): string {
-  return new Bun.CryptoHasher("sha256").update(content).digest("hex")
+  return sha256Hex(content)
 }
 
-export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4)
+export function estimateTokens(text: string | number): number {
+  return typeof text === "number" ? Math.ceil(Math.max(0, text) / 4) : estimateTokensPrimitive(text)
 }
 
 function normalizeWhitespace(s: string): string {
@@ -1622,3 +1634,174 @@ export function readSymbolSlice(
     slice_text: sliceText,
   }
 }
+
+export interface JitReadSkeletonMeta {
+  readonly startLine: number
+  readonly endLine: number
+  readonly totalLines: number | null
+  readonly isTruncated: boolean
+}
+
+export function indexSingleFileSkeleton(
+  first: string | Database,
+  second: Database | string,
+  filePath: string,
+): AstSkeletonView | null {
+  const { db, rootDir } = resolveDbAndRootDir(first, second)
+  ensureCodeGraphSchema(db)
+
+  const normPath = normalizeRepoPath(filePath, rootDir)
+  const absPath = resolveDiskPath(filePath, rootDir)
+  if (!existsSync(absPath)) {
+    return readAstSkeleton(db, normPath)
+  }
+
+  let content: string
+  try {
+    const st = statSync(absPath)
+    if (!st.isFile()) return readAstSkeleton(db, normPath)
+    content = readFileSync(absPath, "utf8")
+  } catch {
+    return readAstSkeleton(db, normPath)
+  }
+
+  const blobSha = computeBlobSha(content)
+  const existing = db
+    .query("SELECT blob_sha FROM code_file WHERE path = ?")
+    .get(normPath) as { blob_sha: string } | null
+  if (existing && existing.blob_sha === blobSha) {
+    return readAstSkeleton(db, normPath)
+  }
+
+  const skeleton = skeletonizeSource(normPath, content, { rootDir })
+  const now = Date.now()
+
+  const upsertTx = db.transaction(() => {
+    db.query(`
+      INSERT INTO code_file (path, blob_sha, loc, raw_tokens, skeleton_tokens, skeleton_text, pagerank, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT pagerank FROM code_file WHERE path = ?), 0), ?)
+      ON CONFLICT(path) DO UPDATE SET
+        blob_sha = excluded.blob_sha,
+        loc = excluded.loc,
+        raw_tokens = excluded.raw_tokens,
+        skeleton_tokens = excluded.skeleton_tokens,
+        skeleton_text = excluded.skeleton_text,
+        updated_at = excluded.updated_at
+    `).run(
+      normPath,
+      blobSha,
+      skeleton.loc,
+      skeleton.rawTokens,
+      skeleton.skeletonTokens,
+      skeleton.skeletonText,
+      normPath,
+      now,
+    )
+
+    db.query("DELETE FROM code_symbol WHERE path = ?").run(normPath)
+    const insertSym = db.query(`
+      INSERT OR REPLACE INTO code_symbol (
+        path, name, qualified_name, kind, depth, parent_symbol,
+        start_line, end_line, signature, exported, blob_sha
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    for (const sym of skeleton.symbols) {
+      insertSym.run(
+        sym.path,
+        sym.name,
+        sym.qualified_name,
+        sym.kind,
+        sym.depth,
+        sym.parent_symbol,
+        sym.start_line,
+        sym.end_line,
+        sym.signature,
+        sym.exported ? 1 : 0,
+        blobSha,
+      )
+    }
+
+    db.query("DELETE FROM code_import_edge WHERE from_path = ?").run(normPath)
+    const insertEdge = db.query(`
+      INSERT OR REPLACE INTO code_import_edge (
+        from_path, to_path, specifier, symbols_json, specifiers_json, is_type_only
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `)
+    const edgesByTarget = new Map<
+      string,
+      { specifier: string; names: Set<string>; typeOnly: boolean }
+    >()
+    for (const imp of skeleton.imports) {
+      if (!imp.resolvedPath) continue
+      let entry = edgesByTarget.get(imp.resolvedPath)
+      if (!entry) {
+        entry = { specifier: imp.specifier, names: new Set(), typeOnly: imp.typeOnly }
+        edgesByTarget.set(imp.resolvedPath, entry)
+      } else if (!imp.typeOnly) {
+        entry.typeOnly = false
+      }
+      for (const n of imp.names) entry.names.add(n)
+    }
+    for (const [toPath, info] of edgesByTarget.entries()) {
+      const json = JSON.stringify([...info.names].sort())
+      insertEdge.run(normPath, toPath, info.specifier, json, json, info.typeOnly ? 1 : 0)
+    }
+  })
+  upsertTx()
+
+  return readAstSkeleton(db, normPath)
+}
+
+export function buildJitReadSkeletonFooter(
+  first: string | Database,
+  second: Database | string,
+  filePath: string,
+  readMeta: JitReadSkeletonMeta,
+): string | null {
+  const isPartial =
+    readMeta.isTruncated ||
+    readMeta.startLine > 1 ||
+    (readMeta.totalLines !== null && readMeta.endLine < readMeta.totalLines)
+  if (!isPartial) return null
+
+  const { db, rootDir } = resolveDbAndRootDir(first, second)
+  const skel = indexSingleFileSkeleton(db, rootDir, filePath)
+  if (!skel || skel.symbols.length === 0) return null
+
+  const unread = skel.symbols.filter(
+    (s) =>
+      (s.depth === 1 || s.exported) &&
+      (s.start_line < readMeta.startLine || s.end_line > readMeta.endLine),
+  )
+  if (unread.length === 0) return null
+
+  const totalLoc = readMeta.totalLines ?? skel.loc
+  const headerLine = `\n\n${JIT_SKELETON_MARKER} ${skel.path} (shown L${readMeta.startLine}-L${readMeta.endLine} of ${totalLoc}; ${unread.length} unread symbols):`
+  const hintLine = `Hint: Use substrate.viewport({ action: "slice", path: "${skel.path}", symbol: "<symbol>" }) or read with offset/limit.`
+
+  const maxChars = 148 * 4 // strictly < 150 tokens
+  const fixedChars = headerLine.length + 1 + hintLine.length
+  const bulletLines: string[] = []
+  let usedChars = fixedChars
+
+  for (let i = 0; i < unread.length; i++) {
+    const s = unread[i]!
+    const item = `- [L${s.start_line}-L${s.end_line}] ${s.qualified_name} (${s.kind})`
+    const remaining = unread.length - (i + 1)
+    const moreLine = remaining > 0 ? `- ... (+${remaining} more unread symbols)` : ""
+    const projected = usedChars + 1 + item.length + (moreLine ? 1 + moreLine.length : 0)
+    if (projected > maxChars) {
+      const restCount = unread.length - i
+      const restLine = `- ... (+${restCount} more unread symbols)`
+      if (usedChars + 1 + restLine.length <= maxChars) {
+        bulletLines.push(restLine)
+      }
+      break
+    }
+    bulletLines.push(item)
+    usedChars += 1 + item.length
+  }
+
+  return [headerLine, ...bulletLines, hintLine].join("\n")
+}
+

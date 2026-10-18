@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite"
+import { ensureHoneycombSchema } from "../archive/index-db.ts"
+import { normalizeRepoPath } from "../archive/primitives.ts"
 import { ensureCodeGraphSchema, normalizeRelPath } from "./ast-skeleton.ts"
 
 export interface GitCommitRecord {
@@ -156,6 +158,7 @@ CREATE TABLE IF NOT EXISTS git_cochange_commit (
 const initializedCochangeDbs = new WeakSet<Database>()
 
 export function ensureCochangeSchema(db: Database): void {
+  ensureHoneycombSchema(db)
   ensureCodeGraphSchema(db)
   if (initializedCochangeDbs.has(db)) {
     const hasTable = db
@@ -410,7 +413,7 @@ export function mineGitCochange(
     explicitRoot ??
     options.repoRoot ??
     options.projectRoot ??
-    "/Users/MAC/Documents/coding-projects/hivemind-steward-oc-devin-dev"
+    process.cwd()
   const maxCommits = options.maxCommits ?? 500
   const maxFilesPerCommit = options.maxFilesPerCommit ?? 15
   const pathPrefix = options.pathPrefix ?? "src/"
@@ -709,7 +712,7 @@ export function updateGitCoChangeIncremental(
     repoRoot =
       repoRootOrOptions.repoRoot ??
       repoRootOrOptions.projectRoot ??
-      "/Users/MAC/Documents/coding-projects/hivemind-steward-oc-devin-dev"
+      process.cwd()
     revRange = repoRootOrOptions.revisionRange ?? repoRootOrOptions.revRange ?? "HEAD~1..HEAD"
     maxFilesPerCommit = repoRootOrOptions.maxFilesPerCommit ?? 15
     pathPrefix = repoRootOrOptions.pathPrefix ?? "src/"

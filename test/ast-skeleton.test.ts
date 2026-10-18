@@ -362,4 +362,64 @@ describe("CSG-01: Zero-Dependency Bun.Transpiler + Depth-2 AST Skeletonizer & SQ
       subDb.close()
     }
   })
+
+  test("CSG-R1 A3: indexSingleFileSkeleton and buildJitReadSkeletonFooter append < 150-token unread symbol outline on truncated reads and return null on full reads", async () => {
+    const astMod = await import("../src/honeycomb/ast-skeleton.ts")
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "csg-jit-footer-"))
+    const db = new Database(":memory:")
+    try {
+      const srcDir = path.join(tmpDir, "src")
+      mkdirSync(srcDir, { recursive: true })
+      const sampleCode = [
+        "export function alphaHeader(x: number): number {",
+        "  return x + 1",
+        "}",
+        "",
+        "export class BetaEngine {",
+        "  runStep(id: string): boolean {",
+        "    return id.length > 0",
+        "  }",
+        "}",
+        "",
+        "export function omegaFooter(msg: string): string {",
+        "  return msg.trim()",
+        "}",
+      ].join("\n")
+      writeFileSync(path.join(srcDir, "engine.ts"), sampleCode)
+
+      const singleSkel = astMod.indexSingleFileSkeleton(db, tmpDir, "src/engine.ts")
+      expect(singleSkel).not.toBeNull()
+      expect(singleSkel!.symbols.map((s) => s.name)).toContain("alphaHeader")
+      expect(singleSkel!.symbols.map((s) => s.name)).toContain("BetaEngine")
+      expect(singleSkel!.symbols.map((s) => s.name)).toContain("omegaFooter")
+
+      // Truncated read of lines 1..3 should emit footer with BetaEngine and omegaFooter, but not alphaHeader
+      const footer = astMod.buildJitReadSkeletonFooter(db, tmpDir, "src/engine.ts", {
+        startLine: 1,
+        endLine: 3,
+        totalLines: 13,
+        isTruncated: true,
+      })
+      expect(footer).not.toBeNull()
+      expect(footer!).toContain("--- [substrate.jit-skeleton] ---")
+      expect(footer!).toContain("BetaEngine")
+      expect(footer!).toContain("omegaFooter")
+      expect(footer!).not.toContain("alphaHeader (function)")
+      expect(footer!).toContain('substrate.viewport({ action: "slice", path: "src/engine.ts"')
+      expect(astMod.estimateTokens(footer!)).toBeLessThan(150)
+
+      // Full-file read should return null
+      const fullFooter = astMod.buildJitReadSkeletonFooter(db, tmpDir, "src/engine.ts", {
+        startLine: 1,
+        endLine: 13,
+        totalLines: 13,
+        isTruncated: false,
+      })
+      expect(fullFooter).toBeNull()
+    } finally {
+      db.close()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })
+
