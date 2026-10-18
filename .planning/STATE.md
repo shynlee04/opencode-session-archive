@@ -2,27 +2,25 @@
 
 ## Current Position
 
-- **Stage:** `/wayfinder` active (`MAP-HIVEMIND-SUBSTRATE.md` — research `WF-SUB-R01..R04` complete; prototype frontier `WF-SUB-01..07` + owner grill gate `WF-SUB-08` open).
-- **Repository:** `/Users/MAC/Documents/coding-projects/hivemind-substrate` (added to `hivemind-steward-oc-devin-dev.code-workspace`).
-- **Baseline Tests:** `bun test` (`3 passed, 0 failed` across `test/archive.test.ts` and `.opencode/plugins/context-prune.test.ts`), `bun run check` (`tsc --noEmit` clean).
+- **Stage:** `to-spec` & independent `spec-review` complete for all 3 phases (`E1.1`, `E1.2`, `E1.3`); `ADR-001..003` locked to `accepted`; ready for `to-tickets`.
+- **Repository:** `/Users/MAC/Documents/coding-projects/hivemind-substrate`
+- **Baseline Tests:** `bun test` (`76 passed, 1 skipped, 0 failed`), `bun run typecheck` (`tsc --noEmit` clean).
 
-## Completed in This Session
+## Completed Artifacts
 
-1. **Transferred Baseline Prototypes & Dossiers:**
-   - `opencode-session-archive` (`src/`, `scripts/`, `dist/`, `test/`).
-   - `opencode-context-prune` (`.opencode/plugins/context-prune.ts`, `context-prune.test.ts`).
-   - `compaction-continuity` (`.opencode/plugins/compaction-continuity.ts`).
-   - Architecture dossiers under `docs/teach-me/` and `.planning/human-used-prompting/the-3-prompting-designs-concepts-wayfinder.md`.
-2. **Completed 4 Deep Research & Forensic Records (`.planning/wayfinder/research/`):**
-   - [`WF-SUB-R01-forensic-dual-plugin-collision.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/research/WF-SUB-R01-forensic-dual-plugin-collision.md)
-   - [`WF-SUB-R02-host-storage-kv-snapshots-spills.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/research/WF-SUB-R02-host-storage-kv-snapshots-spills.md)
-   - [`WF-SUB-R03-codebase-memory-ast-pagerank-cochange.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/research/WF-SUB-R03-codebase-memory-ast-pagerank-cochange.md)
-   - [`WF-SUB-R04-domain-model-and-viewport-matrix.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/research/WF-SUB-R04-domain-model-and-viewport-matrix.md)
-3. **Authored Wayfinder Map, 8 Prototype/Grill Tickets & 3 Proposed ADRs:**
-   - Map: [`MAP-HIVEMIND-SUBSTRATE.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/MAP-HIVEMIND-SUBSTRATE.md)
-   - Tickets: `WF-SUB-01` through `WF-SUB-08` under [`.planning/wayfinder/tickets/`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/)
-   - Proposed ADRs: [`ADR-001`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-001-three-layer-context-substrate.md), [`ADR-002`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-002-step-watermark-valve-and-breadcrumb-handles.md), [`ADR-003`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-003-bun-native-codebase-structural-graph.md)
+1. **Wayfinder & Prototype Evidence (`WF-SUB-01..08` — all `resolved`):**
+   - Map: [`.planning/wayfinder/MAP-HIVEMIND-SUBSTRATE.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/MAP-HIVEMIND-SUBSTRATE.md)
+   - Owner Grill Gate (`Q1..Q3` approved): [`.planning/wayfinder/tickets/WF-SUB-08-substrate-surface-and-cross-harness-switching-grill.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/wayfinder/tickets/WF-SUB-08-substrate-surface-and-cross-harness-switching-grill.md)
+   - Domain Glossary: [`GLOSSARY.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/GLOSSARY.md)
+2. **Accepted Architecture & Deep-Module Design:**
+   - [`DEEP-MODULE-DESIGN.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/DEEP-MODULE-DESIGN.md) (`src/spine/`, `src/honeycomb/`, `src/viewports/`, `src/plugin.ts`, bidirectional `src/archive/*` barrels)
+   - Accepted ADRs: [`ADR-001`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-001-three-layer-context-substrate.md), [`ADR-002`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-002-step-watermark-valve-and-breadcrumb-handles.md), [`ADR-003`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/architecture/ADR-003-bun-native-codebase-structural-graph.md)
+3. **Phase Specifications & Independent Review (`REQ-SUB-01..18`):**
+   - Phase `E1.1` (`REQ-SUB-01..08`): [`.planning/phases/trajectory-working-memory/SPEC.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/phases/trajectory-working-memory/SPEC.md)
+   - Phase `E1.2` (`REQ-SUB-09..12`): [`.planning/phases/codebase-structural-graph/SPEC.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/phases/codebase-structural-graph/SPEC.md)
+   - Phase `E1.3` (`REQ-SUB-13..18`): [`.planning/phases/viewport-synthesis-compaction/SPEC.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/phases/viewport-synthesis-compaction/SPEC.md)
+   - Independent Review (`PASS`, `F-01..F-04` resolved in place): [`.planning/phases/trajectory-working-memory/reviews/SPEC-REVIEW.md`](file:///Users/MAC/Documents/coding-projects/hivemind-substrate/.planning/phases/trajectory-working-memory/reviews/SPEC-REVIEW.md)
 
 ## Next Step (Next Session Pickup)
 
-- Execute the independent prototype spikes on the `/wayfinder` frontier (`WF-SUB-01`, `WF-SUB-03`, `WF-SUB-05` in parallel, followed by `WF-SUB-02`, `WF-SUB-04`, `WF-SUB-06`, `WF-SUB-07`) against the real exported session fixtures (`session-bcad339b`, `session-a35adea6`) and manifested `.session-archive/index.sqlite`, then run `WF-SUB-08` (`grill-with-docs`) with the owner.
+- Run `/to-tickets` on Phase `E1.1` (`trajectory-working-memory`, `TWM-001..`), Phase `E1.2` (`codebase-structural-graph`, `CSG-001..`), and Phase `E1.3` (`viewport-synthesis-compaction`, `VSC-001..`), sync to the tracker if authorized, and execute Phase `E1.1` via `implement-spec`.
