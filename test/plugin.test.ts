@@ -298,6 +298,13 @@ describe("plugin shell & VSC-04 unified surface (REQ-SUB-17)", () => {
     expect(existsSync(path.join(projectRoot, ".session-archive", "index.sqlite"))).toBe(true)
   })
 
+  test("rejects options.dir inside .opencode/ to prevent host hot-reload loops (REQ-SUB-01 / SPEC-01)", async () => {
+    const projectRoot = makeTmpDir()
+    await expect(setup({ dbPath: seedDb(projectRoot), dir: ".opencode/archive" }, projectRoot)).rejects.toThrow(
+      "archive directory must not reside inside .opencode/",
+    )
+  })
+
   test("re-exports buildImplementorViewportBrief and bundles cleanly into dist/session-archive.ts", () => {
     expect(typeof (pluginExports as any).buildImplementorViewportBrief).toBe("function")
     const proc = Bun.spawnSync(["bun", "run", "build"], {
