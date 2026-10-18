@@ -3,7 +3,7 @@ kind: ticket
 id: CSG-03
 phase: codebase-structural-graph
 title: "Git temporal co-change matrix and hidden cross-boundary coupling alerts"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/codebase-structural-graph/SPEC.md
@@ -49,11 +49,11 @@ github_issue: null
 
 - **Automated command:** `bun test test/pagerank-cochange.test.ts && bun run typecheck`
 - **Failing direction (RED):** commits touching > 15 files pollute co-change counts, incremental HEAD~1..HEAD mining double-counts already-indexed commit SHAs, or hidden couplings (has_static_edge = 0) are not flagged.
-- [ ] REQ-SUB-12: mineGitCochange skips commits with > 15 touched files and skips already-indexed commit SHAs idempotently on incremental runs.
-- [ ] REQ-SUB-12: queryCochangeCouplings returns asymmetric P(partner|target), Jaccard similarity, has_static_edge (0 vs 1), and recent shared commit subjects, highlighting hidden couplings where has_static_edge = 0.
-- [ ] Verification: bun test test/pagerank-cochange.test.ts && bun run typecheck pass.
+- [x] REQ-SUB-12: mineGitCochange skips commits with > 15 touched files and skips already-indexed commit SHAs idempotently on incremental runs.
+- [x] REQ-SUB-12: queryCochangeCouplings returns asymmetric P(partner|target), Jaccard similarity, has_static_edge (0 vs 1), and recent shared commit subjects, highlighting hidden couplings where has_static_edge = 0.
+- [x] Verification: bun test test/pagerank-cochange.test.ts && bun run typecheck pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Calling substrate.viewport({ action: "coupled", path: "..." }) surfaces hidden behavioral partners with 0 static import edges.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

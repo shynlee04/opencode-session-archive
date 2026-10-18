@@ -3,7 +3,7 @@ kind: ticket
 id: TWM-02
 phase: trajectory-working-memory
 title: "Multi-stop DelegationTurn lineage, ReportedOutcome vs VerifiedOutcome classifier, and full message blob sinking"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/trajectory-working-memory/SPEC.md
@@ -49,13 +49,13 @@ github_issue: null
 
 - **Automated command:** `bun test test/normalize.test.ts && bun run typecheck`
 - **Failing direction (RED):** normalizeUser drops human prompt text instead of sinking to blobs/<sha256>.txt, multi-turn child continuations overwrite Turn 0 in delegation_turn, or false-positive idle.outcome = succeeded turns with inner tool errors are not flagged as tool_error_inside or blocked_in_text.
-- [ ] REQ-SUB-03: delegation_turn stores every spawn and send/continue stop keyed by (parent_session_id, call_id, turn_index) without overwriting prior turns on the same child_session_id.
-- [ ] REQ-SUB-03: classifyMessagesOutcome detects 100% of false-positive idle.outcome = succeeded child turns containing inner tool errors, permission/lease denials, MCP init timeouts, or explicit BLOCKED markers.
-- [ ] REQ-SUB-04: normalizeUser sinks human prompt text (data.text or text parts) into blobs/<sha256>.txt and emits text_ref: blob:<sha256> alongside a preview.
-- [ ] REQ-SUB-04: file_read_ledger and skill_load_ledger record deduplicated per-session file reads and skill loads with blob_sha / read_blob_sha and skill_blob_sha.
-- [ ] Verification: bun test test/normalize.test.ts && bun run typecheck pass.
+- [x] REQ-SUB-03: delegation_turn stores every spawn and send/continue stop keyed by (parent_session_id, call_id, turn_index) without overwriting prior turns on the same child_session_id.
+- [x] REQ-SUB-03: classifyMessagesOutcome detects 100% of false-positive idle.outcome = succeeded child turns containing inner tool errors, permission/lease denials, MCP init timeouts, or explicit BLOCKED markers.
+- [x] REQ-SUB-04: normalizeUser sinks human prompt text (data.text or text parts) into blobs/<sha256>.txt and emits text_ref: blob:<sha256> alongside a preview.
+- [x] REQ-SUB-04: file_read_ledger and skill_load_ledger record deduplicated per-session file reads and skill loads with blob_sha / read_blob_sha and skill_blob_sha.
+- [x] Verification: bun test test/normalize.test.ts && bun run typecheck pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Querying delegation_turn and session records in .session-archive/index.sqlite shows all turns of multi-stop child sessions and flags false-positive Antigravity/Devin completions.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

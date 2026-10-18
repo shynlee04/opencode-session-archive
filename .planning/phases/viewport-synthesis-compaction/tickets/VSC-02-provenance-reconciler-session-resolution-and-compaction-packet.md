@@ -3,7 +3,7 @@ kind: ticket
 id: VSC-02
 phase: viewport-synthesis-compaction
 title: "ProvenanceChain causal graph, < 2 ms live staleness reconciler, default sessionID resolution, and CompactionContinuationPacket"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/viewport-synthesis-compaction/SPEC.md
@@ -49,12 +49,12 @@ github_issue: null
 
 - **Automated command:** `bun test test/continuity.test.ts && bun run typecheck`
 - **Failing direction (RED):** omitted sessionID fails to resolve via explicit_input -> hook_context -> sqlite_latest_root, modified workspace files stay FRESH in file_read_ledger or provenance_chain, or buildCompactionContinuationPacket exceeds 1,200 tokens.
-- [ ] REQ-SUB-16: resolveDefaultSessionId resolves omitted sessionID via explicit_input -> hook_context -> sqlite_latest_root without throwing Specify action and sessionID.
-- [ ] REQ-SUB-14: reconcileProvenanceStaleness transitions modified files from FRESH — DO NOT REREAD to STALE (modified since read/review — re-verify slice) and provenance chains from verified_pass to verified_stale_by_later_touch in < 2.0 ms.
-- [ ] REQ-SUB-15: buildCompactionContinuationPacket synthesizes all 6 sections (Headline & Gate, Intent Pivot Timeline, Working-Memory Manifest, Delegation Trajectory, Provenance Chain, Tier-1 RepoMap & Co-Change Alerts) under 1,200 tokens and writes zero files under .opencode/.
-- [ ] Verification: bun test test/continuity.test.ts && bun run typecheck pass.
+- [x] REQ-SUB-16: resolveDefaultSessionId resolves omitted sessionID via explicit_input -> hook_context -> sqlite_latest_root without throwing Specify action and sessionID.
+- [x] REQ-SUB-14: reconcileProvenanceStaleness transitions modified files from FRESH — DO NOT REREAD to STALE (modified since read/review — re-verify slice) and provenance chains from verified_pass to verified_stale_by_later_touch in < 2.0 ms.
+- [x] REQ-SUB-15: buildCompactionContinuationPacket synthesizes all 6 sections (Headline & Gate, Intent Pivot Timeline, Working-Memory Manifest, Delegation Trajectory, Provenance Chain, Tier-1 RepoMap & Co-Change Alerts) under 1,200 tokens and writes zero files under .opencode/.
+- [x] Verification: bun test test/continuity.test.ts && bun run typecheck pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Compaction events inject the < 1,200-token CompactionContinuationPacket automatically and tool calls without sessionID succeed.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

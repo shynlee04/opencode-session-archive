@@ -3,7 +3,7 @@ kind: ticket
 id: VSC-03
 phase: viewport-synthesis-compaction
 title: "Exported cross-harness child delegation brief helper buildImplementorViewportBrief"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/viewport-synthesis-compaction/SPEC.md
@@ -49,11 +49,11 @@ github_issue: null
 
 - **Automated command:** `bun test test/brief.test.ts && bun run typecheck`
 - **Failing direction (RED):** buildImplementorViewportBrief omits Tier-1..4 structural context or provenance constraints, fails to accept alias options (writeLeasePaths, focusSymbols, projectRoot, maxTokensBudget), or exceeds maxTokens.
-- [ ] REQ-SUB-18: buildImplementorViewportBrief accepts both canonical (targetPaths, symbolNames, rootDir, maxTokens) and alias (writeLeasePaths, focusSymbols, projectRoot, maxTokensBudget, goal, verificationCommand) option shapes.
-- [ ] REQ-SUB-18: Output includes Tier-1 RepoMap, Tier-2 AstSkeleton, Tier-3 SymbolSlice (when symbols specified), Tier-4 CoChangeCoupling warnings (has_static_edge = 0), and ProvenanceChain constraints within maxTokens (default 1,500) in < 5.0 ms.
-- [ ] Verification: bun test test/brief.test.ts && bun run typecheck pass.
+- [x] REQ-SUB-18: buildImplementorViewportBrief accepts both canonical (targetPaths, symbolNames, rootDir, maxTokens) and alias (writeLeasePaths, focusSymbols, projectRoot, maxTokensBudget, goal, verificationCommand) option shapes.
+- [x] REQ-SUB-18: Output includes Tier-1 RepoMap, Tier-2 AstSkeleton, Tier-3 SymbolSlice (when symbols specified), Tier-4 CoChangeCoupling warnings (has_static_edge = 0), and ProvenanceChain constraints within maxTokens (default 1,500) in < 5.0 ms.
+- [x] Verification: bun test test/brief.test.ts && bun run typecheck pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Parent orchestrators and delegate-devin / hivemind-delegate callers generate bounded 4-tier Implementor briefs in < 5 ms.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

@@ -3,7 +3,7 @@ kind: ticket
 id: TWM-01
 phase: trajectory-working-memory
 title: "Read-only host boundary, schema drift guard, and UTF-16BE kv binding ingestion"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/trajectory-working-memory/SPEC.md
@@ -50,12 +50,12 @@ github_issue: null
 
 - **Automated command:** `bun test test/source.test.ts && bun run typecheck`
 - **Failing direction (RED):** sqliteSource omits readonly mode, fails to validate required project/session_v2/session_message/kv columns, or fails to decode UTF-16BE plugin:<hex>:bindings/<childSessionID> and delegate-mode/child/<childSessionID> rows into kv_binding, kv_foreign_index, and kv_context_prune.
-- [ ] REQ-SUB-01: sqliteSource opens the host DB with { readonly: true } and throws session-archive: host schema drift: <table>.<column> missing when any required column in project, session_v2, session_message, or kv is absent.
-- [ ] REQ-SUB-02: decodeKvKey decodes plugin:<utf16be-hex>:bindings/<childSessionID>, delegate-mode/child/<childSessionID>, and context-prune keys accurately into structured KvBindingRecord, KvForeignIndexRecord, and KvContextPruneRecord objects.
-- [ ] REQ-SUB-02: index-db.ts creates kv_binding, kv_foreign_index, and kv_context_prune tables and upserts decoded rows idempotently.
-- [ ] Verification: bun test test/source.test.ts && bun run typecheck pass with 0 errors.
+- [x] REQ-SUB-01: sqliteSource opens the host DB with { readonly: true } and throws session-archive: host schema drift: <table>.<column> missing when any required column in project, session_v2, session_message, or kv is absent.
+- [x] REQ-SUB-02: decodeKvKey decodes plugin:<utf16be-hex>:bindings/<childSessionID>, delegate-mode/child/<childSessionID>, and context-prune keys accurately into structured KvBindingRecord, KvForeignIndexRecord, and KvContextPruneRecord objects.
+- [x] REQ-SUB-02: index-db.ts creates kv_binding, kv_foreign_index, and kv_context_prune tables and upserts decoded rows idempotently.
+- [x] Verification: bun test test/source.test.ts && bun run typecheck pass with 0 errors.
 
 ## Runtime / UAT
 
 - **Real journey:** Persisting a real or fixture OpenCode v2.0.32 session populates kv_binding and kv_foreign_index in .session-archive/index.sqlite with foreignSessionID, harness, turn, phase, and servingWitness.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

@@ -3,7 +3,7 @@ kind: ticket
 id: TWM-05
 phase: trajectory-working-memory
 title: "Hybrid assistant step-watermark WorkingSetValve, < 2 ms in-memory context hook, FactBreadcrumbs, and WorkingMemoryManifest"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/trajectory-working-memory/SPEC.md
@@ -49,13 +49,13 @@ github_issue: null
 
 - **Automated command:** `bun test test/valve.test.ts && bun run typecheck`
 - **Failing direction (RED):** single-prompt 45-step trajectories prune 0 bytes in recent or step-window mode, thinned tool outputs lack blob:<sha12> FactBreadcrumbs, auto-watermark fails to activate at 65% context window (keepRecentSteps = 12), or applyContextHookInMemory exceeds 2.0 ms.
-- [ ] REQ-SUB-07: computeStepWatermark slices assistant steps prior to the last K = 8 steps on single-prompt trajectories and activates automatically with K = 12 when estimated input tokens exceed 65% of modelContextWindowTokens.
-- [ ] REQ-SUB-07: KEEP_RESULT (subagent, task, delegate-devin, hivemind-delegate) outputs and KEEP_INPUT (read, write, edit) inputs are preserved while other old tool inputs/outputs are shape-preservingly thinned.
-- [ ] REQ-SUB-08: Every thinned tool output is replaced with a FactBreadcrumb carrying blob:<sha12>, 1-line summary, and FRESH — DO NOT REREAD vs STALE status, plus a WorkingMemoryManifest.
-- [ ] REQ-SUB-08: applyContextHookInMemory executes in < 2.0 ms median with zero disk or SQLite I/O.
-- [ ] Verification: bun test test/valve.test.ts && bun run typecheck pass.
+- [x] REQ-SUB-07: computeStepWatermark slices assistant steps prior to the last K = 8 steps on single-prompt trajectories and activates automatically with K = 12 when estimated input tokens exceed 65% of modelContextWindowTokens.
+- [x] REQ-SUB-07: KEEP_RESULT (subagent, task, delegate-devin, hivemind-delegate) outputs and KEEP_INPUT (read, write, edit) inputs are preserved while other old tool inputs/outputs are shape-preservingly thinned.
+- [x] REQ-SUB-08: Every thinned tool output is replaced with a FactBreadcrumb carrying blob:<sha12>, 1-line summary, and FRESH — DO NOT REREAD vs STALE status, plus a WorkingMemoryManifest.
+- [x] REQ-SUB-08: applyContextHookInMemory executes in < 2.0 ms median with zero disk or SQLite I/O.
+- [x] Verification: bun test test/valve.test.ts && bun run typecheck pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Long 45+ step single-prompt turns prune >60% of historical tool output characters without triggering panic re-read storms.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

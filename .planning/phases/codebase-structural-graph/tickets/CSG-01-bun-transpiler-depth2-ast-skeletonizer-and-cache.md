@@ -3,7 +3,7 @@ kind: ticket
 id: CSG-01
 phase: codebase-structural-graph
 title: "Zero-dependency Bun.Transpiler + Depth-2 closure-factory AST skeletonizer and content-addressed SQLite cache"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/codebase-structural-graph/SPEC.md
@@ -49,12 +49,12 @@ github_issue: null
 
 - **Automated command:** `bun test test/ast-skeleton.test.ts && bun run typecheck`
 - **Failing direction (RED):** skeletonizeSource fails to extract Depth-2 inner closure helpers in factory functions >= 200 lines, achieves < 88% token reduction, or indexCodebase re-parses unchanged (path, blob_sha) files.
-- [ ] REQ-SUB-09: skeletonizeSource extracts Depth-1 exports and Depth-2 inner closure helpers/returned methods inside factory functions >= 200 lines while ignoring braces inside comments, strings, template literals, and regexes.
-- [ ] REQ-SUB-10: indexCodebase (supporting both (rootDir, db, options) and (db, projectRoot, options) signatures) skips unchanged (path, blob_sha) files in < 0.5 ms/file and re-indexes a single modified file in < 5 ms.
-- [ ] REQ-SUB-10: readSymbolSlice hydrates exact [Lstart-Lend] source slices by Depth-1 name, Depth-2Parent.child qualified_name, or explicit [Lstart-Lend] range.
-- [ ] Verification: bun test test/ast-skeleton.test.ts && bun run typecheck pass.
+- [x] REQ-SUB-09: skeletonizeSource extracts Depth-1 exports and Depth-2 inner closure helpers/returned methods inside factory functions >= 200 lines while ignoring braces inside comments, strings, template literals, and regexes.
+- [x] REQ-SUB-10: indexCodebase (supporting both (rootDir, db, options) and (db, projectRoot, options) signatures) skips unchanged (path, blob_sha) files in < 0.5 ms/file and re-indexes a single modified file in < 5 ms.
+- [x] REQ-SUB-10: readSymbolSlice hydrates exact [Lstart-Lend] source slices by Depth-1 name, Depth-2Parent.child qualified_name, or explicit [Lstart-Lend] range.
+- [x] Verification: bun test test/ast-skeleton.test.ts && bun run typecheck pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Calling substrate.viewport({ action: "skeleton" }) and substrate.viewport({ action: "slice" }) returns Depth-2 outlines and exact line slices.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

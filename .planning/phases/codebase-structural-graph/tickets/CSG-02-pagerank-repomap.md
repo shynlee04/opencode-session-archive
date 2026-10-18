@@ -3,7 +3,7 @@ kind: ticket
 id: CSG-02
 phase: codebase-structural-graph
 title: "Iterative Float64Array CSR PageRank and < 1,000-token Tier-1 RepoMap"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/codebase-structural-graph/SPEC.md
@@ -49,11 +49,11 @@ github_issue: null
 
 - **Automated command:** `bun test test/pagerank-cochange.test.ts && bun run typecheck`
 - **Failing direction (RED):** 20-iteration PageRank scores do not sum to 1.0, solve latency exceeds 2 ms, or renderRepoMap exceeds the 1,000-token budget.
-- [ ] REQ-SUB-11: computeCodebasePageRank converges in 20 iterations in < 2.0 ms with Math.abs(sum - 1.0) < 1e-6.
-- [ ] REQ-SUB-11: renderRepoMap formats top PageRank modules and exported symbols with [Lstart-Lend] spans within budgetTokens (default 1,000 tokens) in < 5.0 ms.
-- [ ] Verification: bun test test/pagerank-cochange.test.ts && bun run typecheck pass.
+- [x] REQ-SUB-11: computeCodebasePageRank converges in 20 iterations in < 2.0 ms with Math.abs(sum - 1.0) < 1e-6.
+- [x] REQ-SUB-11: renderRepoMap formats top PageRank modules and exported symbols with [Lstart-Lend] spans within budgetTokens (default 1,000 tokens) in < 5.0 ms.
+- [x] Verification: bun test test/pagerank-cochange.test.ts && bun run typecheck pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Calling substrate.viewport({ action: "repomap" }) returns a < 1,000-token topological map of the repository.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

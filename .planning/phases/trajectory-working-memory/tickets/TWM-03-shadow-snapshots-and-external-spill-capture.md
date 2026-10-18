@@ -3,7 +3,7 @@ kind: ticket
 id: TWM-03
 phase: trajectory-working-memory
 title: "Shadow snapshot Git tree blob sinking and external tool-output/shell spill capture"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/trajectory-working-memory/SPEC.md
@@ -49,11 +49,11 @@ github_issue: null
 
 - **Automated command:** `bun test test/snapshots-spills.test.ts && bun run typecheck`
 - **Failing direction (RED):** uncommitted file drafts in shadow Git bare repos (start_tree/end_tree) or external tool-output/shell spill files are not sunk into .session-archive/blobs/<sha256>.txt and indexed in snapshot_artifact and spill_artifact.
-- [ ] REQ-SUB-05: sinkShadowSnapshots recovers start_tree:path and end_tree:path blobs from a bare Git repo in 1 batch pass, deduplicating identical Git blob SHAs and writing snapshot_artifact rows.
-- [ ] REQ-SUB-05: sinkExternalSpills captures full external tool-output and shell spill files into blobs/<sha256>.txt and records inline_byte_len vs full_byte_len in spill_artifact.
-- [ ] Verification: bun test test/snapshots-spills.test.ts && bun run typecheck pass.
+- [x] REQ-SUB-05: sinkShadowSnapshots recovers start_tree:path and end_tree:path blobs from a bare Git repo in 1 batch pass, deduplicating identical Git blob SHAs and writing snapshot_artifact rows.
+- [x] REQ-SUB-05: sinkExternalSpills captures full external tool-output and shell spill files into blobs/<sha256>.txt and records inline_byte_len vs full_byte_len in spill_artifact.
+- [x] Verification: bun test test/snapshots-spills.test.ts && bun run typecheck pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Uncommitted SPEC.md or source drafts from interrupted child sessions and >50 KB spilled tool outputs are recoverable from .session-archive/blobs/<sha256>.txt via snapshot_artifact and spill_artifact.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

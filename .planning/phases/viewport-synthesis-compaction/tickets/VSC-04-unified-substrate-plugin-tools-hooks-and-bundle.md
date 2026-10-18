@@ -3,7 +3,7 @@ kind: ticket
 id: VSC-04
 phase: viewport-synthesis-compaction
 title: "Unified two-tool plugin surface (substrate.valve + substrate.viewport), backwards-compatible aliases, lifecycle hooks, and single-file bundle gate"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/viewport-synthesis-compaction/SPEC.md
@@ -49,12 +49,12 @@ github_issue: null
 
 - **Automated command:** `bun test test/plugin.test.ts && bun run typecheck && bun run build`
 - **Failing direction (RED):** src/plugin.ts fails to register substrate.valve, substrate.viewport, or compatibility aliases (archive.persist, ctx.context-prune, substrate, viewport), fails to wire context/compaction/event hooks, or fails bun run build.
-- [ ] REQ-SUB-17: plugin.setup registers substrate.valve, substrate.viewport, archive.persist, ctx.context-prune, substrate, and viewport, all resolving omitted sessionID via resolveDefaultSessionId.
-- [ ] REQ-SUB-17: context hook runs applyContextHookInMemory in < 2 ms; compaction hook appends CompactionContinuationPacket to event.prompt; event.subscribe triggers incremental sync on idle and session.compacted.
-- [ ] REQ-SUB-17: bun run build produces self-contained dist/session-archive.ts leaving @opencode/plugin external.
-- [ ] Verification: bun test && bun run typecheck && bun run build pass.
+- [x] REQ-SUB-17: plugin.setup registers substrate.valve, substrate.viewport, archive.persist, ctx.context-prune, substrate, and viewport, all resolving omitted sessionID via resolveDefaultSessionId.
+- [x] REQ-SUB-17: context hook runs applyContextHookInMemory in < 2 ms; compaction hook appends CompactionContinuationPacket to event.prompt; event.subscribe triggers incremental sync on idle and session.compacted.
+- [x] REQ-SUB-17: bun run build produces self-contained dist/session-archive.ts leaving @opencode/plugin external.
+- [x] Verification: bun test && bun run typecheck && bun run build pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Loading dist/session-archive.ts in OpenCode V2 exposes substrate.valve, substrate.viewport, and legacy aliases with automatic context pruning and compaction continuity.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

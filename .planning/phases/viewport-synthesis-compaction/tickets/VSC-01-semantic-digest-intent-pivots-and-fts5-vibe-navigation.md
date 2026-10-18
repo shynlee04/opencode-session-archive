@@ -3,7 +3,7 @@ kind: ticket
 id: VSC-01
 phase: viewport-synthesis-compaction
 title: "Semantic session digest, 9-category IntentPivot categorization, and FTS5 vibe navigation"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/viewport-synthesis-compaction/SPEC.md
@@ -49,11 +49,11 @@ github_issue: null
 
 - **Automated command:** `bun test test/semantic-digest.test.ts && bun run typecheck`
 - **Failing direction (RED):** user prompts are not classified into the 9 IntentPivot categories, compound tokens (wave2-slice1) fail FTS5 matching, or queryVibeNavigation exceeds 600 tokens or 5 ms.
-- [ ] REQ-SUB-13: classifyIntentPivot deterministically categorizes user prompts across all 9 categories (initial_goal, course_correction, approval, handoff_resume, prune_or_continuity, followup, verification_directive, scope_narrowing, continuation_after_compaction).
-- [ ] REQ-SUB-13: queryVibeNavigation resolves natural-language queries (including compound tokens like wave2-slice1) to the ranked root session and renders a < 600-token StrategistViewport digest in < 5.0 ms.
-- [ ] Verification: bun test test/semantic-digest.test.ts && bun run typecheck pass.
+- [x] REQ-SUB-13: classifyIntentPivot deterministically categorizes user prompts across all 9 categories (initial_goal, course_correction, approval, handoff_resume, prune_or_continuity, followup, verification_directive, scope_narrowing, continuation_after_compaction).
+- [x] REQ-SUB-13: queryVibeNavigation resolves natural-language queries (including compound tokens like wave2-slice1) to the ranked root session and renders a < 600-token StrategistViewport digest in < 5.0 ms.
+- [x] Verification: bun test test/semantic-digest.test.ts && bun run typecheck pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Calling substrate.viewport({ action: "search", query: "..." }) and substrate.viewport({ action: "timeline" }) locates sessions by meaning without opaque ses_... IDs.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).

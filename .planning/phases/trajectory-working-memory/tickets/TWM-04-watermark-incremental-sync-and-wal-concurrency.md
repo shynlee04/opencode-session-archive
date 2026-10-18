@@ -3,7 +3,7 @@ kind: ticket
 id: TWM-04
 phase: trajectory-working-memory
 title: "Watermark-gated incremental SQLite sync and BEGIN IMMEDIATE WAL concurrency"
-status: todo
+status: done
 type: feature
 owner: implementer
 spec_anchor: .planning/phases/trajectory-working-memory/SPEC.md
@@ -49,12 +49,12 @@ github_issue: null
 
 - **Automated command:** `bun test test/persist.test.ts && bun run typecheck`
 - **Failing direction (RED):** persist() re-reads or re-normalizes already-synced messages when seq <= last_max_seq, exceeds 150 ms on a 1-turn delta, or fails under concurrent WAL readers/writers.
-- [ ] REQ-SUB-06: No-op incremental sync on an unchanged session tree completes in < 2 ms with 0 message rows fetched.
-- [ ] REQ-SUB-06: 1-turn incremental delta sync fetches only seq > last_max_seq messages, appends to the session JSONL, updates index.sqlite, and advances sync_watermark in < 150 ms.
-- [ ] REQ-SUB-06: 50 concurrent read/write operations against index.sqlite in WAL mode complete with 0 SQLITE_BUSY errors.
-- [ ] Verification: bun test test/persist.test.ts && bun run typecheck pass.
+- [x] REQ-SUB-06: No-op incremental sync on an unchanged session tree completes in < 2 ms with 0 message rows fetched.
+- [x] REQ-SUB-06: 1-turn incremental delta sync fetches only seq > last_max_seq messages, appends to the session JSONL, updates index.sqlite, and advances sync_watermark in < 150 ms.
+- [x] REQ-SUB-06: 50 concurrent read/write operations against index.sqlite in WAL mode complete with 0 SQLITE_BUSY errors.
+- [x] Verification: bun test test/persist.test.ts && bun run typecheck pass.
 
 ## Runtime / UAT
 
 - **Real journey:** Idle and compaction background syncs update .session-archive/index.sqlite incrementally in a few milliseconds without blocking the host.
-- **Gate status:** `todo` (engineering verification and owner UAT pending).
+- **Gate status:** `ENGINEERING_VERIFIED` · `UAT_PENDING` (automated gate verified; owner UAT pending).
