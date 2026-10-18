@@ -206,7 +206,7 @@ describe("plugin shell & VSC-04 unified surface (REQ-SUB-17)", () => {
     await contextHook!(hookEvent)
     const elapsedMs = performance.now() - t0
     expect(elapsedMs).toBeLessThan(10)
-    expect(hookEvent.system[0]).toContain("Working-Memory Manifest")
+    expect(hookEvent.system[0]).toContain("WorkingMemoryManifest")
     expect(hookEvent.messages[1].content[0].state.content[0].text).toContain("[Pruned read")
 
     // Resolve pruned blob via substrate.viewport({ action: "resolve" })
