@@ -1,7 +1,7 @@
 {
-  "name": "hivemind-session-archive",
+  "name": "hivemind-substrate",
   "version": "0.1.0",
-  "description": "OpenCode V2 plugin: persist the current session tree into a deterministic, project-scoped JSONL transcript archive plus a SQLite index, from a read-only view of the host session database.",
+  "description": "OpenCode V2 Context & Working-Memory Substrate plugin: unifies session/delegation archival, step-watermark working-set pruning, compaction continuity, and AST/PageRank/co-change codebase viewports.",
   "license": "MIT",
   "author": "shynlee04",
   "type": "module",
@@ -13,6 +13,7 @@
     "./package.json": "./package.json"
   },
   "bin": {
+    "hivemind-substrate": "bin/install.mjs",
     "hivemind-session-archive": "bin/install.mjs"
   },
   "files": [
@@ -21,7 +22,8 @@
     "bin",
     "README.md",
     "LICENSE",
-    "AGENTS.md"
+    "AGENTS.md",
+    "GLOSSARY.md"
   ],
   "scripts": {
     "test": "bun test",
@@ -35,9 +37,11 @@
   "keywords": [
     "opencode",
     "opencode-plugin",
-    "session",
-    "archive",
-    "transcript"
+    "context-substrate",
+    "session-archive",
+    "context-prune",
+    "compaction-continuity",
+    "repomap"
   ],
   "dependencies": {
     "jsonc-parser": "^3.3.1"
