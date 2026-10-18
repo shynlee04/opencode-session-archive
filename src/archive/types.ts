@@ -327,15 +327,55 @@ export interface FileReadLedgerRow {
   readonly line_range: string
   readonly start_line: number | null
   readonly end_line: number | null
+  readonly total_lines?: number | null
+  readonly is_truncated?: boolean | number
   readonly chars: number
   readonly char_len: number
   readonly blob_sha: string
   readonly blob_sha256: string
+  readonly slice_sha?: string
   readonly read_blob_sha: string
   readonly disk_blob_sha: string
   readonly summary: string
   readonly staleness_status: string
   readonly t: number
+  readonly updated_at: string
+}
+
+export interface ProvenanceChainRow {
+  readonly chain_id: string
+  readonly root_session_id: string
+  readonly session_id: string
+  readonly finding_id: string
+  readonly finding_seq: number
+  readonly finding_session_id: string
+  readonly finding_summary: string
+  readonly child_session_id: string | null
+  readonly intent_seq: number
+  readonly intent_message_id: string
+  readonly intent_summary: string
+  readonly decision_seq: number | null
+  readonly decision_pivot_seq: number | null
+  readonly decision_summary: string | null
+  readonly target_path: string
+  readonly touched_files_json: string
+  readonly read_or_review_blob_sha: string
+  readonly repair_seq: number | null
+  readonly repair_session_id: string | null
+  readonly repair_blob_sha: string | null
+  readonly receipt_command: string | null
+  readonly verification_command: string | null
+  readonly receipt_exit_code: number | null
+  readonly verification_exit_code: number | null
+  readonly verification_seq: number | null
+  readonly receipt_blob_sha: string | null
+  readonly verification_blob_ref: string | null
+  readonly head_sha: string | null
+  readonly worktree_tree_sha: string | null
+  readonly disk_blob_sha: string
+  readonly staleness_status: string
+  readonly outcome: "VERIFIED_PASS" | "VERIFIED_FAIL" | "UNVERIFIED" | "IN_PROGRESS"
+  readonly created_at: number
   readonly updated_at: string
 }
 
@@ -447,6 +487,7 @@ export interface NormalizedMessage {
   readonly fileReads: readonly FileReadLedgerRow[]
   readonly skillLoads: readonly SkillLoadLedgerRow[]
   readonly fileTouches: readonly FileTouchRow[]
+  readonly provenanceChains?: readonly ProvenanceChainRow[]
 }
 
 export interface KvBindingRow {

@@ -9,6 +9,7 @@ import type {
   KvBindingRow,
   KvContextPruneRow,
   KvForeignIndexRow,
+  ProvenanceChainRow,
   SkillLoadLedgerRow,
   SnapshotArtifactRow,
   SpillArtifactRow,
@@ -122,6 +123,7 @@ export interface IndexInput {
   readonly fileTouches?: readonly FileTouchRow[]
   readonly snapshotArtifacts?: readonly SnapshotArtifactRow[]
   readonly spillArtifacts?: readonly SpillArtifactRow[]
+  readonly provenanceChains?: readonly ProvenanceChainRow[]
   readonly watermarks?: readonly SyncWatermarkRow[]
   readonly fileCount?: number
 }
@@ -144,6 +146,7 @@ export interface IncrementalIndexInput {
   readonly fileTouches: readonly FileTouchRow[]
   readonly snapshotArtifacts: readonly SnapshotArtifactRow[]
   readonly spillArtifacts: readonly SpillArtifactRow[]
+  readonly provenanceChains?: readonly ProvenanceChainRow[]
   readonly watermarks: readonly SyncWatermarkRow[]
   readonly fileCount: number
 }
@@ -151,40 +154,40 @@ export interface IncrementalIndexInput {
 export const DDL = `
 CREATE TABLE IF NOT EXISTS session (
   id TEXT PRIMARY KEY,
-  root_id TEXT NOT NULL,
-  project_id TEXT NOT NULL,
+  root_id TEXT NOT NULL DEFAULT '',
+  project_id TEXT NOT NULL DEFAULT '',
   parent_id TEXT,
-  depth INTEGER NOT NULL,
-  lane_kind TEXT NOT NULL,
-  lane_path TEXT NOT NULL,
+  depth INTEGER NOT NULL DEFAULT 0,
+  lane_kind TEXT NOT NULL DEFAULT 'root',
+  lane_path TEXT NOT NULL DEFAULT '',
   title TEXT,
   agent TEXT,
   provider TEXT,
   model_id TEXT,
   variant TEXT,
-  harness TEXT,
+  harness TEXT DEFAULT 'opencode',
   outcome TEXT,
-  cost REAL,
-  tok_in INTEGER,
-  tok_out INTEGER,
-  tok_reason INTEGER,
-  tok_cache_r INTEGER,
-  tok_cache_w INTEGER,
+  cost REAL DEFAULT 0,
+  tok_in INTEGER DEFAULT 0,
+  tok_out INTEGER DEFAULT 0,
+  tok_reason INTEGER DEFAULT 0,
+  tok_cache_r INTEGER DEFAULT 0,
+  tok_cache_w INTEGER DEFAULT 0,
   files_changed INTEGER,
   additions INTEGER,
   deletions INTEGER,
-  t_created INTEGER,
-  t_updated INTEGER,
+  t_created INTEGER DEFAULT 0,
+  t_updated INTEGER DEFAULT 0,
   t_idle INTEGER,
   t_compacting INTEGER,
   t_archived INTEGER,
-  resume_attempts INTEGER,
-  message_count INTEGER,
-  transcript_path TEXT
+  resume_attempts INTEGER DEFAULT 0,
+  message_count INTEGER DEFAULT 0,
+  transcript_path TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS delegation (
   call_id TEXT NOT NULL,
-  root_id TEXT NOT NULL,
+  root_id TEXT NOT NULL DEFAULT '',
   parent_session TEXT NOT NULL,
   parent_message_id TEXT,
   child_session TEXT,
@@ -289,18 +292,18 @@ CREATE TABLE IF NOT EXISTS delegation_turn (
   parent_session_id TEXT NOT NULL,
   call_id TEXT NOT NULL,
   turn_index INTEGER NOT NULL,
-  child_session_id TEXT NOT NULL,
-  mode TEXT NOT NULL,
-  harness TEXT NOT NULL,
+  child_session_id TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT 'spawn',
+  harness TEXT NOT NULL DEFAULT 'opencode',
   agent TEXT,
   model TEXT,
   foreign_session_id TEXT,
-  start_seq INTEGER NOT NULL,
-  end_seq INTEGER NOT NULL,
-  start_message_id TEXT NOT NULL,
-  end_message_id TEXT NOT NULL,
+  start_seq INTEGER NOT NULL DEFAULT 0,
+  end_seq INTEGER NOT NULL DEFAULT 0,
+  start_message_id TEXT NOT NULL DEFAULT '',
+  end_message_id TEXT NOT NULL DEFAULT '',
   reported_outcome TEXT,
-  verified_outcome TEXT NOT NULL,
+  verified_outcome TEXT NOT NULL DEFAULT 'clean',
   blocker_summary TEXT,
   tool_error_count INTEGER NOT NULL DEFAULT 0,
   tool_completed_count INTEGER NOT NULL DEFAULT 0,
@@ -313,45 +316,50 @@ CREATE TABLE IF NOT EXISTS delegation_turn (
 CREATE TABLE IF NOT EXISTS file_read_ledger (
   session_id TEXT NOT NULL,
   path TEXT NOT NULL,
-  normalized_path TEXT NOT NULL,
-  call_id TEXT NOT NULL,
-  message_id TEXT NOT NULL,
-  seq INTEGER NOT NULL,
-  read_seq INTEGER NOT NULL,
-  line_range TEXT,
+  normalized_path TEXT NOT NULL DEFAULT '',
+  call_id TEXT NOT NULL DEFAULT '',
+  message_id TEXT NOT NULL DEFAULT '',
+  seq INTEGER NOT NULL DEFAULT 0,
+  read_seq INTEGER NOT NULL DEFAULT 0,
+  line_range TEXT NOT NULL DEFAULT 'L1-L120',
   start_line INTEGER,
   end_line INTEGER,
-  chars INTEGER NOT NULL,
-  char_len INTEGER NOT NULL,
-  blob_sha TEXT NOT NULL,
-  blob_sha256 TEXT NOT NULL,
-  read_blob_sha TEXT NOT NULL,
-  disk_blob_sha TEXT,
-  summary TEXT NOT NULL,
-  staleness_status TEXT NOT NULL DEFAULT 'fresh',
-  t INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
+  total_lines INTEGER,
+  is_truncated INTEGER NOT NULL DEFAULT 0,
+  chars INTEGER NOT NULL DEFAULT 0,
+  char_len INTEGER NOT NULL DEFAULT 0,
+  blob_sha TEXT NOT NULL DEFAULT '',
+  blob_sha256 TEXT NOT NULL DEFAULT '',
+  slice_sha TEXT,
+  read_blob_sha TEXT NOT NULL DEFAULT '',
+  disk_blob_sha TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  staleness_status TEXT NOT NULL DEFAULT 'FRESH — DO NOT REREAD',
+  t INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (session_id, path)
 );
+CREATE INDEX IF NOT EXISTS idx_file_read_ledger_session ON file_read_ledger(session_id, read_seq);
 CREATE TABLE IF NOT EXISTS skill_load_ledger (
   session_id TEXT NOT NULL,
   skill_name TEXT NOT NULL,
-  call_id TEXT NOT NULL,
-  message_id TEXT NOT NULL,
-  seq INTEGER NOT NULL,
-  loaded_seq INTEGER NOT NULL,
-  load_seq INTEGER NOT NULL,
-  chars INTEGER NOT NULL,
-  char_len INTEGER NOT NULL,
-  blob_sha TEXT NOT NULL,
-  blob_sha256 TEXT NOT NULL,
-  skill_blob_sha TEXT NOT NULL,
-  blob_ref TEXT NOT NULL,
-  summary TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'loaded',
-  t INTEGER NOT NULL,
+  call_id TEXT NOT NULL DEFAULT '',
+  message_id TEXT NOT NULL DEFAULT '',
+  seq INTEGER NOT NULL DEFAULT 0,
+  loaded_seq INTEGER NOT NULL DEFAULT 0,
+  load_seq INTEGER NOT NULL DEFAULT 0,
+  chars INTEGER NOT NULL DEFAULT 0,
+  char_len INTEGER NOT NULL DEFAULT 0,
+  blob_sha TEXT NOT NULL DEFAULT '',
+  blob_sha256 TEXT NOT NULL DEFAULT '',
+  skill_blob_sha TEXT NOT NULL DEFAULT '',
+  blob_ref TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'ACTIVE — DO NOT RE-INVOKE',
+  t INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (session_id, skill_name)
 );
+CREATE INDEX IF NOT EXISTS idx_skill_load_ledger_session ON skill_load_ledger(session_id, load_seq);
 CREATE TABLE IF NOT EXISTS file_touch (
   session_id TEXT NOT NULL,
   seq INTEGER NOT NULL,
@@ -409,7 +417,250 @@ CREATE TABLE IF NOT EXISTS sync_root_meta (
   root_id TEXT PRIMARY KEY,
   file_count INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS provenance_chain (
+  chain_id TEXT PRIMARY KEY,
+  root_session_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  finding_id TEXT NOT NULL DEFAULT '',
+  finding_seq INTEGER NOT NULL DEFAULT 0,
+  finding_session_id TEXT NOT NULL DEFAULT '',
+  finding_summary TEXT NOT NULL DEFAULT '',
+  child_session_id TEXT,
+  intent_seq INTEGER NOT NULL DEFAULT 0,
+  intent_message_id TEXT NOT NULL DEFAULT '',
+  intent_summary TEXT NOT NULL DEFAULT '',
+  decision_seq INTEGER,
+  decision_pivot_seq INTEGER,
+  decision_summary TEXT,
+  target_path TEXT NOT NULL DEFAULT '',
+  touched_files_json TEXT NOT NULL DEFAULT '[]',
+  read_or_review_blob_sha TEXT NOT NULL DEFAULT '',
+  repair_seq INTEGER,
+  repair_session_id TEXT,
+  repair_blob_sha TEXT,
+  receipt_command TEXT,
+  verification_command TEXT,
+  receipt_exit_code INTEGER,
+  verification_exit_code INTEGER,
+  verification_seq INTEGER,
+  receipt_blob_sha TEXT,
+  verification_blob_ref TEXT,
+  head_sha TEXT,
+  worktree_tree_sha TEXT,
+  disk_blob_sha TEXT NOT NULL DEFAULT '',
+  staleness_status TEXT NOT NULL DEFAULT 'VERIFIED_FRESH',
+  outcome TEXT NOT NULL DEFAULT 'VERIFIED_PASS',
+  created_at INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_provenance_chain_session ON provenance_chain(root_session_id);
+CREATE INDEX IF NOT EXISTS idx_provenance_chain_target ON provenance_chain(root_session_id, target_path);
+CREATE TABLE IF NOT EXISTS compaction_continuation_ledger (
+  session_id TEXT NOT NULL,
+  compaction_seq INTEGER NOT NULL,
+  compaction_reason TEXT NOT NULL DEFAULT 'auto',
+  reason TEXT NOT NULL DEFAULT 'auto',
+  tok_input INTEGER NOT NULL DEFAULT 0,
+  headline TEXT NOT NULL DEFAULT '',
+  verification_gate_status TEXT NOT NULL DEFAULT 'in_progress_or_unverified',
+  packet_markdown TEXT NOT NULL DEFAULT '',
+  packet_chars INTEGER NOT NULL DEFAULT 0,
+  packet_tokens INTEGER NOT NULL DEFAULT 0,
+  summary_hash TEXT,
+  fresh_files_count INTEGER NOT NULL DEFAULT 0,
+  stale_files_count INTEGER NOT NULL DEFAULT 0,
+  active_skills_count INTEGER NOT NULL DEFAULT 0,
+  provenance_chains_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (session_id, compaction_seq)
+);
+CREATE TABLE IF NOT EXISTS session_semantic_digest (
+  session_id TEXT PRIMARY KEY,
+  root_id TEXT NOT NULL DEFAULT '',
+  headline TEXT NOT NULL DEFAULT '',
+  intent_pivots_json TEXT NOT NULL DEFAULT '[]',
+  touched_files_json TEXT NOT NULL DEFAULT '[]',
+  key_decisions_json TEXT NOT NULL DEFAULT '[]',
+  verification_state TEXT NOT NULL DEFAULT 'in_progress_or_unverified'
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_digest_root ON session_semantic_digest(root_id);
+CREATE TABLE IF NOT EXISTS intent_pivot (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL DEFAULT '',
+  seq INTEGER NOT NULL DEFAULT 0,
+  t TEXT NOT NULL DEFAULT '',
+  prompt_excerpt TEXT NOT NULL DEFAULT '',
+  blob_ref TEXT NOT NULL DEFAULT '',
+  prompt_blob_ref TEXT,
+  pivot_kind TEXT NOT NULL DEFAULT 'followup'
+);
+CREATE INDEX IF NOT EXISTS idx_intent_pivot_session_seq ON intent_pivot(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_intent_pivot_blob_ref ON intent_pivot(blob_ref);
+CREATE TABLE IF NOT EXISTS milestone (
+  id TEXT,
+  session_id TEXT NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 1,
+  kind TEXT NOT NULL DEFAULT 'decision',
+  summary TEXT,
+  text TEXT,
+  prompt_text TEXT,
+  blob_ref TEXT,
+  reported_outcome TEXT,
+  verified_outcome TEXT,
+  t INTEGER,
+  PRIMARY KEY (session_id, seq, kind)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS substrate_fts USING fts5(
+  session_id,
+  kind,
+  symbol_or_path,
+  body,
+  tokenize = 'porter unicode61'
+);
+CREATE TABLE IF NOT EXISTS code_file (
+  path TEXT PRIMARY KEY,
+  blob_sha TEXT NOT NULL DEFAULT '',
+  loc INTEGER NOT NULL DEFAULT 0,
+  raw_tokens INTEGER NOT NULL DEFAULT 0,
+  skeleton_tokens INTEGER NOT NULL DEFAULT 0,
+  skeleton_text TEXT NOT NULL DEFAULT '',
+  pagerank REAL NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS code_symbol (
+  path TEXT NOT NULL,
+  name TEXT NOT NULL,
+  qualified_name TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT 'function',
+  depth INTEGER NOT NULL DEFAULT 1,
+  parent_symbol TEXT,
+  exported INTEGER NOT NULL DEFAULT 0,
+  start_line INTEGER NOT NULL DEFAULT 1,
+  end_line INTEGER NOT NULL DEFAULT 1,
+  signature TEXT NOT NULL DEFAULT '',
+  blob_sha TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (path, start_line, qualified_name)
+);
+CREATE INDEX IF NOT EXISTS idx_code_symbol_path_name ON code_symbol(path, name);
+CREATE INDEX IF NOT EXISTS idx_code_symbol_path_qualified ON code_symbol(path, qualified_name);
+CREATE INDEX IF NOT EXISTS idx_code_symbol_parent ON code_symbol(path, parent_symbol);
+CREATE TABLE IF NOT EXISTS code_import_edge (
+  from_path TEXT NOT NULL,
+  to_path TEXT NOT NULL,
+  specifier TEXT NOT NULL DEFAULT '',
+  symbols_json TEXT NOT NULL DEFAULT '[]',
+  specifiers_json TEXT NOT NULL DEFAULT '[]',
+  is_type_only INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (from_path, to_path)
+);
+CREATE INDEX IF NOT EXISTS idx_code_import_edge_to ON code_import_edge(to_path);
+CREATE TABLE IF NOT EXISTS git_cochange (
+  file_a TEXT NOT NULL,
+  file_b TEXT NOT NULL,
+  co_commits INTEGER NOT NULL DEFAULT 0,
+  commits_a INTEGER NOT NULL DEFAULT 0,
+  commits_b INTEGER NOT NULL DEFAULT 0,
+  prob_a_given_b REAL NOT NULL DEFAULT 0,
+  prob_b_given_a REAL NOT NULL DEFAULT 0,
+  jaccard REAL NOT NULL DEFAULT 0,
+  has_static_edge INTEGER NOT NULL DEFAULT 0,
+  recent_subjects_json TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY (file_a, file_b)
+);
+CREATE INDEX IF NOT EXISTS idx_git_cochange_file_a ON git_cochange(file_a);
+CREATE INDEX IF NOT EXISTS idx_git_cochange_file_b ON git_cochange(file_b);
+CREATE INDEX IF NOT EXISTS idx_git_cochange_hidden ON git_cochange(has_static_edge, co_commits DESC);
+CREATE TABLE IF NOT EXISTS git_cochange_file_stats (
+  path TEXT PRIMARY KEY,
+  commit_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS git_cochange_commit (
+  hash TEXT PRIMARY KEY,
+  subject TEXT NOT NULL DEFAULT '',
+  files_json TEXT NOT NULL DEFAULT '[]',
+  applied_at INTEGER NOT NULL DEFAULT 0
+);
 `
+
+export const SCHEMA_DDL = DDL
+
+const FILE_READ_LEDGER_MIGRATION_COLS: ReadonlyArray<readonly [string, string]> = [
+  ["start_line", "INTEGER"],
+  ["end_line", "INTEGER"],
+  ["total_lines", "INTEGER"],
+  ["is_truncated", "INTEGER DEFAULT 0"],
+  ["slice_sha", "TEXT"],
+]
+
+const PROVENANCE_CHAIN_MIGRATION_COLS: ReadonlyArray<readonly [string, string]> = [
+  ["session_id", "TEXT NOT NULL DEFAULT ''"],
+  ["finding_seq", "INTEGER NOT NULL DEFAULT 0"],
+  ["finding_session_id", "TEXT NOT NULL DEFAULT ''"],
+  ["finding_summary", "TEXT NOT NULL DEFAULT ''"],
+  ["child_session_id", "TEXT"],
+  ["intent_seq", "INTEGER NOT NULL DEFAULT 0"],
+  ["intent_message_id", "TEXT NOT NULL DEFAULT ''"],
+  ["intent_summary", "TEXT NOT NULL DEFAULT ''"],
+  ["decision_seq", "INTEGER"],
+  ["decision_summary", "TEXT"],
+  ["touched_files_json", "TEXT NOT NULL DEFAULT '[]'"],
+  ["verification_seq", "INTEGER"],
+  ["outcome", "TEXT NOT NULL DEFAULT 'VERIFIED_PASS'"],
+  ["created_at", "INTEGER NOT NULL DEFAULT 0"],
+  ["decision_pivot_seq", "INTEGER"],
+  ["read_or_review_blob_sha", "TEXT NOT NULL DEFAULT ''"],
+  ["repair_seq", "INTEGER"],
+  ["repair_session_id", "TEXT"],
+  ["repair_blob_sha", "TEXT"],
+  ["receipt_command", "TEXT"],
+  ["verification_command", "TEXT"],
+  ["receipt_exit_code", "INTEGER"],
+  ["verification_exit_code", "INTEGER"],
+  ["receipt_blob_sha", "TEXT"],
+  ["verification_blob_ref", "TEXT"],
+  ["head_sha", "TEXT"],
+  ["worktree_tree_sha", "TEXT"],
+  ["disk_blob_sha", "TEXT NOT NULL DEFAULT ''"],
+  ["staleness_status", "TEXT NOT NULL DEFAULT 'VERIFIED_FRESH'"],
+  ["updated_at", "TEXT NOT NULL DEFAULT ''"],
+]
+
+export function ensureHoneycombSchema(db: Database): void {
+  db.exec(DDL)
+  const existingCols = new Set(
+    (db.query("PRAGMA table_info(file_read_ledger)").all() as Array<{ name: string }>).map((c) => c.name),
+  )
+  for (const [colName, colDef] of FILE_READ_LEDGER_MIGRATION_COLS) {
+    if (!existingCols.has(colName)) {
+      db.exec(`ALTER TABLE file_read_ledger ADD COLUMN ${colName} ${colDef}`)
+    }
+  }
+  const provCols = new Set(
+    (db.query("PRAGMA table_info(provenance_chain)").all() as Array<{ name: string }>).map((c) => c.name),
+  )
+  for (const [colName, colDef] of PROVENANCE_CHAIN_MIGRATION_COLS) {
+    if (!provCols.has(colName)) {
+      db.exec(`ALTER TABLE provenance_chain ADD COLUMN ${colName} ${colDef}`)
+    }
+  }
+  // Self-heal pre-A3 watermarks where file_read_ledger rows lack slice_sha or provenance_chain was never extracted
+  try {
+    const legacyCount = (
+      db
+        .query("SELECT COUNT(*) AS cnt FROM file_read_ledger WHERE slice_sha IS NULL OR slice_sha = '' OR read_blob_sha = blob_sha")
+        .get() as { cnt?: number } | null
+    )?.cnt ?? 0
+    if (legacyCount > 0) {
+      db.exec(
+        "DELETE FROM sync_watermark WHERE session_id IN (SELECT DISTINCT session_id FROM file_read_ledger WHERE slice_sha IS NULL OR slice_sha = '' OR read_blob_sha = blob_sha)",
+      )
+    }
+  } catch {
+    // ignore if tables are empty
+  }
+}
 
 export function configureWalPragmas(db: Database): {
   readonly journalMode: string
@@ -432,7 +683,7 @@ export function initSyncDatabase(sqlitePath: string): Database {
   mkdirSync(path.dirname(sqlitePath), { recursive: true })
   const db = new Database(sqlitePath)
   configureWalPragmas(db)
-  db.exec(DDL)
+  ensureHoneycombSchema(db)
   return db
 }
 
@@ -789,12 +1040,14 @@ export function writeIncrementalIndex(
         const insRead = db.query(`
           INSERT OR REPLACE INTO file_read_ledger (
             session_id, path, normalized_path, call_id, message_id, seq, read_seq,
-            line_range, start_line, end_line, chars, char_len,
-            blob_sha, blob_sha256, read_blob_sha, disk_blob_sha,
+            line_range, start_line, end_line, total_lines, is_truncated, chars, char_len,
+            blob_sha, blob_sha256, slice_sha, read_blob_sha, disk_blob_sha,
             summary, staleness_status, t, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         for (const r of input.fileReads) {
+          const isTruncatedInt =
+            typeof r.is_truncated === "boolean" ? (r.is_truncated ? 1 : 0) : (r.is_truncated ?? 0)
           insRead.run(
             r.session_id,
             r.path,
@@ -806,10 +1059,13 @@ export function writeIncrementalIndex(
             r.line_range,
             r.start_line,
             r.end_line,
+            r.total_lines ?? null,
+            isTruncatedInt,
             r.chars,
             r.char_len,
             r.blob_sha,
             r.blob_sha256,
+            r.slice_sha ?? r.read_blob_sha,
             r.read_blob_sha,
             r.disk_blob_sha,
             r.summary,
@@ -923,6 +1179,58 @@ export function writeIncrementalIndex(
         }
       }
 
+      if ((input.provenanceChains?.length ?? 0) > 0) {
+        const insChain = db.query(`
+          INSERT OR REPLACE INTO provenance_chain (
+            chain_id, root_session_id, session_id, finding_id, finding_seq, finding_session_id,
+            finding_summary, child_session_id, intent_seq, intent_message_id, intent_summary,
+            decision_seq, decision_pivot_seq, decision_summary, target_path, touched_files_json,
+            read_or_review_blob_sha, repair_seq, repair_session_id, repair_blob_sha,
+            receipt_command, verification_command, receipt_exit_code, verification_exit_code,
+            verification_seq, receipt_blob_sha, verification_blob_ref, head_sha,
+            worktree_tree_sha, disk_blob_sha, staleness_status, outcome, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        for (const pc of input.provenanceChains ?? []) {
+          insChain.run(
+            pc.chain_id,
+            pc.root_session_id,
+            pc.session_id,
+            pc.finding_id,
+            pc.finding_seq,
+            pc.finding_session_id,
+            pc.finding_summary,
+            pc.child_session_id,
+            pc.intent_seq,
+            pc.intent_message_id,
+            pc.intent_summary,
+            pc.decision_seq,
+            pc.decision_pivot_seq,
+            pc.decision_summary,
+            pc.target_path,
+            pc.touched_files_json,
+            pc.read_or_review_blob_sha,
+            pc.repair_seq,
+            pc.repair_session_id,
+            pc.repair_blob_sha,
+            pc.receipt_command,
+            pc.verification_command,
+            pc.receipt_exit_code,
+            pc.verification_exit_code,
+            pc.verification_seq,
+            pc.receipt_blob_sha,
+            pc.verification_blob_ref,
+            pc.head_sha,
+            pc.worktree_tree_sha,
+            pc.disk_blob_sha,
+            pc.staleness_status,
+            pc.outcome,
+            pc.created_at,
+            pc.updated_at,
+          )
+        }
+      }
+
       if (input.watermarks.length > 0) {
         const insWm = db.query(`
           INSERT OR REPLACE INTO sync_watermark (
@@ -983,6 +1291,7 @@ export function writeIndex(targetPath: string, input: IndexInput): "written" | "
     fileTouches: input.fileTouches ?? [],
     snapshotArtifacts: input.snapshotArtifacts ?? [],
     spillArtifacts: input.spillArtifacts ?? [],
+    provenanceChains: input.provenanceChains ?? [],
     watermarks: input.watermarks ?? [],
     fileCount: input.fileCount ?? 0,
   })
