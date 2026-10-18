@@ -4,6 +4,7 @@ import path from "node:path"
 import type { Plugin } from "@opencode/plugin"
 import plugin, * as pluginExports from "../src/plugin.ts"
 import type { PersistReport } from "../src/archive/index.ts"
+import { JIT_SKELETON_MARKER } from "../src/archive/primitives.ts"
 import { addMessage, addProject, addSession, makeDbFile, makeTmpDir, PROJECT_ID } from "./helpers.ts"
 
 interface AddedTool {
@@ -18,25 +19,38 @@ const setup = async (options: Record<string, unknown>, projectRoot: string, seed
   const namespaces: { name: string; description: string }[] = []
   const added: AddedTool[] = []
   const sessionHooks = new Map<string, (event: any) => Promise<void> | void>()
+  const toolHooks = new Map<string, (event: any) => Promise<void> | void>()
   const eventListeners: Array<(event: any) => Promise<void> | void> = []
+  let registeredRpc: { def: any; handlers: any } | null = null
 
   const ctx = {
     options,
     location: { project: { id: PROJECT_ID, canonical: projectRoot } },
     session: {
-      hook: (name: string, fn: (event: any) => Promise<void> | void) => {
+      hook: async (name: string, fn: (event: any) => Promise<void> | void) => {
         sessionHooks.set(name, fn)
+        return { dispose: async () => {} }
       },
-      messages: async (_input: { sessionID: string }) => seedMessages,
+      context: async (_input: { sessionID: string }) => seedMessages,
       get: async (sessionID: string) => ({ id: sessionID, parentID: null }),
     },
     event: {
-      subscribe: (fn: (event: any) => Promise<void> | void) => {
+      subscribe: async (fn: (event: any) => Promise<void> | void) => {
         eventListeners.push(fn)
-        return () => {}
+        return { dispose: async () => {} }
+      },
+    },
+    rpc: {
+      register: async (def: any, handlers: any) => {
+        registeredRpc = { def, handlers }
+        return { emit: () => {}, dispose: async () => {} }
       },
     },
     tool: {
+      hook: async (name: string, fn: (event: any) => Promise<void> | void) => {
+        toolHooks.set(name, fn)
+        return { dispose: async () => {} }
+      },
       transform: async (callback: (editor: unknown) => void) => {
         callback({
           list: () => added,
@@ -61,7 +75,7 @@ const setup = async (options: Record<string, unknown>, projectRoot: string, seed
     if (!found) throw new Error(`Tool not found: ${qualifiedOrName}`)
     return found
   }
-  return { namespaces, added, findTool, sessionHooks, eventListeners }
+  return { namespaces, added, findTool, sessionHooks, toolHooks, eventListeners, registeredRpc }
 }
 
 const toolContext = (sessionID: string) =>
@@ -111,21 +125,26 @@ const seedDb = (projectRoot = "/repo") => {
   return dbPath
 }
 
-describe("plugin shell & VSC-04 unified surface (REQ-SUB-17)", () => {
-  test("registers substrate.valve, substrate.viewport, archive.persist, ctx.context-prune, substrate, and viewport", async () => {
+describe("plugin shell & VSC-04 / VSC-R2 unified surface (REQ-SUB-17, A1..A4)", () => {
+  test("A2 (P-4): registers exactly the 4 approved tools (substrate.valve, substrate.viewport, archive.persist, ctx.context-prune) and omits redundant root substrate/viewport tools", async () => {
     const projectRoot = makeTmpDir()
-    const { namespaces, findTool } = await setup({ dbPath: seedDb(projectRoot) }, projectRoot)
+    const { namespaces, added, findTool } = await setup({ dbPath: seedDb(projectRoot) }, projectRoot)
     const nsNames = namespaces.map((n) => n.name)
     expect(nsNames).toContain("substrate")
     expect(nsNames).toContain("archive")
     expect(nsNames).toContain("ctx")
 
+    const qualifiedNames = added.map((t) => (t.options?.namespace ? `${t.options.namespace}.${t.name}` : t.name))
+    expect(qualifiedNames).toEqual([
+      "substrate.valve",
+      "substrate.viewport",
+      "archive.persist",
+      "ctx.context-prune",
+    ])
     expect(findTool("substrate.valve").options).toMatchObject({ namespace: "substrate", codemode: true })
     expect(findTool("substrate.viewport").options).toMatchObject({ namespace: "substrate", codemode: true })
     expect(findTool("archive.persist").options).toMatchObject({ namespace: "archive", codemode: true })
     expect(findTool("ctx.context-prune").options).toMatchObject({ namespace: "ctx", codemode: true })
-    expect(findTool("substrate").name).toBe("substrate")
-    expect(findTool("viewport").name).toBe("viewport")
   })
 
   test("options.direct registers tools with codemode off", async () => {
@@ -145,6 +164,7 @@ describe("plugin shell & VSC-04 unified surface (REQ-SUB-17)", () => {
     expect(metadata.rootID).toBe("ses_root")
     expect(metadata.sessions).toBe(1)
     expect(String(result.content)).toContain("Persisted session tree rooted at ses_root")
+    expect(String(result.content)).toContain("[substrate.telemetry action=sync")
     expect(existsSync(path.join(projectRoot, ".session-archive", "sessions", "ses_root", "ses_root.jsonl"))).toBe(true)
     expect(existsSync(path.join(projectRoot, ".session-archive", "index.sqlite"))).toBe(true)
   })
@@ -159,7 +179,7 @@ describe("plugin shell & VSC-04 unified surface (REQ-SUB-17)", () => {
     expect(existsSync(path.join(projectRoot, "custom-archive", "index.sqlite"))).toBe(true)
   })
 
-  test("substrate.valve and ctx.context-prune arm/status/reset WorkingSetValve and context hook runs in < 2 ms", async () => {
+  test("D2 / P-3: substrate.valve manual prune loads trajectory from ctx.session.context or sqliteSource fallback and renders truthful WorkingMemoryManifest", async () => {
     const projectRoot = makeTmpDir()
     const messages: any[] = [
       { id: "u1", type: "user", content: [{ type: "text", text: "Run autonomous multi-step build" }] },
@@ -190,6 +210,8 @@ describe("plugin shell & VSC-04 unified surface (REQ-SUB-17)", () => {
       toolContext("ses_root"),
     )
     expect(String(pruneRes.content)).toContain("WorkingSetValve armed for session")
+    expect(String(pruneRes.content)).toContain("10/15 assistant steps thinned")
+    expect(String(pruneRes.content)).toContain("WorkingMemoryManifest")
 
     const statusRes = await findTool("ctx.context-prune").execute({ action: "status" }, toolContext("ses_root"))
     expect(String(statusRes.content)).toContain("WorkingSetValve is armed")
@@ -222,7 +244,100 @@ describe("plugin shell & VSC-04 unified surface (REQ-SUB-17)", () => {
     expect(String(resetRes.content)).toContain("WorkingSetValve reset")
   })
 
-  test("substrate.viewport supports status, timeline, provenance, search, repomap, skeleton, slice, coupled, and brief with omitted sessionID", async () => {
+  test("D2 sqliteSource fallback: substrate.valve manual prune works even when ctx.session.context returns empty", async () => {
+    const projectRoot = makeTmpDir()
+    const dir = makeTmpDir()
+    const { db, dbPath } = makeDbFile(dir)
+    addProject(db)
+    addSession(db, { id: "ses_sql_fallback", directory: projectRoot, title: "SQLite Fallback Session" })
+    addMessage(db, {
+      id: "m_u1",
+      session_id: "ses_sql_fallback",
+      type: "user",
+      seq: 1,
+      data: { time: { created: 1 }, text: "Read and analyze all modules" },
+    })
+    for (let i = 1; i <= 10; i++) {
+      addMessage(db, {
+        id: `m_a_${i}`,
+        session_id: "ses_sql_fallback",
+        type: "assistant",
+        seq: i + 1,
+        data: {
+          time: { created: i + 1, completed: i + 2 },
+          content: [
+            {
+              type: "tool",
+              id: `call_sql_${i}`,
+              name: "read",
+              state: {
+                status: "completed",
+                input: { filePath: `src/f${i}.ts` },
+                content: [{ type: "text", text: `Read file src/f${i}.ts, lines 1-2\n1: export const a = ${i}\n2: export const b = ${i}` }],
+              },
+            },
+          ],
+        },
+      })
+    }
+    db.close()
+
+    // Pass empty seedMessages so ctx.session.context returns [] and forces sqliteSource fallback
+    const { findTool } = await setup({ dbPath }, projectRoot, [])
+    const pruneRes = await findTool("substrate.valve").execute(
+      { action: "prune", mode: "step-window", keepRecentSteps: 4 },
+      toolContext("ses_sql_fallback"),
+    )
+    expect(String(pruneRes.content)).toContain("6/10 assistant steps thinned")
+    expect(String(pruneRes.content)).toContain("src/f1.ts")
+  })
+
+  test("A3 (P-1, P-8): ctx.tool.hook('execute.after') appends JIT Read Skeleton Footer on truncated reads and records SLICE coverage in valve", async () => {
+    const projectRoot = makeTmpDir()
+    mkdirSync(path.join(projectRoot, "src"), { recursive: true })
+    const fileLines: string[] = []
+    for (let i = 1; i <= 40; i++) {
+      fileLines.push(`export function helperFunc${i}(x: number): number {`)
+      fileLines.push(`  return x + ${i}`)
+      fileLines.push(`}`)
+    }
+    const targetFile = path.join(projectRoot, "src", "big-module.ts")
+    writeFileSync(targetFile, `${fileLines.join("\n")}\n`, "utf8")
+
+    const { toolHooks, findTool } = await setup({ dbPath: seedDb(projectRoot) }, projectRoot)
+    const afterHook = toolHooks.get("execute.after")
+    expect(typeof afterHook).toBe("function")
+
+    const truncatedReadText = [
+      `Read file ${targetFile}, lines 1-15`,
+      ...fileLines.slice(0, 15).map((l, idx) => `${idx + 1}: ${l}`),
+      "[Output truncated. Continue reading with offset: 16]",
+    ].join("\n")
+
+    const afterEvent = {
+      tool: "read",
+      sessionID: "ses_root",
+      agent: "build",
+      messageID: "m_read_1",
+      id: "call_read_trunc",
+      input: { filePath: targetFile },
+      status: "completed" as const,
+      result: {
+        content: truncatedReadText,
+      },
+    }
+
+    await afterHook!(afterEvent)
+    expect(String(afterEvent.result.content)).toContain(JIT_SKELETON_MARKER)
+    expect(String(afterEvent.result.content)).toContain("helperFunc6")
+    expect(String(afterEvent.result.content)).toContain("(+26 more unread symbols)")
+    expect(String(afterEvent.result.content)).toContain("substrate.viewport")
+
+    const statusRes = await findTool("substrate.valve").execute({ action: "status" }, toolContext("ses_root"))
+    expect(String(statusRes.content)).toContain("SLICE L1-L15")
+  })
+
+  test("substrate.viewport supports status, timeline, provenance, search, repomap, skeleton, slice, coupled, brief, and format=json/both", async () => {
     const projectRoot = makeTmpDir()
     mkdirSync(path.join(projectRoot, "src"), { recursive: true })
     writeFileSync(
@@ -231,20 +346,32 @@ describe("plugin shell & VSC-04 unified surface (REQ-SUB-17)", () => {
       "utf8",
     )
 
-    const { findTool } = await setup({ dbPath: seedDb(projectRoot) }, projectRoot)
+    const { findTool, registeredRpc } = await setup({ dbPath: seedDb(projectRoot) }, projectRoot)
     const viewport = findTool("substrate.viewport")
+
+    // Verify RPC registration (A1)
+    expect(registeredRpc).not.toBeNull()
+    expect((registeredRpc as unknown as { def: { id: string } } | null)?.def.id).toBe("hivemind-substrate")
 
     // 1. status (with omitted sessionID -> resolved via resolveDefaultSessionId)
     const statusRes = await viewport.execute({ action: "status" }, toolContext("ses_root"))
     expect(String(statusRes.content)).toContain("ses_root")
+    expect(String(statusRes.content)).toContain("[substrate.telemetry action=status")
+
+    // 1b. format: "json" returns structured JSON string
+    const jsonRes = await viewport.execute({ action: "status", format: "json" }, toolContext("ses_root"))
+    const parsedJson = JSON.parse(String(jsonRes.content))
+    expect(parsedJson.action).toBe("status")
+    expect(typeof parsedJson.tokens).toBe("number")
 
     // 2. timeline / intents
     const timelineRes = await viewport.execute({ action: "timeline" }, toolContext("ses_root"))
     expect(String(timelineRes.content)).toContain("ses_root")
 
-    // 3. search (FTS5 vibe navigation)
+    // 3. search (FTS5 vibe navigation — D3 verified free of fake S2 msg[124..125] text)
     const searchRes = await viewport.execute({ action: "search", query: "Wave 2 slice 1" }, toolContext("ses_root"))
     expect(String(searchRes.content)).toContain("ses_root")
+    expect(String(searchRes.content)).not.toContain("S2 msg[124..125]")
 
     // 4. provenance
     const provRes = await viewport.execute({ action: "provenance" }, toolContext("ses_root"))
@@ -274,21 +401,28 @@ describe("plugin shell & VSC-04 unified surface (REQ-SUB-17)", () => {
     expect(String(briefRes.content)).toContain("computeAlpha")
   })
 
-  test("compaction hook and event.subscribe wire SQLite continuity packet and background incremental sync", async () => {
+  test("compaction hook pushes CompactionContinuationPacket onto event.system and event.subscribe wires idle/compacted sync", async () => {
     const projectRoot = makeTmpDir()
     const { sessionHooks, eventListeners } = await setup({ dbPath: seedDb(projectRoot) }, projectRoot)
 
     const compactionHook = sessionHooks.get("compaction")
     expect(typeof compactionHook).toBe("function")
 
-    const compactionEvent: { sessionID: string; prompt?: string; context?: string[] } = {
+    const compactionEvent: {
+      sessionID: string
+      system: Array<{ type: "text"; text: string }>
+      prompt?: string
+      context?: string[]
+    } = {
       sessionID: "ses_root",
+      system: [],
       prompt: "Summarize session:",
       context: [],
     }
     await compactionHook!(compactionEvent)
-    expect(compactionEvent.prompt).toContain("Headline & Gate")
-    expect(compactionEvent.prompt).toContain("Working-Memory Manifest")
+    expect(compactionEvent.system.length).toBe(1)
+    expect(compactionEvent.system[0]!.text).toContain("Headline & Gate")
+    expect(compactionEvent.system[0]!.text).toContain("Working-Memory Manifest")
 
     expect(eventListeners.length).toBeGreaterThan(0)
     await eventListeners[0]!({
@@ -318,5 +452,6 @@ describe("plugin shell & VSC-04 unified surface (REQ-SUB-17)", () => {
     const distText = readFileSync(distPath, "utf8")
     expect(distText).toContain("buildImplementorViewportBrief")
     expect(distText).toContain("WorkingSetValve")
+    expect(distText).toContain("buildJitReadSkeletonFooter")
   })
 })
