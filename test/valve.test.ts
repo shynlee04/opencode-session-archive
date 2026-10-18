@@ -592,4 +592,43 @@ describe("TWM-05: applyContextHookInMemory automatic activation & < 2.0 ms laten
     const medianMs = samples[Math.floor(samples.length / 2)]!
     expect(medianMs).toBeLessThan(2.0)
   })
+
+  test("TWM-R2 D2 / P-3 / P-8: recordReadFromHook updates in-memory ledger on truncated & full reads and WorkingMemoryManifest renders 3-state FRESH / SLICE / STALE", () => {
+    const valve = new WorkingSetValve({ persistBlobsToDisk: false })
+
+    // 1. Truncated slice read (lines 1-2 of 10)
+    const sliceEntry = valve.recordReadFromHook({
+      sessionID: "ses_hook_test",
+      callId: "call_read_slice",
+      path: "src/engine.ts",
+      outputText:
+        "Read file src/engine.ts, lines 1-2\n1: export const X = 1\n2: export const Y = 2\n[Output truncated. Continue reading with offset: 3]",
+      input: { filePath: "src/engine.ts", offset: 1, limit: 2 },
+    })
+    expect(sliceEntry).not.toBeNull()
+    expect(sliceEntry.isTruncated).toBe(true)
+    expect(sliceEntry.startLine).toBe(1)
+    expect(sliceEntry.endLine).toBe(2)
+    expect(sliceEntry.status).toBe("SLICE L1-L2 — FRESH SLICE")
+
+    // 2. Full file read
+    const fullEntry = valve.recordReadFromHook({
+      sessionID: "ses_hook_test",
+      callId: "call_read_full",
+      path: "src/utils.ts",
+      outputText: "Read file src/utils.ts, lines 1-1\n1: export const U = 42\n",
+      input: { filePath: "src/utils.ts" },
+    })
+    expect(fullEntry).not.toBeNull()
+    expect(fullEntry.isTruncated).toBe(false)
+    expect(fullEntry.status).toBe("FRESH — DO NOT REREAD")
+
+    const statusView = valve.status("ses_hook_test")
+    expect(statusView.manifestMarkdown).toContain("src/engine.ts")
+    expect(statusView.manifestMarkdown).toContain("SLICE L1-L2 — FRESH SLICE")
+    expect(statusView.manifestMarkdown).toContain("Do NOT re-read L1-L2; read offset=3")
+    expect(statusView.manifestMarkdown).toContain("src/utils.ts")
+    expect(statusView.manifestMarkdown).toContain("FRESH — DO NOT REREAD")
+  })
 })
+

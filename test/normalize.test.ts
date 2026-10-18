@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { normalizeMessage, sha256hex } from "../src/archive/normalize.ts"
-import type { MessageRow } from "../src/archive/types.ts"
+import type { BlobSink, MessageRow } from "../src/archive/types.ts"
 
 const collect = () => {
   const blobs = new Map<string, string>()
@@ -464,12 +464,12 @@ describe("TWM-02: REQ-SUB-03 & REQ-SUB-04", () => {
       path: "/repo/src/archive/normalize.ts",
       call_id: "call_read_1",
       read_seq: 3,
-      line_range: "L1-L50",
+      line_range: "all",
       start_line: 1,
-      end_line: 50,
+      end_line: 1,
       blob_sha: sha256hex("export function normalizeMessage() {}\n"),
-      read_blob_sha: sha256hex("export function normalizeMessage() {}\n"),
-      staleness_status: "STALE",
+      read_blob_sha: sha256hex("export function normalizeMessage() {}"),
+      staleness_status: "STALE (modified since read/review — re-verify slice)",
     })
 
     expect(ledgers.skillLoads).toHaveLength(2)
@@ -489,6 +489,107 @@ describe("TWM-02: REQ-SUB-03 & REQ-SUB-04", () => {
       load_seq: 3,
       loaded_seq: 3,
       status: "ACTIVE — DO NOT RE-INVOKE",
+    })
+  })
+
+  test("TWM-R2 D1/P-8/T-11: strips OpenCode <content> envelope & line numbers and extracts live ProvenanceChainRow chains", async () => {
+    const normMod = await import("../src/archive/normalize.ts")
+    const blobs = new Map<string, string>()
+    const sink: BlobSink = (text) => {
+      const sha = sha256hex(text)
+      blobs.set(sha, text)
+      return `blob:${sha}`
+    }
+
+    const userIntent = row(
+      "user",
+      {
+        time: { created: 100 },
+        text: "Fix envelope stripping and run verification",
+      },
+      { id: "msg_u1", seq: 1 },
+    )
+    const readAndEdit = row(
+      "assistant",
+      {
+        time: { created: 200, completed: 250 },
+        agent: "build",
+        content: [
+          {
+            type: "text",
+            text: "Inspecting slice and applying targeted repair.",
+          },
+          {
+            type: "tool",
+            id: "call_read_env",
+            name: "read",
+            state: {
+              status: "completed",
+              input: { filePath: "src/archive/primitives.ts", offset: 1, limit: 2 },
+              content: [
+                {
+                  type: "text",
+                  text: "Read file src/archive/primitives.ts, lines 1-2\n1: export const A = 1\n2: export const B = 2\n[Output truncated. Continue reading with offset: 3]",
+                },
+              ],
+            },
+          },
+          {
+            type: "tool",
+            id: "call_edit_env",
+            name: "edit",
+            state: {
+              status: "completed",
+              input: { filePath: "src/archive/primitives.ts", oldString: "A = 1", newString: "A = 2" },
+              content: [{ type: "text", text: "Updated src/archive/primitives.ts" }],
+            },
+          },
+          {
+            type: "tool",
+            id: "call_bash_verify",
+            name: "bash",
+            state: {
+              status: "completed",
+              metadata: { exitCode: 0 },
+              input: { command: "bun test test/primitives.test.ts" },
+              content: [{ type: "text", text: "4 pass, 0 fail" }],
+            },
+          },
+        ],
+      },
+      { id: "msg_a2", seq: 2 },
+    )
+
+    const norm1 = normalizeMessage(userIntent, sink, null)
+    const norm2 = normalizeMessage(readAndEdit, sink, 1)
+    expect(norm2.fileReads).toHaveLength(1)
+    expect(norm2.fileReads[0]).toMatchObject({
+      normalized_path: "src/archive/primitives.ts",
+      start_line: 1,
+      end_line: 2,
+      is_truncated: 1,
+      read_blob_sha: sha256hex("export const A = 1\nexport const B = 2"),
+      staleness_status: "SLICE L1-L2 — FRESH SLICE",
+    })
+
+    const chains = normMod.extractSessionProvenanceChains(
+      "ses_1",
+      "ses_1",
+      [norm1, norm2],
+      [userIntent, readAndEdit],
+    )
+    expect(chains).toHaveLength(1)
+    expect(chains[0]).toMatchObject({
+      chain_id: "ses_1:chain:1",
+      root_session_id: "ses_1",
+      session_id: "ses_1",
+      intent_seq: 1,
+      decision_seq: 2,
+      target_path: "src/archive/primitives.ts",
+      verification_command: "bun test test/primitives.test.ts",
+      verification_exit_code: 0,
+      outcome: "VERIFIED_PASS",
+      staleness_status: "VERIFIED_FRESH",
     })
   })
 

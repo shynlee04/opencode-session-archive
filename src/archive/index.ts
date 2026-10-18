@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import {
+  extractSessionProvenanceChains,
   foldSessionLedgers,
   harnessOf,
   normalizeDelegationTurns,
@@ -11,8 +12,11 @@ import {
 import { laneOf, sessionRelDir } from "./layout.ts"
 import {
   configureWalPragmas,
+  DDL,
+  ensureHoneycombSchema,
   initSyncDatabase,
   readRootWatermarks,
+  SCHEMA_DDL,
   writeIncrementalIndex,
   writeIndex,
 } from "./index-db.ts"
@@ -28,6 +32,8 @@ import type {
   KvBindingRow,
   MessageRecord,
   MessageRow,
+  NormalizedMessage,
+  ProvenanceChainRow,
   SessionRow,
   SkillLoadLedgerRow,
   SnapshotArtifactRow,
@@ -46,12 +52,21 @@ import type {
 
 export type { SessionSource } from "./source.ts"
 export { sqliteSource, decodeHostKvKey, decodeUtf16BeHex, ingestHostKv } from "./source.ts"
-export { configureWalPragmas, initSyncDatabase, writeIncrementalIndex, writeIndex } from "./index-db.ts"
+export {
+  configureWalPragmas,
+  DDL,
+  ensureHoneycombSchema,
+  initSyncDatabase,
+  SCHEMA_DDL,
+  writeIncrementalIndex,
+  writeIndex,
+} from "./index-db.ts"
 export { resolveShadowRepoDir, batchExtractGitBlobs, sinkShadowSnapshots } from "./snapshots.ts"
 export { sinkExternalSpills } from "./spills.ts"
 export {
   classifyMessagesOutcome,
   extractSessionLedgers,
+  extractSessionProvenanceChains,
   foldSessionLedgers,
   normalizeDelegationTurns,
   normalizeMessage,
@@ -79,7 +94,9 @@ export type {
   Lane,
   MessageRecord,
   MessageRow,
+  NormalizedMessage,
   ProjectRow,
+  ProvenanceChainRow,
   ReportedOutcome,
   SessionHeader,
   SessionRow,
@@ -120,7 +137,10 @@ export interface PersistReport {
   snapshotsExtracted: number
   spillsSunk: number
   elapsedMs: number
+  readonly warnings?: readonly string[]
 }
+
+export type PersistResult = PersistReport
 
 interface TreeNode {
   readonly row: SessionRow
@@ -162,6 +182,7 @@ const toHostMessageRow = (row: MessageRow): HostMessageRow => ({
 
 export function persist(input: PersistOptions, source: SessionSource): PersistReport {
   const tStart = performance.now()
+  const warnings: string[] = []
   const seed = source.session(input.sessionID)
   if (seed === undefined) {
     throw new Error(`session-archive: session ${input.sessionID} not found`)
@@ -243,9 +264,18 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
     !isCold && existing
       ? Math.max(0, ...Array.from(existing.watermarks.values(), (w) => w.last_kv_updated))
       : 0
-  const kvState = source.kvState
-    ? source.kvState(sessionIDs, isCold ? 0 : minKvUpdated)
-    : { bindings: [], foreignIndex: [], contextPrunes: [] }
+  let kvState: ReturnType<NonNullable<SessionSource["kvState"]>> = {
+    bindings: [],
+    foreignIndex: [],
+    contextPrunes: [],
+  }
+  if (source.kvState) {
+    try {
+      kvState = source.kvState(sessionIDs, isCold ? 0 : minKvUpdated)
+    } catch (err) {
+      warnings.push(`kvState read failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
   const kvRowsProcessed =
     kvState.bindings.length + kvState.foreignIndex.length + kvState.contextPrunes.length
 
@@ -266,6 +296,7 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
       snapshotsExtracted: 0,
       spillsSunk: 0,
       elapsedMs: performance.now() - tStart,
+      warnings,
     }
   }
 
@@ -315,6 +346,7 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
   const fileReadRows: FileReadLedgerRow[] = []
   const skillLoadRows: SkillLoadLedgerRow[] = []
   const fileTouchRows: FileTouchRow[] = []
+  const provenanceChainRows: ProvenanceChainRow[] = []
   const watermarksToWrite: SyncWatermarkRow[] = []
   const deltaHostMsgsBySession = new Map<string, readonly HostMessageRow[]>()
   const dirtySessionIds = new Set<string>()
@@ -338,6 +370,7 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
     }
     dirtySessionIds.add(node.row.id)
 
+    const normalizedMessages: NormalizedMessage[] = []
     const records: MessageRecord[] = []
     const facts: DelegationFact[] = []
     const rawReads: FileReadLedgerRow[] = []
@@ -348,7 +381,8 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
       !isColdNode && wm && firstDeltaSeq > wm.last_max_seq ? wm.last_max_seq : null
 
     for (const row of deltaRows) {
-      const normalized = normalizeMessage(row, sink, prevSeq)
+      const normalized = normalizeMessage(row, sink, prevSeq, input.projectRoot)
+      normalizedMessages.push(normalized)
       records.push(normalized.record)
       facts.push(...normalized.delegations)
       rawReads.push(...normalized.fileReads)
@@ -363,6 +397,15 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
     fileReadRows.push(...ledgers.fileReads)
     skillLoadRows.push(...ledgers.skillLoads)
     fileTouchRows.push(...ledgers.fileTouches)
+    provenanceChainRows.push(
+      ...extractSessionProvenanceChains(
+        root.id,
+        node.row.id,
+        normalizedMessages,
+        deltaRows,
+        input.projectRoot,
+      ),
+    )
 
     const transcriptRel = path.join(node.relDir, `${node.row.id}.jsonl`)
     const transcriptAbs = path.join(archiveDir, transcriptRel)
@@ -494,15 +537,35 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
   const dirtyHostSessions = dirtyPlans.map((p) => p.node.hostRow)
   const snapshotRootDir =
     input.snapshotRootDir ?? (input.opencodeDataDir ? path.join(input.opencodeDataDir, "snapshot") : undefined)
-  const snapshotArtifacts: SnapshotArtifactRow[] =
-    snapshotRootDir && existsSync(snapshotRootDir)
-      ? sinkShadowSnapshots(dirtyHostSessions, deltaHostMsgsBySession, snapshotRootDir, sinkBuffer, "host_db")
-      : []
+  let snapshotArtifacts: SnapshotArtifactRow[] = []
+  if (snapshotRootDir && existsSync(snapshotRootDir)) {
+    try {
+      snapshotArtifacts = sinkShadowSnapshots(
+        dirtyHostSessions,
+        deltaHostMsgsBySession,
+        snapshotRootDir,
+        sinkBuffer,
+        "host_db",
+      )
+    } catch (err) {
+      warnings.push(`sinkShadowSnapshots failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
 
-  const spillArtifacts: SpillArtifactRow[] =
-    input.opencodeDataDir && existsSync(input.opencodeDataDir)
-      ? sinkExternalSpills(dirtyHostSessions, deltaHostMsgsBySession, input.opencodeDataDir, sinkBuffer, "host_db")
-      : []
+  let spillArtifacts: SpillArtifactRow[] = []
+  if (input.opencodeDataDir && existsSync(input.opencodeDataDir)) {
+    try {
+      spillArtifacts = sinkExternalSpills(
+        dirtyHostSessions,
+        deltaHostMsgsBySession,
+        input.opencodeDataDir,
+        sinkBuffer,
+        "host_db",
+      )
+    } catch (err) {
+      warnings.push(`sinkExternalSpills failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
 
   for (const [sha, content] of blobs) {
     writeIfChanged(path.join("blobs", `${sha}.txt`), content, true)
@@ -531,6 +594,7 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
     fileTouches: fileTouchRows,
     snapshotArtifacts,
     spillArtifacts,
+    provenanceChains: provenanceChainRows,
     watermarks: watermarksToWrite,
     fileCount,
   })
@@ -551,6 +615,7 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
     snapshotsExtracted: snapshotArtifacts.length,
     spillsSunk: spillArtifacts.length,
     elapsedMs: performance.now() - tStart,
+    warnings,
   }
 }
 

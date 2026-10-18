@@ -1,3 +1,13 @@
+import { existsSync, readFileSync } from "node:fs"
+import { isAbsolute } from "node:path"
+import {
+  computeDiskSliceSha,
+  formatStalenessStatus,
+  normalizeRepoPath,
+  parseReadToolOutput,
+  resolveDiskPath,
+  sha256Hex,
+} from "./primitives.ts"
 import type {
   AssistantPart,
   AssistantRecord,
@@ -17,6 +27,7 @@ import type {
   MessageRow,
   ModelRef,
   NormalizedMessage,
+  ProvenanceChainRow,
   ReportedOutcome,
   SessionHeader,
   SessionRow,
@@ -34,11 +45,12 @@ const DELEGATION_TOOLS = new Set(["subagent", "delegate-devin", "hivemind-delega
 const READ_TOOLS = new Set(["read", "read_file", "view_file"])
 const TOUCH_TOOLS = new Set(["write", "edit", "patch", "multi_edit", "write_to_file", "replace_file_content"])
 const SKILL_TOOLS = new Set(["skill", "load_skill"])
+const SHELL_VERIFY_TOOLS = new Set(["bash", "shell", "run_command", "exec"])
 
 const BOUNDARY_TYPES = new Set(["idle", "agent-switched", "model-switched", "location-switched"])
 
 export function sha256hex(text: string | Uint8Array): string {
-  return new Bun.CryptoHasher("sha256").update(text).digest("hex")
+  return sha256Hex(text)
 }
 
 const asObj = (value: unknown): Record<string, unknown> =>
@@ -55,7 +67,8 @@ const asArr = (value: unknown): readonly unknown[] => (Array.isArray(value) ? va
 
 const stripBlobPrefix = (ref: string): string => (ref.startsWith("blob:") ? ref.slice("blob:".length) : ref)
 
-const normalizeLedgerPath = (rawPath: string): string => rawPath.replace(/\\/g, "/").trim()
+const normalizeLedgerPath = (rawPath: string, canonicalRoot?: string): string =>
+  normalizeRepoPath(rawPath, canonicalRoot)
 
 const summarizePayload = (text: string, fallback: string): string => {
   for (const rawLine of text.split("\n")) {
@@ -254,6 +267,7 @@ const toolPart = (
   fileReads: FileReadLedgerRow[],
   skillLoads: SkillLoadLedgerRow[],
   fileTouches: FileTouchRow[],
+  canonicalRoot?: string,
 ): AssistantPart => {
   const state = asObj(part.state)
   const meta = asObj(state.metadata)
@@ -301,23 +315,29 @@ const toolPart = (
       asStr(rawInput.AbsolutePath) ??
       asStr(rawInput.file)
     if (rawPath && rawPath.length > 0) {
-      const startLine =
-        asNum(rawInput.offset) ?? asNum(rawInput.startLine) ?? asNum(rawInput.start_line) ?? asNum(rawInput.StartLine)
-      const limit = asNum(rawInput.limit)
-      const endLine =
-        asNum(rawInput.endLine) ??
-        asNum(rawInput.end_line) ??
-        asNum(rawInput.EndLine) ??
-        (startLine !== null && limit !== null ? startLine + limit - 1 : null)
-      const lineRange =
-        startLine !== null && endLine !== null
-          ? `L${startLine}-L${endLine}`
-          : startLine !== null
-            ? `L${startLine}+`
-            : "all"
+      const capture = parseReadToolOutput(outputText, { ...rawInput, filePath: rawPath }, canonicalRoot)
       const blobRef = outputText.length > 0 ? sink(outputText) : `blob:${sha256hex("")}`
       const blobSha = stripBlobPrefix(blobRef)
-      const normPath = normalizeLedgerPath(rawPath)
+      const normPath = normalizeLedgerPath(rawPath, canonicalRoot)
+
+      let diskBlobSha = capture.sliceSha
+      let stalenessStatus =
+        capture.isTruncated || capture.startLine > 1
+          ? formatStalenessStatus("SLICE", capture.startLine, capture.endLine, capture.totalLines)
+          : "FRESH — DO NOT REREAD"
+
+      const shouldCheckDisk =
+        (typeof canonicalRoot === "string" && canonicalRoot.length > 0) ||
+        (isAbsolute(rawPath) && existsSync(rawPath))
+      if (shouldCheckDisk) {
+        const diskPath = resolveDiskPath(rawPath, canonicalRoot)
+        if (existsSync(diskPath)) {
+          const recon = computeDiskSliceSha(diskPath, capture)
+          diskBlobSha = recon.diskSliceSha ?? capture.sliceSha
+          stalenessStatus = recon.stalenessStatus
+        }
+      }
+
       fileReads.push({
         session_id: row.session_id,
         path: rawPath,
@@ -326,17 +346,20 @@ const toolPart = (
         message_id: row.id,
         seq: row.seq,
         read_seq: row.seq,
-        line_range: lineRange,
-        start_line: startLine,
-        end_line: endLine,
+        line_range: capture.lineRange,
+        start_line: capture.startLine,
+        end_line: capture.endLine,
+        total_lines: capture.totalLines,
+        is_truncated: capture.isTruncated ? 1 : 0,
         chars: outputText.length,
         char_len: outputText.length,
         blob_sha: blobSha,
         blob_sha256: blobSha,
-        read_blob_sha: blobSha,
-        disk_blob_sha: blobSha,
+        slice_sha: capture.sliceSha,
+        read_blob_sha: capture.sliceSha,
+        disk_blob_sha: diskBlobSha,
         summary: summarizePayload(outputText, normPath),
-        staleness_status: "FRESH — DO NOT REREAD",
+        staleness_status: stalenessStatus,
         t: row.time_created,
         updated_at: new Date(row.time_updated || row.time_created || Date.now()).toISOString(),
       })
@@ -400,7 +423,7 @@ const toolPart = (
         op: opKind,
         operation: opKind,
         path: rawPath,
-        normalized_path: normalizeLedgerPath(rawPath),
+        normalized_path: normalizeLedgerPath(rawPath, canonicalRoot),
         detail: null,
         blob_sha256: blobSha,
         t: row.time_created,
@@ -433,6 +456,7 @@ const normalizePart = (
   fileReads: FileReadLedgerRow[],
   skillLoads: SkillLoadLedgerRow[],
   fileTouches: FileTouchRow[],
+  canonicalRoot?: string,
 ): AssistantPart => {
   const part = asObj(value)
   if (part.type === "text") {
@@ -451,7 +475,8 @@ const normalizePart = (
       encrypted_bytes: encrypted?.length ?? 0,
     }
   }
-  if (part.type === "tool") return toolPart(part, row, sink, delegations, fileReads, skillLoads, fileTouches)
+  if (part.type === "tool")
+    return toolPart(part, row, sink, delegations, fileReads, skillLoads, fileTouches, canonicalRoot)
   return { type: "unknown-part", raw_type: asStr(part.type) ?? "", raw: value }
 }
 
@@ -594,6 +619,7 @@ const normalizeAssistant = (
   fileReads: FileReadLedgerRow[],
   skillLoads: SkillLoadLedgerRow[],
   fileTouches: FileTouchRow[],
+  canonicalRoot?: string,
 ): AssistantRecord => {
   const time = asObj(data.time)
   const completed = asNum(time.completed)
@@ -608,7 +634,7 @@ const normalizeAssistant = (
     time: { created: asNum(time.created), completed },
     incomplete: completed === null,
     parts: asArr(data.content).map((part) =>
-      normalizePart(part, row, sink, delegations, fileReads, skillLoads, fileTouches),
+      normalizePart(part, row, sink, delegations, fileReads, skillLoads, fileTouches, canonicalRoot),
     ),
   }
   const extras: Record<string, unknown> = {}
@@ -687,6 +713,7 @@ export function normalizeMessage(
   row: MessageRow,
   sink: BlobSink,
   prevSeq: number | null,
+  canonicalRoot?: string,
 ): NormalizedMessage {
   const delegations: DelegationFact[] = []
   const fileReads: FileReadLedgerRow[] = []
@@ -697,7 +724,7 @@ export function normalizeMessage(
     row.type === "user"
       ? normalizeUser(row, data, sink, skillLoads)
       : row.type === "assistant"
-        ? normalizeAssistant(row, data, sink, delegations, fileReads, skillLoads, fileTouches)
+        ? normalizeAssistant(row, data, sink, delegations, fileReads, skillLoads, fileTouches, canonicalRoot)
         : row.type === "skill"
           ? normalizeSkill(row, data, sink, skillLoads)
           : row.type === "shell"
@@ -740,7 +767,12 @@ export function foldSessionLedgers(
         readsByKey.set(key, {
           ...readRow,
           disk_blob_sha: touch.blob_sha256,
-          staleness_status: "STALE",
+          staleness_status: formatStalenessStatus(
+            "STALE",
+            readRow.start_line ?? 1,
+            readRow.end_line ?? 1,
+            readRow.total_lines ?? null,
+          ),
         })
       }
     }
@@ -771,6 +803,7 @@ export function foldSessionLedgers(
 export function extractSessionLedgers(
   rows: readonly MessageRow[],
   sink: BlobSink,
+  canonicalRoot?: string,
 ): {
   readonly fileReads: FileReadLedgerRow[]
   readonly skillLoads: FileLoadOrSkillRow[]
@@ -781,13 +814,249 @@ export function extractSessionLedgers(
   const rawTouches: FileTouchRow[] = []
   let prevSeq: number | null = null
   for (const row of rows) {
-    const norm = normalizeMessage(row, sink, prevSeq)
+    const norm = normalizeMessage(row, sink, prevSeq, canonicalRoot)
     if (norm.fileReads) rawReads.push(...norm.fileReads)
     if (norm.skillLoads) rawSkills.push(...norm.skillLoads)
     if (norm.fileTouches) rawTouches.push(...norm.fileTouches)
     prevSeq = row.seq
   }
   return foldSessionLedgers(rawReads, rawSkills, rawTouches)
+}
+
+export function extractSessionProvenanceChains(
+  rootSessionId: string,
+  sessionId: string,
+  messages: readonly NormalizedMessage[],
+  rawRows?: readonly MessageRow[],
+  canonicalRoot?: string,
+): ProvenanceChainRow[] {
+  if (messages.length === 0) return []
+  const rawById = new Map<string, MessageRow>()
+  if (rawRows) {
+    for (const r of rawRows) rawById.set(r.id, r)
+  }
+
+  const readBlobByPath = new Map<string, string>()
+  const touchBlobByPath = new Map<string, string>()
+
+  interface ChainBuilder {
+    intentSeq: number
+    intentMessageId: string
+    intentSummary: string
+    decisionSeq: number | null
+    decisionSummary: string | null
+    touchedFiles: Set<string>
+    lastReadPath: string | null
+    repairSeq: number | null
+    verificationCommand: string | null
+    verificationExitCode: number | null
+    verificationSeq: number | null
+    verificationBlobRef: string | null
+    lastTimestamp: number
+    hasActivity: boolean
+  }
+
+  const chains: ProvenanceChainRow[] = []
+  let current: ChainBuilder | null = null
+
+  const flushCurrent = (): void => {
+    if (!current || !current.hasActivity) return
+    const touchedFiles = [...current.touchedFiles]
+    const outcome: ProvenanceChainRow["outcome"] =
+      current.verificationCommand !== null && current.verificationExitCode !== null
+        ? current.verificationExitCode === 0
+          ? "VERIFIED_PASS"
+          : "VERIFIED_FAIL"
+        : touchedFiles.length > 0
+          ? "UNVERIFIED"
+          : "IN_PROGRESS"
+
+    const targetPath = touchedFiles[0] ?? current.lastReadPath ?? "session"
+    const readOrReviewSha = readBlobByPath.get(targetPath) ?? touchBlobByPath.get(targetPath) ?? ""
+    const repairSha =
+      touchedFiles.length > 0
+        ? touchBlobByPath.get(targetPath) ||
+          readOrReviewSha ||
+          sha256hex(`${sessionId}:${targetPath}:${current.repairSeq ?? current.intentSeq}`)
+        : null
+
+    let diskSha = repairSha ?? readOrReviewSha
+    if (canonicalRoot && targetPath !== "session") {
+      const absPath = resolveDiskPath(targetPath, canonicalRoot)
+      if (existsSync(absPath)) {
+        try {
+          diskSha = sha256Hex(readFileSync(absPath))
+        } catch {
+          // keep fallback sha
+        }
+      }
+    }
+
+    const stalenessStatus =
+      outcome === "VERIFIED_PASS"
+        ? "VERIFIED_FRESH"
+        : outcome === "VERIFIED_FAIL"
+          ? "STALE (modified since read/review — re-verify slice)"
+          : "FRESH — DO NOT REREAD"
+
+    const updatedIso = new Date(current.lastTimestamp).toISOString()
+
+    chains.push({
+      chain_id: `${sessionId}:chain:${current.intentSeq}`,
+      root_session_id: rootSessionId,
+      session_id: sessionId,
+      finding_id: `F-${sessionId.slice(-6).toUpperCase()}-${current.intentSeq}`,
+      finding_seq: current.intentSeq,
+      finding_session_id: sessionId,
+      finding_summary: current.decisionSummary ?? current.intentSummary,
+      child_session_id: sessionId !== rootSessionId ? sessionId : null,
+      intent_seq: current.intentSeq,
+      intent_message_id: current.intentMessageId,
+      intent_summary: current.intentSummary,
+      decision_seq: current.decisionSeq,
+      decision_pivot_seq: current.decisionSeq ?? current.intentSeq,
+      decision_summary: current.decisionSummary,
+      target_path: targetPath,
+      touched_files_json: JSON.stringify(touchedFiles),
+      read_or_review_blob_sha: readOrReviewSha,
+      repair_seq: current.repairSeq,
+      repair_session_id: current.repairSeq !== null ? sessionId : null,
+      repair_blob_sha: repairSha,
+      receipt_command: current.verificationCommand,
+      verification_command: current.verificationCommand,
+      receipt_exit_code: current.verificationExitCode,
+      verification_exit_code: current.verificationExitCode,
+      verification_seq: current.verificationSeq,
+      receipt_blob_sha: current.verificationBlobRef,
+      verification_blob_ref: current.verificationBlobRef,
+      head_sha: null,
+      worktree_tree_sha: null,
+      disk_blob_sha: diskSha,
+      staleness_status: stalenessStatus,
+      outcome,
+      created_at: current.lastTimestamp,
+      updated_at: updatedIso,
+    })
+  }
+
+  for (const norm of messages) {
+    const rec = norm.record
+    const seq = rec.raw_ref.seq
+    const t = rec.t || Date.now()
+
+    for (const r of norm.fileReads) {
+      const p = normalizeLedgerPath(r.path, canonicalRoot)
+      readBlobByPath.set(p, r.read_blob_sha || r.blob_sha256)
+      if (current) current.lastReadPath = p
+    }
+
+    if (rec.kind === "user") {
+      flushCurrent()
+      current = {
+        intentSeq: seq,
+        intentMessageId: rec.id,
+        intentSummary: summarizePayload(rec.text, "User intent"),
+        decisionSeq: null,
+        decisionSummary: null,
+        touchedFiles: new Set<string>(),
+        lastReadPath: null,
+        repairSeq: null,
+        verificationCommand: null,
+        verificationExitCode: null,
+        verificationSeq: null,
+        verificationBlobRef: null,
+        lastTimestamp: t,
+        hasActivity: false,
+      }
+      continue
+    }
+
+    if (!current) {
+      current = {
+        intentSeq: seq,
+        intentMessageId: rec.id,
+        intentSummary: "Session start",
+        decisionSeq: null,
+        decisionSummary: null,
+        touchedFiles: new Set<string>(),
+        lastReadPath: null,
+        repairSeq: null,
+        verificationCommand: null,
+        verificationExitCode: null,
+        verificationSeq: null,
+        verificationBlobRef: null,
+        lastTimestamp: t,
+        hasActivity: false,
+      }
+    }
+
+    current.lastTimestamp = Math.max(current.lastTimestamp, t)
+
+    for (const touch of norm.fileTouches) {
+      const tp = normalizeLedgerPath(touch.path, canonicalRoot)
+      current.touchedFiles.add(tp)
+      if (touch.blob_sha256) touchBlobByPath.set(tp, touch.blob_sha256)
+      current.repairSeq = seq
+      current.hasActivity = true
+    }
+
+    if (rec.kind === "shell") {
+      if (rec.command) {
+        current.verificationCommand = rec.command
+        current.verificationExitCode = rec.exit_code ?? 0
+        current.verificationSeq = seq
+        current.verificationBlobRef = rec.output_ref ?? null
+        current.hasActivity = true
+      }
+    } else if (rec.kind === "assistant") {
+      for (const part of rec.parts) {
+        if (part.type === "text" && part.text.trim().length > 0 && current.decisionSummary === null) {
+          current.decisionSeq = seq
+          current.decisionSummary = summarizePayload(part.text, "Assistant decision")
+          current.hasActivity = true
+        } else if (part.type === "tool") {
+          const toolName = part.name.toLowerCase()
+          if (SHELL_VERIFY_TOOLS.has(toolName)) {
+            const inputObj = asObj(part.input)
+            const cmd =
+              asStr(inputObj.command) ??
+              asStr(inputObj.CommandLine) ??
+              asStr(inputObj.cmd) ??
+              part.name
+            if (cmd) {
+              current.verificationCommand = cmd
+              current.verificationSeq = seq
+              current.verificationBlobRef = part.output_ref ?? null
+              current.hasActivity = true
+              const rawMsg = rawById.get(rec.id)
+              let exitCode: number | null = null
+              if (rawMsg) {
+                const rawParts = asArr(asObj(rawMsg.data).content)
+                for (const rp of rawParts) {
+                  const rpObj = asObj(rp)
+                  if (rpObj.id === part.call_id) {
+                    const meta = asObj(asObj(rpObj.state).metadata)
+                    exitCode = asNum(meta.exitCode) ?? asNum(meta.exit_code)
+                  }
+                }
+              }
+              if (exitCode === null) {
+                const m = part.output.match(/exit(?:\s+code)?[:\s]+(-?\d+)/i)
+                if (m?.[1]) exitCode = Number.parseInt(m[1], 10)
+              }
+              if (exitCode === null) {
+                exitCode = part.status === "error" || part.error !== undefined ? 1 : 0
+              }
+              current.verificationExitCode = exitCode
+            }
+          }
+        }
+      }
+    }
+  }
+
+  flushCurrent()
+  return chains
 }
 
 type FileLoadOrSkillRow = SkillLoadLedgerRow

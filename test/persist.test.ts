@@ -689,5 +689,115 @@ describe("TWM-02, TWM-03 & TWM-04: spine tables, incremental watermark sync, and
       for (const r of readers) r.close()
     }
   })
+
+  test("TWM-R2 / CSG-R1 (T-5, T-9): ensureHoneycombSchema initializes all canonical tables, migrates file_read_ledger idempotently, populates live provenance_chain, and exposes warnings[]", () => {
+    addMessage(db, {
+      id: "msg_prov_u1",
+      session_id: "ses_root",
+      type: "user",
+      seq: 6,
+      time_created: 3000,
+      time_updated: 3000,
+      data: { time: { created: 3000 }, text: "Verify schema and provenance chain extraction" },
+    })
+    addMessage(db, {
+      id: "msg_prov_a2",
+      session_id: "ses_root",
+      type: "assistant",
+      seq: 7,
+      time_created: 3010,
+      time_updated: 3020,
+      data: {
+        time: { created: 3010, completed: 3020 },
+        agent: "build",
+        content: [
+          { type: "text", text: "Updating src/index.ts and running tests." },
+          {
+            type: "tool",
+            id: "call_prov_edit",
+            name: "edit",
+            state: {
+              status: "completed",
+              input: { filePath: "src/index.ts", oldString: "old", newString: "new" },
+              content: [{ type: "text", text: "Edited src/index.ts" }],
+            },
+          },
+          {
+            type: "tool",
+            id: "call_prov_bash",
+            name: "bash",
+            state: {
+              status: "completed",
+              metadata: { exitCode: 0 },
+              input: { command: "bun test" },
+              content: [{ type: "text", text: "All tests pass" }],
+            },
+          },
+        ],
+      },
+    })
+    db.query("UPDATE session_v2 SET time_updated = 3020 WHERE id = 'ses_root'").run()
+
+    const report = run()
+    expect(Array.isArray(report.warnings)).toBe(true)
+
+    const sqlitePath = path.join(archiveDir(), "index.sqlite")
+    const index = new Database(sqlitePath, { readonly: true })
+    try {
+      const tables = new Set(
+        (
+          index
+            .query("SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')")
+            .all() as Array<{ name: string }>
+        ).map((r) => r.name),
+      )
+      for (const expectedTable of [
+        "session",
+        "delegation",
+        "message",
+        "tool_call",
+        "compaction",
+        "instruction",
+        "kv_binding",
+        "kv_foreign_index",
+        "kv_context_prune",
+        "delegation_turn",
+        "file_read_ledger",
+        "skill_load_ledger",
+        "file_touch",
+        "snapshot_artifact",
+        "spill_artifact",
+        "sync_watermark",
+        "sync_root_meta",
+        "provenance_chain",
+        "compaction_continuation_ledger",
+        "session_semantic_digest",
+        "intent_pivot",
+        "milestone",
+        "substrate_fts",
+        "code_file",
+        "code_symbol",
+        "code_import_edge",
+        "git_cochange",
+        "git_cochange_file_stats",
+        "git_cochange_commit",
+      ]) {
+        expect(tables.has(expectedTable)).toBe(true)
+      }
+
+      const chains = index
+        .query("SELECT * FROM provenance_chain WHERE session_id = 'ses_root' ORDER BY intent_seq ASC")
+        .all() as Array<Record<string, unknown>>
+      expect(chains.length).toBeGreaterThanOrEqual(1)
+      const latestChain = chains[chains.length - 1]!
+      expect(latestChain.outcome).toBe("VERIFIED_PASS")
+      expect(latestChain.verification_command).toBe("bun test")
+      expect(latestChain.verification_exit_code).toBe(0)
+      expect(latestChain.target_path).toBe("src/index.ts")
+    } finally {
+      index.close()
+    }
+  })
 })
+
 

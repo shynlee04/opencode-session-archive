@@ -1,6 +1,16 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
-import { sha256hex } from "./normalize.ts"
+import { isAbsolute, join } from "node:path"
+import {
+  computeDiskSliceSha,
+  estimateTokens as estimateStringTokens,
+  formatSliceLineRange,
+  formatStalenessStatus,
+  normalizeRepoPath as normalizePrimitiveRepoPath,
+  parseReadToolOutput,
+  resolveDiskPath,
+  sha256Hex,
+  type FileReadCapture,
+} from "./primitives.ts"
 
 export const DEFAULT_KEEP_RECENT_STEPS = 8
 export const DEFAULT_AUTO_KEEP_RECENT_STEPS = 12
@@ -26,6 +36,8 @@ export type FreshnessStatus =
   | typeof FRESH_STATUS
   | typeof STALE_STATUS
   | "STALE"
+  | `SLICE L${number}-L${number} of ${number | "?"} — FRESH SLICE`
+  | string
 
 export type BreadcrumbStatus =
   | FreshnessStatus
@@ -85,8 +97,13 @@ export interface ManifestFileReadEntry {
   readonly path: string
   readonly normalizedPath: string
   readonly lineRange: string
+  readonly startLine?: number
+  readonly endLine?: number
+  readonly totalLines?: number | null
+  readonly isTruncated?: boolean
   readonly chars: number
   readonly blobSha256: string
+  readonly sliceSha256?: string
   readonly blobRef: string
   readonly summary: string
   readonly status: FreshnessStatus
@@ -169,6 +186,7 @@ export type ArmedValveState = ValveExecutionLedger
 export interface ValveOptions {
   readonly blobDir?: string
   readonly readOnlyArchiveDir?: string | null
+  readonly canonicalRoot?: string
   readonly keepRecentSteps?: number
   readonly autoKeepRecentSteps?: number
   readonly autoPruneThresholdRatio?: number
@@ -201,17 +219,12 @@ export interface ContextHookApplyResult {
 }
 
 export function estimateTokens(charsOrText: number | string): number {
-  const n = typeof charsOrText === "number" ? charsOrText : charsOrText.length
-  return Math.ceil(n / 4)
+  if (typeof charsOrText === "string") return estimateStringTokens(charsOrText)
+  return Math.ceil(charsOrText / 4)
 }
 
-export function normalizeRepoPath(rawPath: string): string {
-  if (!rawPath) return ""
-  return rawPath
-    .trim()
-    .replace(/^\/Users\/[^/]+\/Documents\/coding-projects\/[^/]+\/\.worktree\/[^/]+\//, "")
-    .replace(/^\/Users\/[^/]+\/Documents\/coding-projects\/[^/]+\//, "")
-    .replace(/^\.\//, "")
+export function normalizeRepoPath(rawPath: string, canonicalRoot?: string): string {
+  return normalizePrimitiveRepoPath(rawPath, canonicalRoot)
 }
 
 function isUserMessage(msg: Record<string, any>): boolean {
@@ -626,7 +639,7 @@ export class BlobStore {
   }
 
   sink(content: string, options?: { readonly persistToDisk?: boolean }): { readonly sha256: string; readonly blobRef: string } {
-    const sha256 = sha256hex(content)
+    const sha256 = sha256Hex(content)
     const short = sha256.slice(0, 12)
     this.prefixIndex.set(short, sha256)
 
@@ -801,8 +814,12 @@ export function renderWorkingMemoryManifest(
 
   for (const f of manifest.filesRead) {
     const shortPath = f.normalizedPath || f.path
+    const sliceHint =
+      f.status.startsWith("SLICE ") && f.startLine != null && f.endLine != null
+        ? ` (Do NOT re-read L${f.startLine}-L${f.endLine}; read offset=${f.endLine + 1})`
+        : ""
     lines.push(
-      `- \`${shortPath}#${f.lineRange}\` (${f.chars} chars) -> \`${f.blobRef}\` | ${f.summary.slice(0, 72)} | **${f.status}**`,
+      `- \`${shortPath}#${f.lineRange}\` (${f.chars} chars) -> \`${f.blobRef}\` | ${f.summary.slice(0, 72)} | **${f.status}**${sliceHint}`,
     )
   }
 
@@ -839,6 +856,7 @@ export function renderWorkingMemoryManifest(
 export class WorkingSetValve {
   readonly blobStore: BlobStore
   private readonly ledgers = new Map<string, ValveExecutionLedger>()
+  private readonly hookReads = new Map<string, Map<string, ManifestFileReadEntry>>()
   private readonly options: ValveOptions
 
   constructor(options: ValveOptions = {}) {
@@ -888,6 +906,83 @@ export class WorkingSetValve {
     }
   }
 
+  recordReadFromHook(
+    sessionIDOrParams:
+      | string
+      | {
+          readonly sessionID: string
+          readonly callId?: string
+          readonly path?: string
+          readonly outputText?: string
+          readonly rawOutput?: string
+          readonly input?: Record<string, unknown>
+          readonly canonicalRoot?: string
+        },
+    inputArg?: Record<string, unknown>,
+    rawOutputArg?: string,
+    canonicalRootArg?: string,
+  ): FileReadCapture & { readonly status: FreshnessStatus } {
+    let sessionID: string
+    let input: Record<string, unknown>
+    let rawOutput: string
+    let canonicalRoot: string | undefined
+    let callId = "hook_read"
+
+    if (typeof sessionIDOrParams === "string") {
+      sessionID = sessionIDOrParams
+      input = inputArg ?? {}
+      rawOutput = rawOutputArg ?? ""
+      canonicalRoot = canonicalRootArg
+    } else {
+      sessionID = sessionIDOrParams.sessionID
+      callId = sessionIDOrParams.callId ?? "hook_read"
+      rawOutput = sessionIDOrParams.outputText ?? sessionIDOrParams.rawOutput ?? ""
+      input = {
+        ...(sessionIDOrParams.input ?? {}),
+        ...(sessionIDOrParams.path ? { filePath: sessionIDOrParams.path } : {}),
+      }
+      canonicalRoot = sessionIDOrParams.canonicalRoot
+    }
+
+    const effectiveRoot = canonicalRoot ?? this.options.canonicalRoot
+    const capture = parseReadToolOutput(rawOutput, input, effectiveRoot)
+    const { blobRef, sha256 } = this.blobStore.sink(rawOutput)
+    const status: FreshnessStatus =
+      capture.isTruncated ||
+      capture.startLine > 1 ||
+      (capture.totalLines !== null && capture.endLine < capture.totalLines)
+        ? (formatStalenessStatus("SLICE", capture.startLine, capture.endLine, capture.totalLines) as FreshnessStatus)
+        : "FRESH — DO NOT REREAD"
+
+    let sessionMap = this.hookReads.get(sessionID)
+    if (!sessionMap) {
+      sessionMap = new Map()
+      this.hookReads.set(sessionID, sessionMap)
+    }
+    sessionMap.set(capture.normalizedPath, {
+      path: capture.path,
+      normalizedPath: capture.normalizedPath,
+      lineRange: capture.lineRange,
+      startLine: capture.startLine,
+      endLine: capture.endLine,
+      totalLines: capture.totalLines,
+      isTruncated: capture.isTruncated,
+      chars: rawOutput.length,
+      blobRef,
+      blobSha256: sha256,
+      sliceSha256: capture.sliceSha,
+      summary: summarizeReadOutput(capture.normalizedPath, capture.cleanText),
+      status,
+      messageId: callId,
+      sourceSessionId: sessionID,
+    })
+
+    return {
+      ...capture,
+      status,
+    }
+  }
+
   prune(params: {
     readonly sessionID: string
     readonly mode?: PruningMode
@@ -917,13 +1012,23 @@ export class WorkingSetValve {
     readonly armed: boolean
     readonly ledger: ValveExecutionLedger | null
     readonly summaryMarkdown: string
+    readonly manifestMarkdown: string
   } {
     const ledger = this.ledgers.get(sessionID) ?? null
+    const hookMap = this.hookReads.get(sessionID)
+    const fallbackManifest = renderWorkingMemoryManifest({
+      sessionID,
+      filesRead: hookMap ? [...hookMap.values()] : [],
+      filesModified: [],
+      activeSkills: [],
+      delegationOutcomes: [],
+    })
     if (!ledger) {
       return {
         armed: false,
         ledger: null,
         summaryMarkdown: `WorkingSetValve is currently unarmed for session \`${sessionID}\`.`,
+        manifestMarkdown: fallbackManifest,
       }
     }
     return {
@@ -933,6 +1038,7 @@ export class WorkingSetValve {
         `WorkingSetValve is armed for session \`${sessionID}\` (mode: \`${ledger.mode}\`, keepRecentSteps: \`${ledger.keepRecentSteps}\`, anchor: \`${ledger.watermark.anchorMessageID ?? "none"}\`).`,
         `Thinned: ${ledger.metrics.toolPartsThinned} tool parts (~${ledger.metrics.netTokensFreed} net tokens freed).`,
       ].join("\n"),
+      manifestMarkdown: ledger.manifest.renderedMarkdown,
     }
   }
 
@@ -942,6 +1048,7 @@ export class WorkingSetValve {
     readonly summaryMarkdown: string
   } {
     const existed = this.ledgers.delete(sessionID)
+    this.hookReads.delete(sessionID)
     return {
       reset: existed,
       sessionID,
@@ -1040,13 +1147,16 @@ export class WorkingSetValve {
     )
 
     const diskHashes = params.diskHashesByPath ?? this.options.diskHashesByPath
-    if (diskHashes) {
-      for (const [key, entry] of filesReadMap.entries()) {
-        const diskHash = diskHashes.get(entry.path) ?? diskHashes.get(entry.normalizedPath)
-        if (diskHash && diskHash !== entry.blobSha256) {
+    const canonicalRoot = this.options.canonicalRoot
+
+    for (const [key, entry] of filesReadMap.entries()) {
+      const diskHash = diskHashes?.get(entry.path) ?? diskHashes?.get(entry.normalizedPath)
+      if (diskHash !== undefined) {
+        const matches = diskHash === entry.blobSha256 || (entry.sliceSha256 !== undefined && diskHash === entry.sliceSha256)
+        if (!matches) {
           filesReadMap.set(key, { ...entry, status: STALE_STATUS })
           for (const [callId, bc] of breadcrumbsByCallId.entries()) {
-            if (bc.tool === "read" && normalizeRepoPath(bc.target) === entry.normalizedPath) {
+            if (bc.tool === "read" && normalizeRepoPath(bc.target, canonicalRoot) === entry.normalizedPath) {
               breadcrumbsByCallId.set(
                 callId,
                 formatFactBreadcrumb({
@@ -1059,6 +1169,51 @@ export class WorkingSetValve {
                   blobSha256: bc.blobSha256,
                   summary: bc.summary,
                   status: STALE_STATUS,
+                }),
+              )
+            }
+          }
+        }
+        continue
+      }
+
+      if (entry.status === STALE_STATUS) continue
+
+      const shouldCheckDisk =
+        (typeof canonicalRoot === "string" && canonicalRoot.length > 0) ||
+        (isAbsolute(entry.path) && existsSync(entry.path))
+      if (shouldCheckDisk) {
+        const diskPath = resolveDiskPath(entry.path, canonicalRoot)
+        if (existsSync(diskPath)) {
+          const recon = computeDiskSliceSha(diskPath, {
+            startLine: entry.startLine ?? 1,
+            endLine: entry.endLine ?? 1,
+            totalLines: entry.totalLines ?? null,
+            isTruncated: Boolean(entry.isTruncated),
+            sliceSha: entry.sliceSha256 ?? entry.blobSha256,
+          })
+          const nextLineRange = recon.state === "SLICE" ? recon.lineRange : entry.lineRange
+          filesReadMap.set(key, {
+            ...entry,
+            lineRange: nextLineRange,
+            totalLines: recon.currentTotalLines,
+            isTruncated: recon.state === "SLICE",
+            status: recon.stalenessStatus,
+          })
+          for (const [callId, bc] of breadcrumbsByCallId.entries()) {
+            if (bc.tool === "read" && normalizeRepoPath(bc.target, canonicalRoot) === entry.normalizedPath) {
+              breadcrumbsByCallId.set(
+                callId,
+                formatFactBreadcrumb({
+                  callId: bc.callId,
+                  messageId: bc.messageId,
+                  tool: bc.tool,
+                  target: bc.target,
+                  lineRange: nextLineRange,
+                  originalChars: bc.originalChars,
+                  blobSha256: bc.blobSha256,
+                  summary: bc.summary,
+                  status: recon.stalenessStatus,
                 }),
               )
             }
@@ -1367,7 +1522,7 @@ export class WorkingSetValve {
       for (const [cId, prevBc] of breadcrumbsByCallId.entries()) {
         if (
           prevBc.tool === "read" &&
-          normalizeRepoPath(prevBc.target) === normPath &&
+          normalizeRepoPath(prevBc.target, this.options.canonicalRoot) === normPath &&
           prevBc.blobSha256 !== newSha256
         ) {
           breadcrumbsByCallId.set(
@@ -1481,20 +1636,39 @@ export class WorkingSetValve {
 
         const { sha256, blobRef } = this.blobStore.sink(outputText, { persistToDisk })
         const target = extractTargetLabel(name, input, outputText)
+        let readCaptureStatus: FreshnessStatus = FRESH_STATUS
+        let readCaptureLineRange: string | null = null
 
         if (name === "read") {
-          const lineRange = extractReadLineRange(input, outputText)
+          const capture = parseReadToolOutput(
+            outputText,
+            { ...input, path: target },
+            this.options.canonicalRoot,
+          )
+          readCaptureStatus =
+            capture.isTruncated || capture.startLine > 1
+              ? formatStalenessStatus("SLICE", capture.startLine, capture.endLine, capture.totalLines)
+              : FRESH_STATUS
+          readCaptureLineRange =
+            capture.isTruncated || capture.startLine > 1
+              ? capture.lineRange
+              : extractReadLineRange(input, outputText)
           const summary = summarizeReadOutput(target, outputText)
-          const normPath = normalizeRepoPath(target)
+          const normPath = normalizeRepoPath(target, this.options.canonicalRoot)
           recordAndTrackRead({
             path: target,
             normalizedPath: normPath,
-            lineRange,
+            lineRange: readCaptureLineRange,
+            startLine: capture.startLine,
+            endLine: capture.endLine,
+            totalLines: capture.totalLines,
+            isTruncated: capture.isTruncated,
             chars: outputText.length,
             blobSha256: sha256,
+            sliceSha256: capture.sliceSha,
             blobRef,
             summary,
-            status: FRESH_STATUS,
+            status: readCaptureStatus,
             messageId: msgId,
             sourceSessionId: sessionID,
           })
@@ -1542,7 +1716,7 @@ export class WorkingSetValve {
         } else if (name === "patch" && typeof input.patchText === "string") {
           for (const patched of extractPatchFiles(input.patchText)) {
             const { sha256: pSha, blobRef: pRef } = this.blobStore.sink(patched.hunkText, { persistToDisk })
-            const normPath = normalizeRepoPath(patched.path)
+            const normPath = normalizeRepoPath(patched.path, this.options.canonicalRoot)
             if (isPrimarySession || isCrossSessionContinuityArtifact(normPath)) {
               filesModifiedMap.set(normPath, {
                 path: patched.path,
@@ -1557,10 +1731,14 @@ export class WorkingSetValve {
             if (localReadsByPath.has(normPath)) {
               markExistingReadsStale(normPath, pSha)
             } else {
+              const pLines = Math.max(1, patched.hunkText.split("\n").length)
               recordAndTrackRead({
                 path: patched.path,
                 normalizedPath: normPath,
-                lineRange: `L1-L${Math.max(1, patched.hunkText.split("\n").length)}`,
+                lineRange: `L1-L${pLines}`,
+                startLine: 1,
+                endLine: pLines,
+                isTruncated: false,
                 chars: patched.hunkText.length,
                 blobSha256: pSha,
                 blobRef: pRef,
@@ -1573,7 +1751,7 @@ export class WorkingSetValve {
           }
         } else if ((name === "write" || name === "edit") && (input.path || input.filePath)) {
           const filePath = String(input.path ?? input.filePath)
-          const normPath = normalizeRepoPath(filePath)
+          const normPath = normalizeRepoPath(filePath, this.options.canonicalRoot)
           const body = String(input.content ?? input.newString ?? outputText)
           const { sha256: wSha, blobRef: wRef } = this.blobStore.sink(body, { persistToDisk })
           if (isPrimarySession || isCrossSessionContinuityArtifact(normPath)) {
@@ -1590,10 +1768,14 @@ export class WorkingSetValve {
           if (localReadsByPath.has(normPath)) {
             markExistingReadsStale(normPath, wSha)
           } else {
+            const wLines = Math.max(1, body.replace(/\n$/, "").split("\n").length)
             recordAndTrackRead({
               path: filePath,
               normalizedPath: normPath,
-              lineRange: `L1-L${Math.max(1, body.split("\n").length)}`,
+              lineRange: `L1-L${wLines}`,
+              startLine: 1,
+              endLine: wLines,
+              isTruncated: false,
               chars: body.length,
               blobSha256: wSha,
               blobRef: wRef,
@@ -1606,12 +1788,16 @@ export class WorkingSetValve {
         } else if ((name === "shell" || name === "bash") && typeof input.command === "string") {
           for (const catSlice of extractShellCatSlices(input.command, outputText)) {
             const { sha256: cSha, blobRef: cRef } = this.blobStore.sink(catSlice.content, { persistToDisk })
-            const normPath = normalizeRepoPath(catSlice.path)
+            const normPath = normalizeRepoPath(catSlice.path, this.options.canonicalRoot)
             const summary = summarizeReadOutput(catSlice.path, catSlice.content)
+            const cLines = Math.max(1, catSlice.content.replace(/\n$/, "").split("\n").length)
             recordAndTrackRead({
               path: catSlice.path,
               normalizedPath: normPath,
-              lineRange: `L1-L${Math.max(1, catSlice.content.split("\n").length)}`,
+              lineRange: `L1-L${cLines}`,
+              startLine: 1,
+              endLine: cLines,
+              isTruncated: false,
               chars: catSlice.content.length,
               blobSha256: cSha,
               blobRef: cRef,
@@ -1674,7 +1860,7 @@ export class WorkingSetValve {
 
         if (inThinRange) {
           toolPartsThinned += 1
-          const lineRange = name === "read" ? extractReadLineRange(input, outputText) : null
+          const lineRange = name === "read" ? (readCaptureLineRange ?? extractReadLineRange(input, outputText)) : null
           const summary =
             name === "read"
               ? summarizeReadOutput(target, outputText)
@@ -1691,7 +1877,7 @@ export class WorkingSetValve {
             originalChars: outputText.length,
             blobSha256: sha256,
             summary,
-            status: name === "skill" ? ACTIVE_SKILL_BREADCRUMB_STATUS : FRESH_STATUS,
+            status: name === "skill" ? ACTIVE_SKILL_BREADCRUMB_STATUS : name === "read" ? readCaptureStatus : FRESH_STATUS,
           })
           breadcrumbsByCallId.set(callId, bc)
 
