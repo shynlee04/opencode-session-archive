@@ -1,0 +1,650 @@
+import { existsSync, mkdirSync } from "node:fs"
+import path from "node:path"
+import { Database } from "bun:sqlite"
+import { estimateTokens, normalizeRepoPath } from "./archive/primitives.ts"
+import {
+  ensureCodeGraphSchema,
+  indexCodebase,
+  readAstSkeleton,
+  readSymbolSlice,
+} from "./honeycomb/ast-skeleton.ts"
+import {
+  ensureCochangeSchema,
+  mineGitCochange,
+  renderCochangeWarnings,
+} from "./honeycomb/cochange.ts"
+import { computeCodebasePageRank, renderRepoMap } from "./honeycomb/pagerank.ts"
+import type {
+  SubstrateActionInput,
+  SubstrateActionKind,
+  SubstrateActionOutput,
+  SubstrateSnapshotOutput,
+} from "./rpc.ts"
+import { buildImplementorViewportBrief } from "./viewports/brief.ts"
+import {
+  buildCompactionContinuationPacket,
+  ensureContinuitySchema,
+  isFreshOrSliceStatus,
+  isSliceStatus,
+  reconcileProvenanceStaleness,
+  renderProvenanceReport,
+  resolveDefaultSessionId,
+  shortBlobRef,
+} from "./viewports/continuity.ts"
+import {
+  ensureSemanticDigestSchema,
+  materializeSemanticDigests,
+  queryVibeNavigation,
+  renderIntentTimeline,
+} from "./viewports/semantic-digest.ts"
+
+export interface SubstrateRuntimeContextOptions {
+  readonly projectRoot?: string
+  readonly archiveDir?: string
+  readonly indexDbPath?: string
+  readonly sessionID?: string
+}
+
+function queryScalarCount(db: Database, sql: string, ...params: (string | number)[]): number {
+  try {
+    const row = db.query(sql).get(...params) as { c?: number } | null
+    return typeof row?.c === "number" ? row.c : 0
+  } catch {
+    return 0
+  }
+}
+
+export function buildSubstrateSnapshot(
+  db: Database,
+  options: SubstrateRuntimeContextOptions = {},
+): SubstrateSnapshotOutput {
+  ensureContinuitySchema(db)
+  ensureSemanticDigestSchema(db)
+  ensureCodeGraphSchema(db)
+  ensureCochangeSchema(db)
+
+  const projectRoot = options.projectRoot ?? process.cwd()
+  const archiveDir = options.archiveDir ?? path.join(projectRoot, ".session-archive")
+  const indexDbPath = options.indexDbPath ?? path.join(archiveDir, "index.sqlite")
+
+  const resolved = resolveDefaultSessionId(db, options.sessionID)
+  const resolvedSessionID = resolved.sessionId
+
+  if (options.projectRoot) {
+    try {
+      reconcileProvenanceStaleness(db, {
+        sessionID: resolvedSessionID,
+        canonicalRoot: projectRoot,
+      })
+    } catch {
+      // ignore reconciliation error on partial schemas
+    }
+  }
+
+  const sessionRow = db
+    .query("SELECT title FROM session WHERE id = ? LIMIT 1")
+    .get(resolvedSessionID) as { title: string | null } | null
+  const digestRow = db
+    .query(
+      "SELECT headline, verification_state FROM session_semantic_digest WHERE session_id = ? LIMIT 1",
+    )
+    .get(resolvedSessionID) as { headline: string | null; verification_state: string | null } | null
+
+  const sessionTitle =
+    sessionRow?.title || digestRow?.headline || `Session ${resolvedSessionID}`
+  const verificationState = digestRow?.verification_state || "in_progress_or_unverified"
+
+  const fileRows = db
+    .query(
+      "SELECT path, line_range, staleness_status FROM file_read_ledger WHERE session_id = ? ORDER BY read_seq ASC, path ASC",
+    )
+    .all(resolvedSessionID) as { path: string; line_range: string; staleness_status: string }[]
+
+  const freshFiles = fileRows.filter((f) => isFreshOrSliceStatus(f.staleness_status)).length
+  const sliceFiles = fileRows.filter((f) => isSliceStatus(f.staleness_status)).length
+  const staleFiles = fileRows.filter((f) => !isFreshOrSliceStatus(f.staleness_status)).length
+
+  const staleAlerts = fileRows
+    .filter((f) => !isFreshOrSliceStatus(f.staleness_status) || isSliceStatus(f.staleness_status))
+    .map((f) => ({
+      path: f.path,
+      lineRange: f.line_range,
+      status: f.staleness_status,
+    }))
+
+  const recentPivots = (
+    db
+      .query(
+        "SELECT seq, pivot_kind, prompt_excerpt, blob_ref FROM intent_pivot WHERE session_id = ? ORDER BY seq DESC LIMIT 5",
+      )
+      .all(resolvedSessionID) as {
+      seq: number
+      pivot_kind: string
+      prompt_excerpt: string
+      blob_ref: string
+    }[]
+  ).map((p) => ({
+    seq: p.seq,
+    pivotKind: p.pivot_kind,
+    excerpt: p.prompt_excerpt,
+    blobRef: shortBlobRef(p.blob_ref),
+  }))
+
+  const topCentralFiles = db
+    .query("SELECT path, pagerank, loc FROM code_file ORDER BY pagerank DESC, path ASC LIMIT 5")
+    .all() as { path: string; pagerank: number; loc: number }[]
+
+  let latestValuation: SubstrateSnapshotOutput["latestValuation"] = null
+  try {
+    const valRow = db
+      .query(
+        "SELECT mode, step_count, watermark_step_index, saved_chars, saved_tokens FROM working_valve_state WHERE session_id = ? LIMIT 1",
+      )
+      .get(resolvedSessionID) as {
+      mode: string
+      step_count: number
+      watermark_step_index: number
+      saved_chars: number
+      saved_tokens: number
+    } | null
+    if (valRow) {
+      latestValuation = {
+        mode: valRow.mode,
+        stepCount: valRow.step_count,
+        watermarkStepIndex: valRow.watermark_step_index,
+        savedChars: valRow.saved_chars,
+        savedTokens: valRow.saved_tokens,
+      }
+    }
+  } catch {
+    latestValuation = null
+  }
+
+  return {
+    projectRoot,
+    archiveDir,
+    indexDbPath,
+    resolvedSessionID,
+    sessionTitle,
+    verificationState,
+    counts: {
+      sessions: queryScalarCount(db, "SELECT COUNT(*) as c FROM session"),
+      rootSessions: queryScalarCount(db, "SELECT COUNT(*) as c FROM session WHERE depth = 0"),
+      delegations: queryScalarCount(
+        db,
+        "SELECT COUNT(*) as c FROM delegation_turn WHERE parent_session_id = ?",
+        resolvedSessionID,
+      ),
+      flaggedDelegations: queryScalarCount(
+        db,
+        "SELECT COUNT(*) as c FROM delegation_turn WHERE parent_session_id = ? AND (verified_outcome IN ('blocked_in_text', 'tool_error_inside') OR tool_error_count > 0)",
+        resolvedSessionID,
+      ),
+      codeFiles: queryScalarCount(db, "SELECT COUNT(*) as c FROM code_file"),
+      codeSymbols: queryScalarCount(db, "SELECT COUNT(*) as c FROM code_symbol"),
+      cochangePairs: queryScalarCount(db, "SELECT COUNT(*) as c FROM git_cochange"),
+      hiddenCochangePairs: queryScalarCount(
+        db,
+        "SELECT COUNT(*) as c FROM git_cochange WHERE has_static_edge = 0",
+      ),
+      freshFiles,
+      sliceFiles,
+      staleFiles,
+      activeSkills: queryScalarCount(
+        db,
+        "SELECT COUNT(*) as c FROM skill_load_ledger WHERE session_id = ?",
+        resolvedSessionID,
+      ),
+      provenanceChains: queryScalarCount(
+        db,
+        "SELECT COUNT(*) as c FROM provenance_chain WHERE root_session_id = ?",
+        resolvedSessionID,
+      ),
+      staleChains: queryScalarCount(
+        db,
+        "SELECT COUNT(*) as c FROM provenance_chain WHERE root_session_id = ? AND staleness_status IN ('verified_stale_by_later_touch', 'STALE (modified since read/review — re-verify slice)')",
+        resolvedSessionID,
+      ),
+      compactions: queryScalarCount(
+        db,
+        "SELECT COUNT(*) as c FROM compaction WHERE session_id = ?",
+        resolvedSessionID,
+      ),
+    },
+    latestValuation,
+    recentPivots,
+    staleAlerts,
+    topCentralFiles,
+    updatedAt: new Date().toISOString(),
+  }
+}
+
+export async function executeSubstrateAction(
+  db: Database,
+  input: SubstrateActionInput,
+  options: SubstrateRuntimeContextOptions = {},
+): Promise<SubstrateActionOutput> {
+  ensureContinuitySchema(db)
+  ensureSemanticDigestSchema(db)
+  ensureCodeGraphSchema(db)
+  ensureCochangeSchema(db)
+
+  const projectRoot = options.projectRoot ?? process.cwd()
+  const archiveDir = options.archiveDir ?? path.join(projectRoot, ".session-archive")
+  const resolved = resolveDefaultSessionId(db, input.sessionID ?? options.sessionID)
+  const resolvedSessionID = resolved.sessionId
+
+  let markdown = ""
+
+  switch (input.action) {
+    case "sync": {
+      if (existsSync(projectRoot)) {
+        try {
+          indexCodebase(db, projectRoot)
+          computeCodebasePageRank(db)
+        } catch {
+          // ignore if projectRoot has no TS files
+        }
+        try {
+          await mineGitCochange(db, projectRoot)
+        } catch {
+          // ignore if projectRoot is not a git repo
+        }
+      }
+      try {
+        materializeSemanticDigests(db, { archiveDir })
+      } catch {
+        // ignore if no sessions exist yet
+      }
+      const snap = buildSubstrateSnapshot(db, {
+        ...options,
+        projectRoot,
+        archiveDir,
+        sessionID: resolvedSessionID,
+      })
+      markdown = [
+        `## Substrate Sync Complete · \`${snap.resolvedSessionID}\``,
+        `- **Project Root:** \`${snap.projectRoot}\``,
+        `- **Sessions:** ${snap.counts.rootSessions} root / ${snap.counts.sessions} total`,
+        `- **CodeGraph:** ${snap.counts.codeFiles} files, ${snap.counts.codeSymbols} symbols`,
+        `- **Git Co-Change:** ${snap.counts.cochangePairs} pairs (${snap.counts.hiddenCochangePairs} HIDDEN)`,
+        `- **Working Memory:** ${snap.counts.freshFiles} FRESH (${snap.counts.sliceFiles} SLICE), ${snap.counts.staleFiles} STALE`,
+      ].join("\n")
+      return {
+        ok: true,
+        action: input.action,
+        resolvedSessionID,
+        markdown,
+        tokenEstimate: estimateTokens(markdown),
+        snapshot: snap,
+      }
+    }
+
+    case "repomap": {
+      const focusPaths = input.targetPaths ?? (input.path ? [input.path] : undefined)
+      const view = renderRepoMap(db, {
+        focusPaths,
+        budgetTokens: input.maxTokens ?? 1000,
+      })
+      markdown = view.text
+      break
+    }
+
+    case "skeleton": {
+      const targetPath = input.path ?? input.targetPaths?.[0]
+      if (!targetPath) {
+        markdown = "Error: `skeleton` requires `--path <rel>`."
+        return {
+          ok: false,
+          action: input.action,
+          resolvedSessionID,
+          markdown,
+          tokenEstimate: estimateTokens(markdown),
+        }
+      }
+      const normPath = normalizeRepoPath(targetPath, projectRoot)
+      const skel = readAstSkeleton(db, normPath)
+      markdown = skel
+        ? skel.skeleton_text
+        : `No indexed AST skeleton found for \`${normPath}\`.`
+      break
+    }
+
+    case "slice": {
+      const targetPath = input.path ?? input.targetPaths?.[0]
+      const symbolName = input.symbol ?? input.symbolNames?.[0]
+      if (!targetPath || !symbolName) {
+        markdown = "Error: `slice` requires `--path <rel>` and `--symbol <name>`."
+        return {
+          ok: false,
+          action: input.action,
+          resolvedSessionID,
+          markdown,
+          tokenEstimate: estimateTokens(markdown),
+        }
+      }
+      const normPath = normalizeRepoPath(targetPath, projectRoot)
+      const slice = readSymbolSlice(db, projectRoot, normPath, symbolName)
+      markdown = slice
+        ? slice.slice_text
+        : `No symbol slice found for \`${normPath}#${symbolName}\`.`
+      break
+    }
+
+    case "coupled": {
+      const targetPath = input.path ?? input.targetPaths?.[0]
+      if (!targetPath) {
+        markdown = "Error: `coupled` requires `--path <rel>`."
+        return {
+          ok: false,
+          action: input.action,
+          resolvedSessionID,
+          markdown,
+          tokenEstimate: estimateTokens(markdown),
+        }
+      }
+      const normPath = normalizeRepoPath(targetPath, projectRoot)
+      markdown =
+        renderCochangeWarnings(db, normPath) ||
+        `No temporal co-change couplings found for \`${normPath}\`.`
+      break
+    }
+
+    case "provenance": {
+      markdown = renderProvenanceReport(db, resolvedSessionID, {
+        canonicalRoot: options.projectRoot,
+      })
+      break
+    }
+
+    case "timeline": {
+      const timeline = renderIntentTimeline(db, resolvedSessionID, {
+        archiveDir,
+      })
+      markdown = timeline.markdown
+      break
+    }
+
+    case "search": {
+      const queryText = input.query?.trim() ?? ""
+      if (!queryText) {
+        markdown = "Error: `search` requires `--query <text>`."
+        return {
+          ok: false,
+          action: input.action,
+          resolvedSessionID,
+          markdown,
+          tokenEstimate: estimateTokens(markdown),
+        }
+      }
+      const nav = queryVibeNavigation(db, queryText, {
+        maxTokens: input.maxTokens ?? 350,
+      })
+      markdown = nav.markdown
+      break
+    }
+
+    case "brief": {
+      const targetPaths =
+        input.targetPaths && input.targetPaths.length > 0
+          ? input.targetPaths
+          : input.path
+            ? [input.path]
+            : (
+                db
+                  .query("SELECT path FROM code_file ORDER BY pagerank DESC LIMIT 2")
+                  .all() as { path: string }[]
+              ).map((r) => r.path)
+      const symbolNames =
+        input.symbolNames && input.symbolNames.length > 0
+          ? input.symbolNames
+          : input.symbol
+            ? [input.symbol]
+            : undefined
+      const brief = buildImplementorViewportBrief(db, {
+        targetPaths,
+        symbolNames,
+        sessionID: resolvedSessionID,
+        rootDir: projectRoot,
+        maxTokens: input.maxTokens ?? 1500,
+      })
+      markdown = brief.markdown
+      break
+    }
+
+    case "prune": {
+      const mode = input.mode ?? "manual"
+      const keepRecentSteps = input.keepRecentSteps ?? 1
+      const rec = reconcileProvenanceStaleness(db, {
+        sessionID: resolvedSessionID,
+        canonicalRoot: options.projectRoot,
+      })
+      markdown = [
+        `## Working-Set Valve Prune (\`mode=${mode}\`, \`keepRecentSteps=${keepRecentSteps}\`) · \`${resolvedSessionID}\``,
+        `- **Files Checked:** ${rec.totalFilesChecked} (${rec.freshFilesCount} FRESH [${rec.sliceFilesCount} SLICE], ${rec.staleFilesCount} STALE)`,
+        `- **Provenance Chains Checked:** ${rec.totalChainsChecked} (${rec.verifiedFreshChainsCount} fresh, ${rec.staleChainsCount} stale)`,
+      ].join("\n")
+      break
+    }
+
+    case "status":
+    default: {
+      const pkt = buildCompactionContinuationPacket(db, {
+        sessionID: resolvedSessionID,
+        canonicalRoot: options.projectRoot,
+        maxTokens: input.maxTokens ?? 1200,
+      })
+      markdown = pkt.markdown
+      break
+    }
+  }
+
+  const snapshot = buildSubstrateSnapshot(db, {
+    ...options,
+    projectRoot,
+    archiveDir,
+    sessionID: resolvedSessionID,
+  })
+
+  return {
+    ok: true,
+    action: input.action,
+    resolvedSessionID,
+    markdown,
+    tokenEstimate: estimateTokens(markdown),
+    snapshot,
+  }
+}
+
+const VALID_ACTIONS = new Set<SubstrateActionKind>([
+  "status",
+  "sync",
+  "repomap",
+  "skeleton",
+  "slice",
+  "coupled",
+  "provenance",
+  "timeline",
+  "search",
+  "brief",
+  "prune",
+])
+
+export interface SubstrateCliOptions {
+  readonly projectRoot?: string
+  readonly archiveDir?: string
+  readonly dbPath?: string
+  readonly db?: Database
+}
+
+export interface SubstrateCliResult {
+  readonly exitCode: number
+  readonly stdout: string
+  readonly stderr: string
+  readonly snapshot?: SubstrateSnapshotOutput
+  readonly actionOutput?: SubstrateActionOutput
+}
+
+export async function runSubstrateCli(
+  argv: readonly string[],
+  options: SubstrateCliOptions = {},
+): Promise<SubstrateCliResult> {
+  let action: SubstrateActionKind = "status"
+  let sessionID: string | undefined
+  const paths: string[] = []
+  const symbols: string[] = []
+  let query: string | undefined
+  let maxTokens: number | undefined
+  let mode: "manual" | "auto" | "off" | undefined
+  let jsonOutput = false
+  let projectRoot = options.projectRoot
+  let dbPath = options.dbPath
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (!arg.startsWith("-")) {
+      if (VALID_ACTIONS.has(arg as SubstrateActionKind)) {
+        action = arg as SubstrateActionKind
+      } else if (!query && action === "search") {
+        query = arg
+      } else if (paths.length === 0 && (action === "skeleton" || action === "slice" || action === "coupled" || action === "brief")) {
+        paths.push(arg)
+      }
+      continue
+    }
+
+    const eqIdx = arg.indexOf("=")
+    const flag = eqIdx > 0 ? arg.slice(0, eqIdx) : arg
+    const nextVal = eqIdx > 0 ? arg.slice(eqIdx + 1) : argv[i + 1]
+    const consumeNext = () => {
+      if (eqIdx < 0 && i + 1 < argv.length) i++
+      return nextVal ?? ""
+    }
+
+    switch (flag) {
+      case "--json":
+        jsonOutput = true
+        break
+      case "--session":
+      case "-s":
+        sessionID = consumeNext()
+        break
+      case "--path":
+      case "-p": {
+        const val = consumeNext()
+        for (const item of val.split(",").map((s) => s.trim()).filter(Boolean)) {
+          paths.push(item)
+        }
+        break
+      }
+      case "--symbol": {
+        const val = consumeNext()
+        for (const item of val.split(",").map((s) => s.trim()).filter(Boolean)) {
+          symbols.push(item)
+        }
+        break
+      }
+      case "--query":
+      case "-q":
+        query = consumeNext()
+        break
+      case "--max-tokens": {
+        const parsed = Number.parseInt(consumeNext(), 10)
+        if (Number.isFinite(parsed) && parsed > 0) maxTokens = parsed
+        break
+      }
+      case "--mode": {
+        const val = consumeNext()
+        if (val === "manual" || val === "auto" || val === "off") mode = val
+        break
+      }
+      case "--project-root":
+        projectRoot = consumeNext()
+        break
+      case "--db":
+        dbPath = consumeNext()
+        break
+      default:
+        break
+    }
+  }
+
+  const effectiveProjectRoot = projectRoot ?? process.cwd()
+  const effectiveArchiveDir =
+    options.archiveDir ?? path.join(effectiveProjectRoot, ".session-archive")
+  const effectiveDbPath = dbPath ?? path.join(effectiveArchiveDir, "index.sqlite")
+
+  let ownDb: Database | null = null
+  const db =
+    options.db ??
+    (() => {
+      mkdirSync(path.dirname(effectiveDbPath), { recursive: true })
+      ownDb = new Database(effectiveDbPath)
+      return ownDb
+    })()
+
+  try {
+    const actionInput: SubstrateActionInput = {
+      action,
+      sessionID,
+      path: paths[0],
+      targetPaths: paths.length > 0 ? paths : undefined,
+      symbol: symbols[0],
+      symbolNames: symbols.length > 0 ? symbols : undefined,
+      query,
+      maxTokens,
+      mode,
+    }
+
+    const actionOutput = await executeSubstrateAction(db, actionInput, {
+      projectRoot: effectiveProjectRoot,
+      archiveDir: effectiveArchiveDir,
+      indexDbPath: effectiveDbPath,
+      sessionID,
+    })
+
+    if (!actionOutput.ok) {
+      return {
+        exitCode: 1,
+        stdout: jsonOutput ? JSON.stringify(actionOutput, null, 2) : "",
+        stderr: actionOutput.markdown,
+        snapshot: actionOutput.snapshot,
+        actionOutput,
+      }
+    }
+
+    const stdout = jsonOutput
+      ? JSON.stringify(
+          action === "status" && actionOutput.snapshot
+            ? { ...actionOutput, snapshot: actionOutput.snapshot }
+            : actionOutput,
+          null,
+          2,
+        )
+      : actionOutput.markdown
+
+    return {
+      exitCode: 0,
+      stdout,
+      stderr: "",
+      snapshot: actionOutput.snapshot,
+      actionOutput,
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `hivemind-substrate: ${msg}`,
+    }
+  } finally {
+    ownDb?.close()
+  }
+}
+
+if (import.meta.main) {
+  const res = await runSubstrateCli(process.argv.slice(2))
+  if (res.stdout) process.stdout.write(`${res.stdout}\n`)
+  if (res.stderr) process.stderr.write(`${res.stderr}\n`)
+  process.exit(res.exitCode)
+}
