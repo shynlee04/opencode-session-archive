@@ -13,8 +13,8 @@ Status values: `planned`, `active`, `done`, `empty`, `superseded`, `deferred`.
 | Phase | Slug | Status | Depends on | Spec |
 |---|---|---|---|---|
 | E1.1 | `trajectory-working-memory` | `active` | none | `.planning/phases/trajectory-working-memory/SPEC.md` |
-| E1.2 | `codebase-structural-graph` | `planned` | E1.1 | `.planning/phases/codebase-structural-graph/SPEC.md` |
-| E1.3 | `viewport-synthesis-compaction` | `planned` | E1.1, E1.2 | `.planning/phases/viewport-synthesis-compaction/SPEC.md` |
+| E1.2 | `codebase-structural-graph` | `active` | E1.1 | `.planning/phases/codebase-structural-graph/SPEC.md` |
+| E1.3 | `viewport-synthesis-compaction` | `active` | E1.1, E1.2 | `.planning/phases/viewport-synthesis-compaction/SPEC.md` |
 
 ## Deferred
 
