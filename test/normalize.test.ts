@@ -330,3 +330,372 @@ describe("normalize: unknown", () => {
     expect(record.data).toEqual({ time: {}, something: 1 })
   })
 })
+
+describe("TWM-02: REQ-SUB-03 & REQ-SUB-04", () => {
+  test("REQ-SUB-04: normalizeUser sinks human prompt text (data.text and data.content parts) into blobs and emits text_ref", () => {
+    const { sink, blobs } = collect()
+    const res1 = normalizeMessage(
+      row("user", {
+        time: { created: 1000 },
+        text: "Look at my prompting throughout and continue from Wave 2 slice",
+      }),
+      sink,
+      null,
+    )
+    if (res1.record.kind !== "user") throw new Error("expected user")
+    const expectedSha1 = sha256hex("Look at my prompting throughout and continue from Wave 2 slice")
+    expect(res1.record.text).toBe("Look at my prompting throughout and continue from Wave 2 slice")
+    expect((res1.record as unknown as { text_ref?: string }).text_ref).toBe(`blob:${expectedSha1}`)
+    expect(blobs.get(expectedSha1)).toBe("Look at my prompting throughout and continue from Wave 2 slice")
+
+    const res2 = normalizeMessage(
+      row("user", {
+        time: { created: 1001 },
+        content: [
+          { type: "text", text: "Part one of prompt" },
+          { type: "text", text: "Part two of prompt" },
+        ],
+      }),
+      sink,
+      1,
+    )
+    if (res2.record.kind !== "user") throw new Error("expected user")
+    const expectedText2 = "Part one of prompt\nPart two of prompt"
+    const expectedSha2 = sha256hex(expectedText2)
+    expect(res2.record.text).toBe(expectedText2)
+    expect((res2.record as unknown as { text_ref?: string }).text_ref).toBe(`blob:${expectedSha2}`)
+    expect(blobs.get(expectedSha2)).toBe(expectedText2)
+  })
+
+  test("REQ-SUB-04: normalizes standalone skill and shell messages and populates file_read_ledger & skill_load_ledger", async () => {
+    const normMod = (await import("../src/archive/normalize.ts")) as Record<string, unknown>
+    const extractSessionLedgers = normMod.extractSessionLedgers as (
+      rows: readonly MessageRow[],
+      sink: (text: string) => string,
+    ) => {
+      fileReads: Array<Record<string, unknown>>
+      skillLoads: Array<Record<string, unknown>>
+      fileTouches: Array<Record<string, unknown>>
+    }
+    expect(typeof extractSessionLedgers).toBe("function")
+
+    const { sink, blobs } = collect()
+    const skillMsg = row(
+      "skill",
+      {
+        id: "sk_tdd",
+        name: "tdd",
+        description: "Test-driven development",
+        text: "# TDD Skill Body\nRed -> Green -> Refactor",
+      },
+      { id: "msg_sk1", seq: 1 },
+    )
+    const shellMsg = row(
+      "shell",
+      {
+        command: "bun test",
+        cwd: "/repo",
+        exitCode: 0,
+        output: "12 pass, 0 fail",
+      },
+      { id: "msg_sh1", seq: 2 },
+    )
+    const readAndSkillAssistant = row(
+      "assistant",
+      {
+        time: { created: 100, completed: 200 },
+        agent: "build",
+        content: [
+          {
+            type: "tool",
+            id: "call_read_1",
+            name: "read",
+            state: {
+              status: "completed",
+              input: { filePath: "/repo/src/archive/normalize.ts", offset: 1, limit: 50 },
+              content: [{ type: "text", text: "export function normalizeMessage() {}\n" }],
+            },
+          },
+          {
+            type: "tool",
+            id: "call_skill_2",
+            name: "skill",
+            state: {
+              status: "completed",
+              input: { name: "ultra-mode" },
+              content: [{ type: "text", text: "<skill_content name=\"ultra-mode\"># Ultra mode body</skill_content>" }],
+            },
+          },
+        ],
+      },
+      { id: "msg_asst_3", seq: 3 },
+    )
+    const editAssistant = row(
+      "assistant",
+      {
+        time: { created: 201, completed: 300 },
+        agent: "build",
+        content: [
+          {
+            type: "tool",
+            id: "call_edit_1",
+            name: "edit",
+            state: {
+              status: "completed",
+              input: { filePath: "/repo/src/archive/normalize.ts", oldString: "a", newString: "b" },
+              content: [{ type: "text", text: "Edited /repo/src/archive/normalize.ts" }],
+            },
+          },
+        ],
+      },
+      { id: "msg_asst_4", seq: 4 },
+    )
+
+    const normSkill = normalizeMessage(skillMsg, sink, null)
+    expect(normSkill.record.kind).toBe("skill")
+    const normShell = normalizeMessage(shellMsg, sink, 1)
+    expect(normShell.record.kind).toBe("shell")
+    expect(blobs.has(sha256hex("12 pass, 0 fail"))).toBe(true)
+
+    const ledgers = extractSessionLedgers([skillMsg, shellMsg, readAndSkillAssistant, editAssistant], sink)
+    expect(ledgers.fileReads).toHaveLength(1)
+    expect(ledgers.fileReads[0]).toMatchObject({
+      session_id: "ses_1",
+      path: "/repo/src/archive/normalize.ts",
+      call_id: "call_read_1",
+      read_seq: 3,
+      line_range: "L1-L50",
+      start_line: 1,
+      end_line: 50,
+      blob_sha: sha256hex("export function normalizeMessage() {}\n"),
+      read_blob_sha: sha256hex("export function normalizeMessage() {}\n"),
+      staleness_status: "STALE",
+    })
+
+    expect(ledgers.skillLoads).toHaveLength(2)
+    const byName = new Map(ledgers.skillLoads.map((s) => [s.skill_name as string, s]))
+    expect(byName.get("tdd")).toMatchObject({
+      session_id: "ses_1",
+      skill_name: "tdd",
+      load_seq: 1,
+      loaded_seq: 1,
+      blob_sha: sha256hex("# TDD Skill Body\nRed -> Green -> Refactor"),
+      skill_blob_sha: sha256hex("# TDD Skill Body\nRed -> Green -> Refactor"),
+      status: "ACTIVE — DO NOT RE-INVOKE",
+    })
+    expect(byName.get("ultra-mode")).toMatchObject({
+      session_id: "ses_1",
+      skill_name: "ultra-mode",
+      load_seq: 3,
+      loaded_seq: 3,
+      status: "ACTIVE — DO NOT RE-INVOKE",
+    })
+  })
+
+  test("REQ-SUB-03: segmentChildStops and normalizeDelegationTurns preserve multi-stop turns without overwriting Turn 0", async () => {
+    const normMod = (await import("../src/archive/normalize.ts")) as Record<string, unknown>
+    const segmentChildStops = normMod.segmentChildStops as (
+      messages: readonly MessageRow[],
+      idleOutcome: string | null,
+    ) => Array<Record<string, unknown>>
+    const normalizeDelegationTurns = normMod.normalizeDelegationTurns as (
+      parentSessionId: string,
+      parentMessages: readonly MessageRow[],
+      childSessions: readonly Record<string, unknown>[],
+      childMessagesById: ReadonlyMap<string, readonly MessageRow[]>,
+      kvByChildId: ReadonlyMap<string, Record<string, unknown>>,
+      sinkText: (text: string) => string,
+    ) => Array<Record<string, unknown>>
+
+    expect(typeof segmentChildStops).toBe("function")
+    expect(typeof normalizeDelegationTurns).toBe("function")
+
+    const childMessages: MessageRow[] = [
+      row("user", { text: "Turn 0 spawn prompt" }, { id: "msg_c1", session_id: "ses_child_multi", seq: 1 }),
+      row(
+        "assistant",
+        {
+          content: [
+            { type: "text", text: "Turn 0 completed work" },
+            { type: "tool", id: "t1", name: "read", state: { status: "completed", content: [{ type: "text", text: "ok" }] } },
+          ],
+        },
+        { id: "msg_c2", session_id: "ses_child_multi", seq: 2 },
+      ),
+      row("idle", { outcome: "succeeded" }, { id: "msg_c3", session_id: "ses_child_multi", seq: 3 }),
+      row("user", { text: "Turn 1 send follow-up" }, { id: "msg_c4", session_id: "ses_child_multi", seq: 4 }),
+      row(
+        "assistant",
+        {
+          content: [
+            { type: "text", text: "Turn 1 follow-up response" },
+            { type: "tool", id: "t2", name: "edit", state: { status: "completed", content: [{ type: "text", text: "ok" }] } },
+          ],
+        },
+        { id: "msg_c5", session_id: "ses_child_multi", seq: 5 },
+      ),
+      row("idle", { outcome: "succeeded" }, { id: "msg_c6", session_id: "ses_child_multi", seq: 6 }),
+    ]
+
+    const stops = segmentChildStops(childMessages, "succeeded")
+    expect(stops).toHaveLength(2)
+    expect(stops[0]).toMatchObject({
+      turn_index: 0,
+      start_seq: 1,
+      end_seq: 3,
+      start_message_id: "msg_c1",
+      end_message_id: "msg_c3",
+    })
+    expect(stops[1]).toMatchObject({
+      turn_index: 1,
+      start_seq: 4,
+      end_seq: 6,
+      start_message_id: "msg_c4",
+      end_message_id: "msg_c6",
+    })
+
+    const { sink } = collect()
+    const parentMessages: MessageRow[] = [
+      row(
+        "assistant",
+        {
+          content: [
+            {
+              type: "tool",
+              id: "call_spawn_0",
+              name: "hivemind-delegate",
+              state: {
+                status: "completed",
+                input: { harness: "antigravity", agent: "implementer", prompt: "Turn 0 spawn prompt" },
+                metadata: { sessionID: "ses_child_multi" },
+              },
+            },
+          ],
+        },
+        { id: "msg_p1", session_id: "ses_parent", seq: 1 },
+      ),
+      row(
+        "assistant",
+        {
+          content: [
+            {
+              type: "tool",
+              id: "call_send_1",
+              name: "hivemind-delegate",
+              state: {
+                status: "completed",
+                input: { harness: "antigravity", sessionID: "ses_child_multi", prompt: "Turn 1 send follow-up" },
+                metadata: { sessionID: "ses_child_multi" },
+              },
+            },
+          ],
+        },
+        { id: "msg_p2", session_id: "ses_parent", seq: 2 },
+      ),
+    ]
+
+    const turns = normalizeDelegationTurns(
+      "ses_parent",
+      parentMessages,
+      [
+        {
+          id: "ses_child_multi",
+          project_id: "proj_1",
+          parent_id: "ses_parent",
+          directory: "/repo",
+          title: "Antigravity child",
+          agent: "implementer",
+          model: { id: "gemini-3.1-pro", providerID: "antigravity-native" },
+          idle_outcome: "succeeded",
+          time_created: 1000,
+          time_updated: 2000,
+        },
+      ],
+      new Map([["ses_child_multi", childMessages]]),
+      new Map(),
+      sink,
+    )
+    expect(turns).toHaveLength(2)
+    expect(turns[0]).toMatchObject({
+      parent_session_id: "ses_parent",
+      call_id: "call_spawn_0",
+      turn_index: 0,
+      child_session_id: "ses_child_multi",
+      mode: "spawn",
+      harness: "antigravity",
+      start_seq: 1,
+      end_seq: 3,
+      reported_outcome: "succeeded",
+    })
+    expect(turns[1]).toMatchObject({
+      parent_session_id: "ses_parent",
+      call_id: "call_send_1",
+      turn_index: 1,
+      child_session_id: "ses_child_multi",
+      mode: "send",
+      harness: "antigravity",
+      start_seq: 4,
+      end_seq: 6,
+      reported_outcome: "succeeded",
+    })
+  })
+
+  test("REQ-SUB-03: classifyMessagesOutcome flags 100% of false-positive succeeded turns (tool_error_inside & blocked_in_text)", async () => {
+    const normMod = (await import("../src/archive/normalize.ts")) as Record<string, unknown>
+    const classifyMessagesOutcome = normMod.classifyMessagesOutcome as (
+      messages: readonly MessageRow[],
+      fallbackReportedOutcome: string | null,
+    ) => {
+      reported_outcome: string | null
+      verified_outcome: string
+      blocker_summary: string | null
+      tool_error_count: number
+    }
+    expect(typeof classifyMessagesOutcome).toBe("function")
+
+    const toolErrorCase = classifyMessagesOutcome(
+      [
+        row("assistant", {
+          content: [
+            { type: "text", text: "Finished the task." },
+            {
+              type: "tool",
+              id: "call_err",
+              name: "read",
+              state: { status: "error", error: { message: "ENOENT: no such file" } },
+            },
+          ],
+        }),
+        row("idle", { outcome: "succeeded" }),
+      ],
+      "succeeded",
+    )
+    expect(toolErrorCase.reported_outcome).toBe("succeeded")
+    expect(toolErrorCase.verified_outcome).toBe("tool_error_inside")
+    expect(toolErrorCase.tool_error_count).toBe(1)
+    expect(toolErrorCase.blocker_summary).toContain("ENOENT")
+
+    const blockerCases: ReadonlyArray<readonly [string, string]> = [
+      ["The MCP server context7 timed out after 30000ms", "context7 timed out"],
+      ["The MCP server tavily failed to initialize", "failed to initialize"],
+      ["The tavily-search MCP tool failed with an error", "MCP tool failed"],
+      ["Error: read lease violation on /etc/hosts", "read lease violation"],
+      ["Access denied: /outside/path is outside allowed directories", "Access denied"],
+      ["**BLOCKED**: missing authorization for production deploy", "BLOCKED"],
+    ]
+
+    for (const [text, expectedSnippet] of blockerCases) {
+      const res = classifyMessagesOutcome(
+        [
+          row("assistant", { content: [{ type: "text", text }] }),
+          row("idle", { outcome: "succeeded" }),
+        ],
+        "succeeded",
+      )
+      expect(res.reported_outcome).toBe("succeeded")
+      expect(res.verified_outcome).toBe("blocked_in_text")
+      expect(res.blocker_summary).toContain(expectedSnippet)
+    }
+  })
+})
+
