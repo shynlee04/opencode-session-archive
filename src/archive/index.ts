@@ -174,7 +174,10 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
   }
 
   const nodes = flattenTree(root, source)
-  const archiveDir = path.join(input.projectRoot, input.dir ?? ".session-archive")
+  const archiveDir = path.isAbsolute(input.dir ?? "") ? path.resolve(input.dir!) : path.resolve(input.projectRoot, input.dir ?? ".session-archive")
+  if (archiveDir.split(path.sep).includes(".opencode")) {
+    throw new Error(`session-archive: archive directory must not reside inside .opencode/: ${archiveDir}`)
+  }
   const sqlitePath = path.join(archiveDir, "index.sqlite")
 
   const existing = input.forceColdFull ? null : readRootWatermarks(sqlitePath, root.id)

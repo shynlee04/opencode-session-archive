@@ -38,6 +38,7 @@ import {
   querySubstrateContinuity,
   queryVibeNavigation,
   reconcileProvenanceStaleness,
+  recordCompactionSummaryHash,
   renderIntentTimeline,
   renderProvenanceReport,
   resolveDefaultSessionId,
@@ -75,8 +76,16 @@ const defaultDbPath = (): string => {
 }
 
 const resolveArchiveDir = (projectRoot: string, dir?: string): string => {
-  if (!dir) return path.join(projectRoot, ".session-archive")
-  return path.isAbsolute(dir) ? dir : path.join(projectRoot, dir)
+  const resolved = !dir
+    ? path.join(projectRoot, ".session-archive")
+    : path.isAbsolute(dir)
+      ? path.resolve(dir)
+      : path.resolve(projectRoot, dir)
+  const segments = resolved.split(path.sep)
+  if (segments.includes(".opencode")) {
+    throw new Error(`session-archive: archive directory must not reside inside .opencode/: ${resolved}`)
+  }
+  return resolved
 }
 
 export default {
@@ -403,7 +412,14 @@ export default {
           event?.sessionID ??
           undefined
         const { db } = ensureSyncedDb(sessionID)
-        db.close()
+        try {
+          if (isCompacted && sessionID) {
+            const summaryText = String(event?.properties?.summary ?? event?.summary ?? "session.compacted")
+            recordCompactionSummaryHash(db, sessionID, summaryText)
+          }
+        } catch {} finally {
+          db.close()
+        }
       })
     }
 
