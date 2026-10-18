@@ -246,3 +246,56 @@ export interface NormalizedMessage {
   readonly record: MessageRecord
   readonly delegations: readonly DelegationFact[]
 }
+
+export interface KvBindingRow {
+  readonly child_session_id: string
+  readonly raw_key: string
+  readonly scope: string | null
+  readonly driver_kind: string | null
+  readonly harness: Harness | null
+  readonly foreign_session_id: string | null
+  readonly parent_session_id: string | null
+  readonly call_id: string | null
+  readonly title: string | null
+  readonly cwd: string | null
+  readonly agent: string | null
+  readonly model: string | null
+  readonly effort: string | null
+  readonly mode: "spawn" | "send" | "continue" | null
+  readonly background: boolean | null
+  readonly requested_model: string | null
+  readonly confirmed_model: string | null
+  readonly confirmed_effort: string | null
+  readonly turn: number | null
+  readonly phase: string | null
+  readonly foreign_ack_turn: number | null
+  readonly foreign_ack_stop_reason: string | null
+  readonly serving_witness_model: string | null
+  readonly serving_witness_at: string | null
+  readonly consumed_inputs_json: string | null
+  readonly created_at: number | null
+  readonly updated_at: number | null
+}
+
+export interface KvForeignIndexRow {
+  readonly harness: string
+  readonly foreign_session_id: string
+  readonly child_session_id: string
+  readonly raw_key: string
+}
+
+export interface KvContextPruneRow {
+  readonly session_id: string
+  readonly raw_key: string
+  readonly scope: string | null
+  readonly mode: string | null
+  readonly anchor_message_id: string | null
+  readonly recorded_at: string | null
+  readonly updated_at: number | null
+}
+
+export interface KvState {
+  readonly bindings: readonly KvBindingRow[]
+  readonly foreignIndex: readonly KvForeignIndexRow[]
+  readonly contextPrunes: readonly KvContextPruneRow[]
+}

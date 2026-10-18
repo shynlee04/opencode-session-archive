@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs"
 import { Database } from "bun:sqlite"
-import type { DelegationFact, Harness } from "./types.ts"
+import type { DelegationFact, Harness, KvBindingRow, KvContextPruneRow, KvForeignIndexRow } from "./types.ts"
 
 export interface IndexSessionRow {
   readonly id: string
@@ -100,6 +100,9 @@ export interface IndexInput {
   readonly toolCalls: readonly IndexToolCallRow[]
   readonly compactions: readonly IndexCompactionRow[]
   readonly instructions: readonly IndexInstructionRow[]
+  readonly kvBindings?: readonly KvBindingRow[]
+  readonly kvForeignIndex?: readonly KvForeignIndexRow[]
+  readonly kvContextPrunes?: readonly KvContextPruneRow[]
 }
 
 const DDL = `
@@ -190,6 +193,51 @@ CREATE TABLE IF NOT EXISTS instruction (
   seq INTEGER NOT NULL,
   path TEXT NOT NULL,
   blob_sha TEXT
+);
+CREATE TABLE IF NOT EXISTS kv_binding (
+  child_session_id TEXT PRIMARY KEY,
+  raw_key TEXT NOT NULL,
+  scope TEXT,
+  driver_kind TEXT,
+  harness TEXT,
+  foreign_session_id TEXT,
+  parent_session_id TEXT,
+  call_id TEXT,
+  title TEXT,
+  cwd TEXT,
+  agent TEXT,
+  model TEXT,
+  effort TEXT,
+  mode TEXT,
+  background INTEGER,
+  requested_model TEXT,
+  confirmed_model TEXT,
+  confirmed_effort TEXT,
+  turn INTEGER,
+  phase TEXT,
+  foreign_ack_turn INTEGER,
+  foreign_ack_stop_reason TEXT,
+  serving_witness_model TEXT,
+  serving_witness_at TEXT,
+  consumed_inputs_json TEXT,
+  created_at INTEGER,
+  updated_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS kv_foreign_index (
+  harness TEXT NOT NULL,
+  foreign_session_id TEXT NOT NULL,
+  child_session_id TEXT NOT NULL,
+  raw_key TEXT NOT NULL,
+  PRIMARY KEY (harness, foreign_session_id)
+);
+CREATE TABLE IF NOT EXISTS kv_context_prune (
+  session_id TEXT PRIMARY KEY,
+  raw_key TEXT NOT NULL,
+  scope TEXT,
+  mode TEXT,
+  anchor_message_id TEXT,
+  recorded_at TEXT,
+  updated_at INTEGER
 );
 `
 
@@ -386,6 +434,41 @@ export function writeIndex(targetPath: string, input: IndexInput): "written" | "
       insertSql("instruction", ["session_id", "seq", "path", "blob_sha"]),
     )
     for (const row of instructionValues) insertInstruction.run(...row)
+    if (input.kvBindings && input.kvBindings.length > 0) {
+      const upsertKvBinding = db.query(`INSERT OR REPLACE INTO kv_binding (
+        child_session_id, raw_key, scope, driver_kind, harness, foreign_session_id,
+        parent_session_id, call_id, title, cwd, agent, model, effort, mode, background,
+        requested_model, confirmed_model, confirmed_effort, turn, phase,
+        foreign_ack_turn, foreign_ack_stop_reason, serving_witness_model, serving_witness_at,
+        consumed_inputs_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      for (const b of input.kvBindings) {
+        upsertKvBinding.run(
+          b.child_session_id, b.raw_key, b.scope, b.driver_kind, b.harness, b.foreign_session_id,
+          b.parent_session_id, b.call_id, b.title, b.cwd, b.agent, b.model, b.effort, b.mode,
+          bool(b.background), b.requested_model, b.confirmed_model, b.confirmed_effort,
+          b.turn, b.phase, b.foreign_ack_turn, b.foreign_ack_stop_reason,
+          b.serving_witness_model, b.serving_witness_at, b.consumed_inputs_json,
+          b.created_at, b.updated_at,
+        )
+      }
+    }
+    if (input.kvForeignIndex && input.kvForeignIndex.length > 0) {
+      const upsertForeign = db.query(`INSERT OR REPLACE INTO kv_foreign_index (
+        harness, foreign_session_id, child_session_id, raw_key
+      ) VALUES (?, ?, ?, ?)`)
+      for (const f of input.kvForeignIndex) {
+        upsertForeign.run(f.harness, f.foreign_session_id, f.child_session_id, f.raw_key)
+      }
+    }
+    if (input.kvContextPrunes && input.kvContextPrunes.length > 0) {
+      const upsertPrune = db.query(`INSERT OR REPLACE INTO kv_context_prune (
+        session_id, raw_key, scope, mode, anchor_message_id, recorded_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      for (const p of input.kvContextPrunes) {
+        upsertPrune.run(p.session_id, p.raw_key, p.scope, p.mode, p.anchor_message_id, p.recorded_at, p.updated_at)
+      }
+    }
   })
   rebuild()
   db.exec("PRAGMA wal_checkpoint(TRUNCATE)")
