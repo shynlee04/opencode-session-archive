@@ -9,6 +9,8 @@
   "types": "src/plugin.ts",
   "exports": {
     ".": "./src/plugin.ts",
+    "./tui": "./tui.tsx",
+    "./rpc": "./src/rpc.ts",
     "./dist/session-archive.ts": "./dist/session-archive.ts",
     "./package.json": "./package.json"
   },
@@ -18,6 +20,7 @@
   },
   "files": [
     "src",
+    "tui.tsx",
     "dist",
     "bin",
     "README.md",
@@ -29,6 +32,7 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "build": "bun scripts/build.ts",
+    "substrate": "bun src/cli.ts",
     "prepublishOnly": "bun test && bun run typecheck && bun run build"
   },
   "publishConfig": {
@@ -47,8 +51,12 @@
     "jsonc-parser": "^3.3.1"
   },
   "devDependencies": {
-    "@opencode/plugin": "2.0.31",
+    "@opencode/plugin": "2.0.32",
+    "@opencode/theme": "2.0.32",
+    "@opentui/core": "0.5.17",
+    "@opentui/solid": "0.5.17",
     "@types/bun": "latest",
+    "solid-js": "1.9.15",
     "typescript": "latest"
   }
 }
