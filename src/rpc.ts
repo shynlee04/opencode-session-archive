@@ -26,6 +26,7 @@ export type SubstrateActionKind =
   | "timeline"
   | "search"
   | "brief"
+  | "compaction"
   | "prune"
   | "sync"
 
@@ -72,10 +73,41 @@ export type SubstrateStaleAlertSummary = {
   readonly status: string
 }
 
+export type SubstrateSymbolOutlineItem = {
+  readonly name: string
+  readonly kind: string
+  readonly startLine: number
+  readonly endLine: number
+  readonly lineSpan: number
+  readonly signature: string
+}
+
 export type SubstrateCentralFileSummary = {
   readonly path: string
   readonly pagerank: number
   readonly loc: number
+  readonly inDegree?: number
+  readonly outDegree?: number
+  readonly rawTokens?: number
+  readonly skeletonTokens?: number
+  readonly symbolsCount?: number
+  readonly exportedSymbols?: readonly SubstrateSymbolOutlineItem[]
+}
+
+export type SubstrateMudballHotspotSummary = {
+  readonly kind: "god_file" | "god_symbol" | "high_coupling_hub" | "hidden_coupling"
+  readonly severity: "warn" | "high"
+  readonly target: string
+  readonly detail: string
+  readonly metric: string
+}
+
+export type SubstrateTokenEconomicsSummary = {
+  readonly rawTokensTotal: number
+  readonly skeletonTokensTotal: number
+  readonly skeletonTokensSaved: number
+  readonly compressionPct: number
+  readonly valveSavedTokens: number
 }
 
 export type SubstrateSnapshotOutput = {
@@ -85,11 +117,15 @@ export type SubstrateSnapshotOutput = {
   readonly resolvedSessionID: string
   readonly sessionTitle: string
   readonly verificationState: string
+  readonly gateLabel?: string
   readonly counts: SubstrateSnapshotCounts
   readonly latestValuation: SubstrateValuationSummary | null
   readonly recentPivots: readonly SubstratePivotSummary[]
   readonly staleAlerts: readonly SubstrateStaleAlertSummary[]
   readonly topCentralFiles: readonly SubstrateCentralFileSummary[]
+  readonly mudballHotspots?: readonly SubstrateMudballHotspotSummary[]
+  readonly tokenEconomics?: SubstrateTokenEconomicsSummary
+  readonly compactionPreview?: string
   readonly updatedAt: string
 }
 
@@ -104,6 +140,9 @@ export type SubstrateActionInput = {
   readonly maxTokens?: number
   readonly mode?: "manual" | "auto" | "off"
   readonly keepRecentSteps?: number
+  readonly scope?: "session" | "project" | "all-projects"
+  readonly full?: boolean
+  readonly includePrivate?: boolean
 }
 
 export type SubstrateActionOutput = {

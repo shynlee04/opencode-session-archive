@@ -6,13 +6,15 @@
 // here stay type-only.
 
 import { Database } from "bun:sqlite"
-import { existsSync, mkdirSync } from "node:fs"
+import { existsSync, mkdirSync, statSync } from "node:fs"
 import path from "node:path"
 import type { Plugin } from "@opencode/plugin"
 
 type ToolExecute = Parameters<Parameters<Plugin.Context["tool"]["transform"]>[0]>[0]["add"] extends (tool: infer T) => void ? (T extends { execute: infer E } ? E : never) : never
+import * as archiveMod from "./archive/index.ts"
 import { persist, sqliteSource, type PersistReport } from "./archive/index.ts"
 import { initSyncDatabase } from "./archive/index-db.ts"
+import * as primitivesMod from "./archive/primitives.ts"
 import { JIT_SKELETON_MARKER, estimateTokens } from "./archive/primitives.ts"
 import {
   WorkingSetValve,
@@ -27,6 +29,7 @@ import {
   ensureCochangeSchema,
   ensureCodeGraphSchema,
   indexCodebase,
+  indexSingleFileSkeleton,
   mineGitCochange,
   queryCochangeCouplings,
   readAstSkeleton,
@@ -41,6 +44,10 @@ import {
   type SubstrateActionInput,
   type SubstrateSnapshotInput,
 } from "./rpc.ts"
+import {
+  formatVerificationGateLabel,
+  renderProvenanceViewport,
+} from "./viewports/continuity.ts"
 import {
   buildCompactionContinuationPacket,
   buildImplementorViewportBrief,
@@ -68,6 +75,7 @@ export {
   computeCodebasePageRank,
   computeStepWatermark,
   executeSubstrateAction,
+  formatVerificationGateLabel,
   indexCodebase,
   materializeSemanticDigests,
   mineGitCochange,
@@ -81,6 +89,7 @@ export {
   renderCochangeWarnings,
   renderIntentTimeline,
   renderProvenanceReport,
+  renderProvenanceViewport,
   renderRepoMap,
   resolveDefaultSessionId,
   resolvePromptBlob,
@@ -108,6 +117,116 @@ const resolveArchiveDir = (projectRoot: string, dir?: string): string => {
   return resolved
 }
 
+function normalizeCanonicalAction(rawAction: string): string {
+  const a = rawAction.trim().toLowerCase()
+  if (a === "find") return "search"
+  if (a === "persist") return "sync"
+  if (a === "valve" || a === "valve.prune" || a === "prune") return "prune"
+  if (a === "valve.status") return "status"
+  if (a === "valve.reset") return "reset"
+  if (a === "intents") return "timeline"
+  return a
+}
+
+function resolveTargetWorkspaceForCall(
+  rawPath: string | undefined,
+  activeWorktreeRoot: string,
+): {
+  readonly targetRoot: string
+  readonly archiveDir: string
+  readonly indexDbPath: string
+  readonly relPath: string
+  readonly isCrossProject: boolean
+} {
+  const helper = (primitivesMod as Record<string, unknown>).resolveTargetWorkspace
+  if (typeof helper === "function" && rawPath && rawPath.trim().length > 0) {
+    try {
+      const resolved = helper(rawPath, activeWorktreeRoot) as {
+        targetRoot?: string
+        archiveDir?: string
+        indexDbPath?: string
+        relPath?: string
+        isCrossProject?: boolean
+      }
+      if (resolved && typeof resolved.targetRoot === "string") {
+        const tRoot = resolved.targetRoot
+        const aDir = resolved.archiveDir ?? path.join(tRoot, ".session-archive")
+        return {
+          targetRoot: tRoot,
+          archiveDir: aDir,
+          indexDbPath: resolved.indexDbPath ?? path.join(aDir, "index.sqlite"),
+          relPath: resolved.relPath ?? rawPath,
+          isCrossProject: Boolean(resolved.isCrossProject ?? path.resolve(tRoot) !== path.resolve(activeWorktreeRoot)),
+        }
+      }
+    } catch {
+      // Fall through to local implementation
+    }
+  }
+
+  const trimmed = (rawPath ?? "").trim()
+  if (!trimmed || !path.isAbsolute(trimmed)) {
+    const aDir = path.join(activeWorktreeRoot, ".session-archive")
+    return {
+      targetRoot: activeWorktreeRoot,
+      archiveDir: aDir,
+      indexDbPath: path.join(aDir, "index.sqlite"),
+      relPath: trimmed.replace(/^\.\//, ""),
+      isCrossProject: false,
+    }
+  }
+
+  const absTarget = path.resolve(trimmed)
+  const absActive = path.resolve(activeWorktreeRoot)
+  if (absTarget === absActive || absTarget.startsWith(`${absActive}${path.sep}`)) {
+    const rel = path.relative(absActive, absTarget).split(path.sep).join("/")
+    const aDir = path.join(absActive, ".session-archive")
+    return {
+      targetRoot: absActive,
+      archiveDir: aDir,
+      indexDbPath: path.join(aDir, "index.sqlite"),
+      relPath: rel,
+      isCrossProject: false,
+    }
+  }
+
+  let startDir = absTarget
+  try {
+    if (existsSync(absTarget) && !statSync(absTarget).isDirectory()) {
+      startDir = path.dirname(absTarget)
+    }
+  } catch {
+    startDir = path.dirname(absTarget)
+  }
+
+  let cur = startDir
+  let detectedRoot: string | null = null
+  while (true) {
+    if (
+      existsSync(path.join(cur, ".git")) ||
+      existsSync(path.join(cur, "package.json")) ||
+      existsSync(path.join(cur, "tsconfig.json"))
+    ) {
+      detectedRoot = cur
+      break
+    }
+    const parent = path.dirname(cur)
+    if (parent === cur) break
+    cur = parent
+  }
+
+  const targetRoot = detectedRoot ?? startDir
+  const relPath = path.relative(targetRoot, absTarget).split(path.sep).join("/")
+  const archiveDir = path.join(targetRoot, ".session-archive")
+  return {
+    targetRoot,
+    archiveDir,
+    indexDbPath: path.join(archiveDir, "index.sqlite"),
+    relPath,
+    isCrossProject: true,
+  }
+}
+
 function formatToolOutput(params: {
   readonly action: string
   readonly markdown: string
@@ -115,20 +234,62 @@ function formatToolOutput(params: {
   readonly format?: unknown
   readonly elapsedMs?: number
   readonly skipFooter?: boolean
+  readonly sessionID?: string | null
+  readonly budgetTokens?: number | null
 }): { readonly content: string; readonly metadata: Record<string, unknown> } {
   const fmt: OutputFormat =
     params.format === "json" || params.format === "both" ? params.format : "markdown"
+  const canonicalAction = normalizeCanonicalAction(params.action)
   const tokens = estimateTokens(params.markdown)
+  const rawMeta = params.metadata ?? {}
+  const baseData: Record<string, unknown> =
+    typeof (rawMeta as { toJSON?: unknown }).toJSON === "function"
+      ? { ...((rawMeta as { toJSON: () => Record<string, unknown> }).toJSON()) }
+      : { ...rawMeta }
+
+  delete baseData.content
+  delete baseData.markdown
+  delete baseData.tokenEstimate
+  delete baseData.estimatedTokens
+  delete baseData.maxTokens
+
+  const resolvedSessionID =
+    (params.sessionID ??
+      (typeof rawMeta.sessionID === "string" ? rawMeta.sessionID : undefined) ??
+      (typeof rawMeta.resolvedSessionID === "string" ? rawMeta.resolvedSessionID : undefined) ??
+      null) as string | null
+  const resolvedBudgetTokens =
+    (params.budgetTokens ??
+      (typeof rawMeta.budgetTokens === "number" ? rawMeta.budgetTokens : undefined) ??
+      (typeof rawMeta.maxTokens === "number" ? rawMeta.maxTokens : undefined) ??
+      null) as number | null
+
   const enrichedMeta: Record<string, unknown> = {
-    action: params.action,
+    ok: true,
+    action: canonicalAction,
+    sessionID: resolvedSessionID,
+    tokenCount: tokens,
     tokens,
+    budgetTokens: resolvedBudgetTokens,
     ...(params.elapsedMs !== undefined ? { latencyMs: Number(params.elapsedMs.toFixed(2)) } : {}),
-    ...params.metadata,
+    ...rawMeta,
+  }
+
+  const jsonEnvelope: Record<string, unknown> = {
+    ok: true,
+    action: canonicalAction,
+    sessionID: resolvedSessionID,
+    tokenCount: tokens,
+    tokens,
+    budgetTokens: resolvedBudgetTokens,
+    ...(params.elapsedMs !== undefined ? { latencyMs: Number(params.elapsedMs.toFixed(2)) } : {}),
+    content: params.markdown,
+    data: baseData,
   }
 
   if (fmt === "json") {
     return {
-      content: JSON.stringify(enrichedMeta, null, 2),
+      content: JSON.stringify(jsonEnvelope, null, 2),
       metadata: enrichedMeta,
     }
   }
@@ -136,14 +297,14 @@ function formatToolOutput(params: {
   const footer =
     params.skipFooter || params.markdown.includes("[substrate.telemetry")
       ? ""
-      : `\n\n---\n[substrate.telemetry action=${params.action} tokens=${tokens}${
+      : `\n\n---\n[substrate.telemetry action=${canonicalAction} tokens=${tokens}${
           params.elapsedMs !== undefined ? ` latencyMs=${params.elapsedMs.toFixed(2)}` : ""
         }]`
   const markdownWithFooter = `${params.markdown}${footer}`
 
   if (fmt === "both") {
     return {
-      content: `${markdownWithFooter}\n\n\`\`\`json\n${JSON.stringify(enrichedMeta, null, 2)}\n\`\`\``,
+      content: `${markdownWithFooter}\n\n\`\`\`json\n${JSON.stringify(jsonEnvelope, null, 2)}\n\`\`\``,
       metadata: enrichedMeta,
     }
   }
@@ -189,14 +350,28 @@ function appendTextToToolResultContent(content: unknown, suffix: string): unknow
 }
 
 export default {
-  id: "session-archive",
+  id: "hivemind-substrate",
   async setup(ctx: Plugin.Context) {
     const dir = typeof ctx.options?.dir === "string" ? ctx.options.dir : undefined
     const dbPath = typeof ctx.options?.dbPath === "string" ? ctx.options.dbPath : defaultDbPath()
     const codemode = ctx.options?.direct === true ? false : true
-    const projectRoot = ctx.location.project.canonical
-    const projectID = ctx.location.project.id
-    const archiveDir = resolveArchiveDir(projectRoot, dir)
+    const locationAny = (ctx.location ?? {}) as unknown as {
+      project?: { id?: string; canonical?: string }
+      worktree?: string
+      directory?: string
+    }
+    const canonicalRoot =
+      locationAny.project?.canonical ||
+      locationAny.worktree ||
+      locationAny.directory ||
+      process.cwd()
+    const activeWorktreeRoot =
+      locationAny.worktree ||
+      locationAny.directory ||
+      canonicalRoot
+    const projectRoot = activeWorktreeRoot
+    const projectID = locationAny.project?.id ?? "default"
+    const archiveDir = resolveArchiveDir(canonicalRoot, dir)
     const blobDir = path.join(archiveDir, "blobs")
     const indexDbPath = path.join(archiveDir, "index.sqlite")
 
@@ -204,12 +379,13 @@ export default {
       blobDir,
       readOnlyArchiveDir: archiveDir,
       persistBlobsToDisk: true,
-      canonicalRoot: projectRoot,
+      canonicalRoot: activeWorktreeRoot,
     })
 
     const ensureSyncedDb = (targetSessionID?: string): { db: Database; report?: PersistReport } => {
       mkdirSync(archiveDir, { recursive: true })
       let report: PersistReport | undefined
+      let syncedSessionID: string | undefined = targetSessionID
       if (existsSync(dbPath)) {
         try {
           const source = sqliteSource(dbPath)
@@ -227,11 +403,12 @@ export default {
                   })()
                 : "")
             if (candidateSession && candidateSession !== "unknown") {
+              syncedSessionID = candidateSession
               report = persist(
                 {
                   sessionID: candidateSession,
                   projectID,
-                  projectRoot,
+                  projectRoot: canonicalRoot,
                   dir,
                 },
                 source,
@@ -250,9 +427,14 @@ export default {
       ensureCodeGraphSchema(db)
       ensureCochangeSchema(db)
       try {
-        materializeSemanticDigests(db, { archiveDir })
+        materializeSemanticDigests(db, { archiveDir, canonicalRoot: activeWorktreeRoot })
       } catch {
         // Best-effort digest materialization
+      }
+      try {
+        reconcileProvenanceStaleness(db, activeWorktreeRoot, syncedSessionID || undefined)
+      } catch {
+        // Best-effort provenance staleness reconciliation
       }
       return { db, report }
     }
@@ -337,20 +519,103 @@ export default {
     const executePersist = async (input: Record<string, unknown> | undefined, context: { sessionID?: string; progress?: (p: { status: string }) => Promise<void> } | undefined) => {
       const t0 = performance.now()
       const requestedSessionID = resolveSessionIdForCall(input?.sessionID, context?.sessionID)
+      const scopeRaw = String(input?.scope ?? "session").toLowerCase()
+      const scope = scopeRaw === "project" || scopeRaw === "all-projects" ? scopeRaw : "session"
       if (typeof context?.progress === "function") {
-        await context.progress({ status: `persisting session tree for ${requestedSessionID}` })
+        await context.progress({ status: `persisting session tree (${scope}) for ${requestedSessionID}` })
       }
       const source = sqliteSource(dbPath)
       try {
+        const persistProjectFn = (archiveMod as Record<string, unknown>).persistProject
+        if ((scope === "project" || scope === "all-projects") && typeof persistProjectFn === "function") {
+          const projReport = (await persistProjectFn(
+            {
+              sessionID: requestedSessionID,
+              projectID,
+              projectRoot: canonicalRoot,
+              dir,
+              scope,
+            },
+            source,
+          )) as {
+            readonly scope?: string
+            readonly rootSessionsSynced?: number
+            readonly totalSessionsSynced?: number
+            readonly skippedWarmTrees?: number
+            readonly rootID?: string
+            readonly archiveDir?: string
+            readonly sessions?: number
+            readonly messages?: number
+            readonly delegations?: number
+            readonly written?: readonly string[]
+            readonly unchanged?: number
+          }
+          const { db } = ensureSyncedDb(requestedSessionID)
+          db.close()
+          const summary = [
+            `Persisted ${scope} session trees (${projReport.rootSessionsSynced ?? 1} root trees, ${projReport.totalSessionsSynced ?? projReport.sessions ?? 1} total sessions, ${projReport.skippedWarmTrees ?? 0} warm skips) into ${projReport.archiveDir ?? archiveDir}.`,
+          ].join(" ")
+          return formatToolOutput({
+            action: "sync",
+            sessionID: projReport.rootID ?? requestedSessionID,
+            markdown: summary,
+            metadata: projReport as unknown as Record<string, unknown>,
+            format: input?.format,
+            elapsedMs: performance.now() - t0,
+          })
+        }
+
         const report = persist(
           {
             sessionID: requestedSessionID,
             projectID,
-            projectRoot,
+            projectRoot: canonicalRoot,
             dir,
           },
           source,
         )
+
+        if (scope === "project" || scope === "all-projects") {
+          try {
+            const hostDb = new Database(dbPath, { readonly: true })
+            try {
+              const rootRows =
+                scope === "all-projects"
+                  ? (hostDb
+                      .query(`SELECT id FROM session_v2 WHERE parent_id IS NULL ORDER BY time_updated DESC LIMIT 200`)
+                      .all() as Array<{ id: string }>)
+                  : (hostDb
+                      .query(
+                        `SELECT id FROM session_v2 WHERE parent_id IS NULL AND (project_id = ? OR directory = ?) ORDER BY time_updated DESC LIMIT 200`,
+                      )
+                      .all(projectID, canonicalRoot) as Array<{ id: string }>)
+              for (const r of rootRows) {
+                if (!r.id || r.id === report.rootID) continue
+                try {
+                  persist(
+                    {
+                      sessionID: r.id,
+                      projectID,
+                      projectRoot: canonicalRoot,
+                      dir,
+                    },
+                    source,
+                  )
+                } catch {
+                  // Ignore individual root session sync error during batch scope sync
+                }
+              }
+            } finally {
+              hostDb.close()
+            }
+          } catch {
+            // Best-effort project-wide root enumeration
+          }
+        }
+
+        const { db } = ensureSyncedDb(report.rootID)
+        db.close()
+
         const summary = [
           `Persisted session tree rooted at ${report.rootID} into ${report.archiveDir}.`,
           `${report.sessions} sessions, ${report.messages} messages, ${report.delegations} delegations.`,
@@ -359,6 +624,7 @@ export default {
         ].join(" ")
         return formatToolOutput({
           action: "sync",
+          sessionID: report.rootID,
           markdown: summary,
           metadata: report as unknown as Record<string, unknown>,
           format: input?.format,
@@ -369,28 +635,89 @@ export default {
       }
     }
 
+    const buildCompactValveManifest = (
+      sessionID: string,
+      valveEntries: ReadonlyArray<{
+        readonly path: string
+        readonly normalizedPath?: string
+        readonly lineRange: string
+        readonly status: string
+      }>,
+      sqlReads: ReadonlyArray<{
+        readonly path: string
+        readonly normalized_path?: string
+        readonly line_range: string
+        readonly staleness_status: string
+      }>,
+    ): string => {
+      const merged = new Map<string, { path: string; lineRange: string; status: string }>()
+      for (const f of valveEntries) {
+        const p = f.normalizedPath || f.path
+        if (!p) continue
+        merged.set(p, {
+          path: p,
+          lineRange: f.lineRange || "L1-L1",
+          status: f.status,
+        })
+      }
+      for (const r of sqlReads) {
+        const p = r.normalized_path || r.path
+        if (!p || merged.has(p)) continue
+        merged.set(p, {
+          path: p,
+          lineRange: r.line_range || "L1-L1",
+          status: r.staleness_status || "FRESH — DO NOT REREAD",
+        })
+      }
+
+      const all = [...merged.values()]
+      if (all.length === 0) {
+        return `## WorkingMemoryManifest · \`${sessionID}\`\nNo files recorded in working-memory ledger.`
+      }
+
+      let freshCount = 0
+      let sliceCount = 0
+      let staleCount = 0
+      for (const item of all) {
+        if (item.status.startsWith("STALE")) staleCount++
+        else if (item.status.startsWith("SLICE")) sliceCount++
+        else freshCount++
+      }
+
+      const preview = all.slice(0, 6).map((item) => {
+        const badge = item.status.startsWith("SLICE")
+          ? item.status.split(" — ")[0]
+          : item.status.startsWith("STALE")
+            ? "STALE"
+            : "FRESH"
+        return `- \`${item.path}#${item.lineRange}\` (**${badge}**)`
+      })
+      if (all.length > 6) {
+        preview.push(`- _(+${all.length - 6} more files in ledger; pass \`full: true\` for full manifest)_`)
+      }
+
+      const ledgerCounts = valve.status(sessionID).ledger?.manifest
+      const modCount = ledgerCounts?.filesModified.length ?? 0
+      const skillCount = ledgerCounts?.activeSkills.length ?? 0
+      const delCount = ledgerCounts?.delegationOutcomes.length ?? 0
+
+      return [
+        `## WorkingMemoryManifest · \`${sessionID}\` (FRESH=${freshCount} SLICE=${sliceCount} STALE=${staleCount} | Modified=${modCount} | Skills=${skillCount} | Delegations=${delCount})`,
+        ...preview,
+      ].join("\n")
+    }
+
     const executeValve = async (input: Record<string, unknown> | undefined, context: { sessionID?: string } | undefined) => {
       const t0 = performance.now()
       const action = String(input?.action ?? "prune").toLowerCase()
       const sessionID = resolveSessionIdForCall(input?.sessionID, context?.sessionID)
+      const fullOutput = input?.full === true
 
-      if (action === "status") {
-        const res = valve.status(sessionID)
-        const md = res.armed || res.manifestMarkdown.includes("SLICE") || res.manifestMarkdown.includes("FRESH")
-          ? `${res.summaryMarkdown}\n\n${res.manifestMarkdown}`
-          : res.summaryMarkdown
-        return formatToolOutput({
-          action: "valve.status",
-          markdown: md,
-          metadata: res as unknown as Record<string, unknown>,
-          format: input?.format,
-          elapsedMs: performance.now() - t0,
-        })
-      }
       if (action === "reset") {
         const res = valve.reset(sessionID)
         return formatToolOutput({
-          action: "valve.reset",
+          action: "reset",
+          sessionID,
           markdown: res.summaryMarkdown,
           metadata: res as unknown as Record<string, unknown>,
           format: input?.format,
@@ -398,36 +725,160 @@ export default {
         })
       }
 
-      const mode: PruningMode =
-        input?.mode === "recent" || input?.mode === "initial" || input?.mode === "all"
-          ? input.mode
-          : "step-window"
-      const keepRecentSteps =
-        typeof input?.keepRecentSteps === "number" && Number.isFinite(input.keepRecentSteps)
-          ? input.keepRecentSteps
-          : undefined
+      const { db } = ensureSyncedDb(sessionID)
+      try {
+        try {
+          reconcileProvenanceStaleness(db, activeWorktreeRoot, sessionID)
+        } catch {
+          // Best-effort provenance sync
+        }
+        try {
+          const syncFn = (valve as unknown as { syncFromSqlite?: (sid: string, d: Database) => void }).syncFromSqlite
+          if (typeof syncFn === "function") {
+            syncFn.call(valve, sessionID, db)
+          }
+        } catch {
+          // Ignore optional syncFromSqlite error
+        }
 
-      const messages = await loadSessionMessagesForValve(sessionID)
-      const res = valve.prune({
-        sessionID,
-        mode,
-        keepRecentSteps,
-        messages,
-      })
-      const markdown =
-        res.ledger.manifest.filesRead.length > 0 ||
-        res.ledger.manifest.filesModified.length > 0 ||
-        res.ledger.manifest.activeSkills.length > 0
+        const querySqlReads = () => {
+          try {
+            return db
+              .query(
+                `SELECT path, normalized_path, line_range, staleness_status, total_lines, read_seq
+                 FROM file_read_ledger
+                 WHERE session_id = ?
+                 ORDER BY read_seq ASC`,
+              )
+              .all(sessionID) as Array<{
+              path: string
+              normalized_path: string
+              line_range: string
+              staleness_status: string
+              total_lines: number | null
+              read_seq: number
+            }>
+          } catch {
+            return []
+          }
+        }
+
+        if (action === "status") {
+          const res = valve.status(sessionID)
+          const sqlReads = querySqlReads()
+          const hookReadsMap = (valve as unknown as { hookReads?: Map<string, Map<string, { path: string; normalizedPath?: string; lineRange: string; status: string }>> }).hookReads?.get(sessionID)
+          const valveEntries = res.ledger?.manifest.filesRead ?? (hookReadsMap ? [...hookReadsMap.values()] : [])
+          const compactManifest = buildCompactValveManifest(sessionID, valveEntries, sqlReads)
+          const md = fullOutput
+            ? `${res.summaryMarkdown}\n\n${res.manifestMarkdown}`
+            : `${res.summaryMarkdown}\n\n${compactManifest}`
+          return formatToolOutput({
+            action: "status",
+            sessionID,
+            markdown: md,
+            metadata: res as unknown as Record<string, unknown>,
+            format: input?.format,
+            elapsedMs: performance.now() - t0,
+          })
+        }
+
+        const mode: PruningMode =
+          input?.mode === "recent" || input?.mode === "initial" || input?.mode === "all"
+            ? input.mode
+            : "step-window"
+        const keepRecentSteps =
+          typeof input?.keepRecentSteps === "number" && Number.isFinite(input.keepRecentSteps)
+            ? input.keepRecentSteps
+            : undefined
+
+        const messages = await loadSessionMessagesForValve(sessionID)
+        const res = valve.prune({
+          sessionID,
+          mode,
+          keepRecentSteps,
+          messages,
+        })
+
+        // Sync in-memory valve file reads into file_read_ledger so valve and provenance share one source of truth (S3-1)
+        try {
+          const upsertRead = db.prepare(
+            `INSERT INTO file_read_ledger
+               (session_id, path, normalized_path, start_line, end_line, total_lines, is_truncated, line_range, slice_sha, read_blob_sha, disk_blob_sha, staleness_status, read_seq, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(session_id, path) DO UPDATE SET
+               normalized_path = excluded.normalized_path,
+               start_line = excluded.start_line,
+               end_line = excluded.end_line,
+               total_lines = COALESCE(excluded.total_lines, file_read_ledger.total_lines),
+               is_truncated = excluded.is_truncated,
+               line_range = excluded.line_range,
+               slice_sha = excluded.slice_sha,
+               read_blob_sha = excluded.read_blob_sha,
+               staleness_status = excluded.staleness_status,
+               updated_at = excluded.updated_at`,
+          )
+          const nowIso = new Date().toISOString()
+          let seqCounter = 1
+          for (const f of res.ledger.manifest.filesRead) {
+            const normPath = f.normalizedPath || f.path
+            if (!normPath) continue
+            const isSlice = f.status.startsWith("SLICE")
+            const sha = f.sliceSha256 ?? f.blobSha256
+            upsertRead.run(
+              sessionID,
+              normPath,
+              normPath,
+              f.startLine ?? 1,
+              f.endLine ?? 1,
+              f.totalLines ?? null,
+              isSlice ? 1 : 0,
+              f.lineRange || "L1-L1",
+              sha,
+              sha,
+              sha,
+              f.status,
+              seqCounter++,
+              nowIso,
+            )
+          }
+          reconcileProvenanceStaleness(db, activeWorktreeRoot, sessionID)
+        } catch {
+          // Best-effort ledger sync back to SQLite
+        }
+
+        const sqlReads = querySqlReads()
+        const compactManifest = buildCompactValveManifest(sessionID, res.ledger.manifest.filesRead, sqlReads)
+        const markdown = fullOutput
           ? `${res.summaryMarkdown}\n\n${res.ledger.manifest.renderedMarkdown}`
-          : res.summaryMarkdown
+          : `${res.summaryMarkdown}\n\n${compactManifest}`
 
-      return formatToolOutput({
-        action: "valve.prune",
-        markdown,
-        metadata: res as unknown as Record<string, unknown>,
-        format: input?.format,
-        elapsedMs: performance.now() - t0,
-      })
+        return formatToolOutput({
+          action: "prune",
+          sessionID,
+          markdown,
+          metadata: res as unknown as Record<string, unknown>,
+          format: input?.format,
+          elapsedMs: performance.now() - t0,
+        })
+      } finally {
+        db.close()
+      }
+    }
+
+    const openTargetWorkspaceDb = (targetWs: {
+      readonly targetRoot: string
+      readonly archiveDir: string
+      readonly indexDbPath: string
+      readonly isCrossProject: boolean
+    }): Database | null => {
+      if (!targetWs.isCrossProject) return null
+      mkdirSync(targetWs.archiveDir, { recursive: true })
+      const targetDb = initSyncDatabase(targetWs.indexDbPath)
+      ensureSemanticDigestSchema(targetDb)
+      ensureContinuitySchema(targetDb)
+      ensureCodeGraphSchema(targetDb)
+      ensureCochangeSchema(targetDb)
+      return targetDb
     }
 
     const executeViewport = async (
@@ -435,7 +886,8 @@ export default {
       context: { sessionID?: string; progress?: (p: { status: string }) => Promise<void> } | undefined,
     ): Promise<{ content: string; metadata: Record<string, unknown> }> => {
       const t0 = performance.now()
-      const action = String(input?.action ?? "status").toLowerCase()
+      const rawAction = String(input?.action ?? "status").toLowerCase()
+      const action = rawAction === "find" ? "search" : rawAction
 
       if (action === "sync" || action === "persist") {
         return executePersist(input, context)
@@ -485,124 +937,212 @@ export default {
         const resolvedSession = resolveDefaultSessionId(db, explicitSession, { sessionID: hookSession })
         const sessionID = resolvedSession.sessionId
 
-        if (action === "repomap") {
-          indexCodebase(db, projectRoot)
-          computeCodebasePageRank(db)
-          const budgetTokens = typeof input?.maxTokens === "number" ? input.maxTokens : 1000
-          const focusPaths = Array.isArray(input?.focusPaths) ? input.focusPaths.map(String) : undefined
-          const rendered = renderRepoMap(db, { budgetTokens, focusPaths })
+        if (action === "compaction") {
+          reconcileProvenanceStaleness(db, activeWorktreeRoot, sessionID)
+          const maxTokens = typeof input?.maxTokens === "number" ? input.maxTokens : 1200
+          const packet = buildCompactionContinuationPacket(db, {
+            sessionID,
+            hookContext: { sessionID: hookSession },
+            canonicalRoot: activeWorktreeRoot,
+            maxTokens,
+          })
           return formatToolOutput({
-            action: "repomap",
-            markdown: rendered.markdown,
-            metadata: rendered as unknown as Record<string, unknown>,
+            action: "compaction",
+            sessionID,
+            budgetTokens: maxTokens,
+            markdown: packet.markdown,
+            metadata: packet as unknown as Record<string, unknown>,
             format: input?.format,
             elapsedMs: performance.now() - t0,
           })
+        }
+
+        if (action === "repomap") {
+          const rawTargetPath = typeof input?.path === "string" ? input.path : typeof input?.filePath === "string" ? input.filePath : undefined
+          const targetWs = resolveTargetWorkspaceForCall(rawTargetPath, activeWorktreeRoot)
+          const crossDb = openTargetWorkspaceDb(targetWs)
+          const activeDb = crossDb ?? db
+          try {
+            indexCodebase(activeDb, targetWs.targetRoot)
+            computeCodebasePageRank(activeDb)
+            const budgetTokens = typeof input?.maxTokens === "number" ? input.maxTokens : 1000
+            const focusPaths = Array.isArray(input?.focusPaths) ? input.focusPaths.map(String) : undefined
+            const rendered = renderRepoMap(activeDb, { budgetTokens, focusPaths })
+            return formatToolOutput({
+              action: "repomap",
+              sessionID,
+              budgetTokens,
+              markdown: rendered.markdown,
+              metadata: rendered as unknown as Record<string, unknown>,
+              format: input?.format,
+              elapsedMs: performance.now() - t0,
+            })
+          } finally {
+            crossDb?.close()
+          }
         }
 
         if (action === "skeleton") {
-          indexCodebase(db, projectRoot)
-          const targetPath = String(input?.path ?? input?.filePath ?? "")
-          const skel = readAstSkeleton(db, targetPath)
-          const skelObj = skel && typeof skel === "object" ? (skel as unknown as Record<string, unknown>) : null
-          const text =
-            typeof skel === "string"
-              ? skel
-              : String(skelObj?.skeleton_text ?? skelObj?.skeletonText ?? `No skeleton found for ${targetPath}`)
-          return formatToolOutput({
-            action: "skeleton",
-            markdown: text,
-            metadata: { path: targetPath, skeleton: skel },
-            format: input?.format,
-            elapsedMs: performance.now() - t0,
-          })
+          const rawTargetPath = String(input?.path ?? input?.filePath ?? "")
+          const targetWs = resolveTargetWorkspaceForCall(rawTargetPath, activeWorktreeRoot)
+          const crossDb = openTargetWorkspaceDb(targetWs)
+          const activeDb = crossDb ?? db
+          try {
+            indexCodebase(activeDb, targetWs.targetRoot)
+            const targetPath = targetWs.relPath || rawTargetPath
+            const includePrivate = Boolean(input?.includePrivate)
+            let skel = readAstSkeleton(activeDb, targetPath, {
+              rootDir: targetWs.targetRoot,
+              includePrivate,
+            })
+            if (!skel) {
+              try {
+                indexSingleFileSkeleton(activeDb, targetWs.targetRoot, targetPath)
+                skel = readAstSkeleton(activeDb, targetPath, {
+                  rootDir: targetWs.targetRoot,
+                  includePrivate,
+                })
+              } catch {
+                // ignore if file does not exist on disk
+              }
+            }
+            const skelObj = skel && typeof skel === "object" ? (skel as unknown as Record<string, unknown>) : null
+            const text =
+              typeof skel === "string"
+                ? skel
+                : String(skelObj?.skeleton_text ?? skelObj?.skeletonText ?? `No skeleton found for ${targetPath}`)
+            return formatToolOutput({
+              action: "skeleton",
+              sessionID,
+              markdown: text,
+              metadata: { path: targetPath, targetRoot: targetWs.targetRoot, includePrivate, skeleton: skel },
+              format: input?.format,
+              elapsedMs: performance.now() - t0,
+            })
+          } finally {
+            crossDb?.close()
+          }
         }
 
         if (action === "slice") {
-          indexCodebase(db, projectRoot)
-          const targetPath = String(input?.path ?? input?.filePath ?? "")
-          const symbol =
-            typeof input?.symbol === "string"
-              ? input.symbol
-              : typeof input?.qualifiedName === "string"
-                ? input.qualifiedName
-                : {
-                    startLine: Number(input?.startLine ?? 1),
-                    endLine: Number(input?.endLine ?? 50),
-                  }
-          const slice = readSymbolSlice(db, projectRoot, targetPath, symbol)
-          const sliceObj = slice && typeof slice === "object" ? (slice as unknown as Record<string, unknown>) : null
-          const text =
-            typeof slice === "string"
-              ? slice
-              : String(sliceObj?.slice_text ?? sliceObj?.sliceText ?? `Symbol slice not found for ${targetPath}`)
-          return formatToolOutput({
-            action: "slice",
-            markdown: text,
-            metadata: sliceObj ?? { path: targetPath },
-            format: input?.format,
-            elapsedMs: performance.now() - t0,
-          })
+          const rawTargetPath = String(input?.path ?? input?.filePath ?? "")
+          const targetWs = resolveTargetWorkspaceForCall(rawTargetPath, activeWorktreeRoot)
+          const crossDb = openTargetWorkspaceDb(targetWs)
+          const activeDb = crossDb ?? db
+          try {
+            indexCodebase(activeDb, targetWs.targetRoot)
+            const targetPath = targetWs.relPath || rawTargetPath
+            const symbol =
+              typeof input?.symbol === "string"
+                ? input.symbol
+                : typeof input?.qualifiedName === "string"
+                  ? input.qualifiedName
+                  : {
+                      startLine: Number(input?.startLine ?? 1),
+                      endLine: Number(input?.endLine ?? 50),
+                    }
+            const slice = readSymbolSlice(activeDb, targetWs.targetRoot, targetPath, symbol)
+            const sliceObj = slice && typeof slice === "object" ? (slice as unknown as Record<string, unknown>) : null
+            const text =
+              typeof slice === "string"
+                ? slice
+                : String(sliceObj?.slice_text ?? sliceObj?.sliceText ?? `Symbol slice not found for ${targetPath}`)
+            return formatToolOutput({
+              action: "slice",
+              sessionID,
+              markdown: text,
+              metadata: sliceObj ?? { path: targetPath, targetRoot: targetWs.targetRoot },
+              format: input?.format,
+              elapsedMs: performance.now() - t0,
+            })
+          } finally {
+            crossDb?.close()
+          }
         }
 
         if (action === "coupled") {
-          indexCodebase(db, projectRoot)
+          const rawTargetPath = String(input?.path ?? input?.filePath ?? "")
+          const targetWs = resolveTargetWorkspaceForCall(rawTargetPath, activeWorktreeRoot)
+          const crossDb = openTargetWorkspaceDb(targetWs)
+          const activeDb = crossDb ?? db
           try {
-            mineGitCochange(db, projectRoot)
-          } catch {
-            // ignore if projectRoot is not a git repo
+            indexCodebase(activeDb, targetWs.targetRoot)
+            try {
+              mineGitCochange(activeDb, targetWs.targetRoot)
+            } catch {
+              // ignore if targetRoot is not a git repo
+            }
+            const targetPath = targetWs.relPath || rawTargetPath
+            const couplings = queryCochangeCouplings(activeDb, targetPath)
+            const warnings = renderCochangeWarnings(activeDb, [targetPath])
+            return formatToolOutput({
+              action: "coupled",
+              sessionID,
+              markdown: warnings || `No co-change couplings above threshold for ${targetPath}.`,
+              metadata: { path: targetPath, targetRoot: targetWs.targetRoot, couplings },
+              format: input?.format,
+              elapsedMs: performance.now() - t0,
+            })
+          } finally {
+            crossDb?.close()
           }
-          const targetPath = String(input?.path ?? input?.filePath ?? "")
-          const couplings = queryCochangeCouplings(db, targetPath)
-          const warnings = renderCochangeWarnings(db, [targetPath])
-          return formatToolOutput({
-            action: "coupled",
-            markdown: warnings || `No co-change couplings above threshold for ${targetPath}.`,
-            metadata: { path: targetPath, couplings },
-            format: input?.format,
-            elapsedMs: performance.now() - t0,
-          })
         }
 
         if (action === "brief") {
-          indexCodebase(db, projectRoot)
-          computeCodebasePageRank(db)
-          try {
-            mineGitCochange(db, projectRoot)
-          } catch {
-            // ignore if projectRoot is not a git repo
-          }
-          const targetPaths = Array.isArray(input?.targetPaths)
+          const rawTargetPaths = Array.isArray(input?.targetPaths)
             ? input.targetPaths.map(String)
             : typeof input?.path === "string"
               ? [input.path]
               : []
-          const symbolNames = Array.isArray(input?.symbolNames) ? input.symbolNames.map(String) : undefined
-          const maxTokens = typeof input?.maxTokens === "number" ? input.maxTokens : 1500
-          const brief = buildImplementorViewportBrief(db, {
-            targetPaths,
-            symbolNames,
-            sessionID,
-            rootDir: projectRoot,
-            maxTokens,
-          })
-          return formatToolOutput({
-            action: "brief",
-            markdown: brief.markdown,
-            metadata: brief as unknown as Record<string, unknown>,
-            format: input?.format,
-            elapsedMs: performance.now() - t0,
-          })
+          const firstTargetWs = resolveTargetWorkspaceForCall(rawTargetPaths[0], activeWorktreeRoot)
+          const crossDb = openTargetWorkspaceDb(firstTargetWs)
+          const activeDb = crossDb ?? db
+          try {
+            indexCodebase(activeDb, firstTargetWs.targetRoot)
+            computeCodebasePageRank(activeDb)
+            try {
+              mineGitCochange(activeDb, firstTargetWs.targetRoot)
+            } catch {
+              // ignore if targetRoot is not a git repo
+            }
+            const normalizedTargets = rawTargetPaths.map((tp) => {
+              const ws = resolveTargetWorkspaceForCall(tp, firstTargetWs.targetRoot)
+              return ws.relPath || tp
+            })
+            const symbolNames = Array.isArray(input?.symbolNames) ? input.symbolNames.map(String) : undefined
+            const maxTokens = typeof input?.maxTokens === "number" ? input.maxTokens : 1500
+            const brief = buildImplementorViewportBrief(activeDb, {
+              targetPaths: normalizedTargets,
+              symbolNames,
+              sessionID,
+              rootDir: firstTargetWs.targetRoot,
+              maxTokens,
+            })
+            return formatToolOutput({
+              action: "brief",
+              sessionID,
+              budgetTokens: maxTokens,
+              markdown: brief.markdown,
+              metadata: brief as unknown as Record<string, unknown>,
+              format: input?.format,
+              elapsedMs: performance.now() - t0,
+            })
+          } finally {
+            crossDb?.close()
+          }
         }
 
         if (action === "search") {
           const query = String(input?.query ?? input?.q ?? "")
+          const maxTokens = typeof input?.maxTokens === "number" ? input.maxTokens : 600
           const nav = queryVibeNavigation(db, query, {
             limit: typeof input?.limit === "number" ? input.limit : 5,
-            maxTokens: typeof input?.maxTokens === "number" ? input.maxTokens : 600,
+            maxTokens,
           })
           return formatToolOutput({
             action: "search",
+            sessionID,
+            budgetTokens: maxTokens,
             markdown: nav.markdown,
             metadata: nav as unknown as Record<string, unknown>,
             format: input?.format,
@@ -618,6 +1158,7 @@ export default {
             typeof timeline === "string" ? timeline : String(timelineObj?.markdown ?? JSON.stringify(timeline))
           return formatToolOutput({
             action: "timeline",
+            sessionID,
             markdown: content,
             metadata: timelineObj ?? { sessionID },
             format: input?.format,
@@ -626,7 +1167,7 @@ export default {
         }
 
         if (action === "provenance") {
-          reconcileProvenanceStaleness(db, projectRoot, sessionID)
+          reconcileProvenanceStaleness(db, activeWorktreeRoot, sessionID)
           const report = renderProvenanceReport(db, sessionID)
           const reportObj =
             report && typeof report === "object" ? (report as unknown as Record<string, unknown>) : null
@@ -634,6 +1175,7 @@ export default {
             typeof report === "string" ? report : String(reportObj?.markdown ?? JSON.stringify(report))
           return formatToolOutput({
             action: "provenance",
+            sessionID,
             markdown: content,
             metadata: reportObj ?? { sessionID },
             format: input?.format,
@@ -642,7 +1184,7 @@ export default {
         }
 
         // Default: status / overview / latest / session
-        reconcileProvenanceStaleness(db, projectRoot, sessionID)
+        reconcileProvenanceStaleness(db, activeWorktreeRoot, sessionID)
         const result = querySubstrateContinuity(
           db,
           { action: action as "status", sessionID, query: typeof input?.query === "string" ? input.query : undefined },
@@ -652,6 +1194,7 @@ export default {
         const markdown = String(resObj.content ?? resObj.markdown ?? JSON.stringify(result))
         return formatToolOutput({
           action,
+          sessionID,
           markdown,
           metadata: resObj,
           format: input?.format,
@@ -675,11 +1218,11 @@ export default {
         const { db } = ensureSyncedDb(hookSessionID)
         try {
           const resolved = resolveDefaultSessionId(db, hookSessionID, { sessionID: hookSessionID })
-          reconcileProvenanceStaleness(db, projectRoot, resolved.sessionId)
+          reconcileProvenanceStaleness(db, activeWorktreeRoot, resolved.sessionId)
           const packet = buildCompactionContinuationPacket(db, {
             sessionID: resolved.sessionId,
             hookContext: { sessionID: hookSessionID },
-            canonicalRoot: projectRoot,
+            canonicalRoot: activeWorktreeRoot,
             maxTokens: 1200,
           })
           if (Array.isArray(event.system)) {
@@ -700,24 +1243,45 @@ export default {
       })
     }
 
-    // 3. JIT Read Skeleton Interception via ctx.tool.hook("execute.after") (A3 / P-1 / P-8)
+    // 3. JIT Read Skeleton Interception & Write/Edit Ledger Sync via ctx.tool.hook("execute.after") (A3 / P-1 / P-8 / S3-3)
     if (typeof ctx.tool?.hook === "function") {
       await ctx.tool.hook("execute.after", (event) => {
-        if (event.status !== "completed" || event.tool !== "read") return
+        if (event.status !== "completed") return
         const rawText = extractToolResultText(event.result?.content)
-        if (!rawText) return
-
         const inputObj =
           event.input && typeof event.input === "object" && !Array.isArray(event.input)
             ? (event.input as Record<string, unknown>)
             : {}
+
+        if (
+          event.tool === "write" ||
+          event.tool === "edit" ||
+          event.tool === "patch" ||
+          event.tool === "apply_patch"
+        ) {
+          try {
+            valve.recordToolExecuteAfter({
+              sessionID: event.sessionID,
+              tool: event.tool,
+              callId: event.id,
+              input: inputObj,
+              outputText: rawText || "",
+              canonicalRoot: activeWorktreeRoot,
+            })
+          } catch {
+            // Non-fatal: never block host write/edit tool completion
+          }
+          return
+        }
+
+        if (event.tool !== "read" || !rawText) return
 
         const capture = valve.recordReadFromHook({
           sessionID: event.sessionID,
           callId: event.id,
           input: inputObj,
           rawOutput: rawText,
-          canonicalRoot: projectRoot,
+          canonicalRoot: activeWorktreeRoot,
         })
 
         const isPartialOrTruncated =
@@ -728,7 +1292,7 @@ export default {
         try {
           const { db } = ensureSyncedDb(event.sessionID)
           try {
-            const footer = buildJitReadSkeletonFooter(db, projectRoot, capture.path, capture)
+            const footer = buildJitReadSkeletonFooter(db, activeWorktreeRoot, capture.path, capture)
             if (footer && event.result) {
               const updatedContent = appendTextToToolResultContent(event.result.content, `\n\n${footer}`)
               event.result = {
@@ -746,7 +1310,10 @@ export default {
     }
 
     // 4. OpenCode V2 RPC Server Registration for TUI Inspector (`tui.tsx`) (A1 / P-2)
-    let rpcHandle: { emit?: (event: string, data: { sessionID?: string; action: string; updatedAt: string }) => void } | null = null
+    let rpcHandle: {
+      emit?: (event: string, data: { sessionID?: string; action: string; updatedAt: string }) => void
+      events?: { emit?: (event: string, data: { sessionID?: string; action: string; updatedAt: string }) => void }
+    } | null = null
     if (typeof ctx.rpc?.register === "function") {
       try {
         rpcHandle = (await ctx.rpc.register(substrateRpcContract, {
@@ -754,7 +1321,7 @@ export default {
             const { db } = ensureSyncedDb(input?.sessionID)
             try {
               return buildSubstrateSnapshot(db, {
-                projectRoot,
+                projectRoot: activeWorktreeRoot,
                 archiveDir,
                 indexDbPath,
                 sessionID: input?.sessionID,
@@ -777,7 +1344,7 @@ export default {
               const { db } = ensureSyncedDb(input.sessionID)
               try {
                 const snap = buildSubstrateSnapshot(db, {
-                  projectRoot,
+                  projectRoot: activeWorktreeRoot,
                   archiveDir,
                   indexDbPath,
                   sessionID: input.sessionID,
@@ -797,7 +1364,7 @@ export default {
             const { db } = ensureSyncedDb(input.sessionID)
             try {
               return await executeSubstrateAction(db, input, {
-                projectRoot,
+                projectRoot: activeWorktreeRoot,
                 archiveDir,
                 indexDbPath,
                 sessionID: input.sessionID,
@@ -806,7 +1373,10 @@ export default {
               db.close()
             }
           },
-        })) as unknown as { emit?: (event: string, data: { sessionID?: string; action: string; updatedAt: string }) => void }
+        })) as unknown as {
+          emit?: (event: string, data: { sessionID?: string; action: string; updatedAt: string }) => void
+          events?: { emit?: (event: string, data: { sessionID?: string; action: string; updatedAt: string }) => void }
+        }
       } catch {
         // Ignore if host RPC is already registered or unsupported in test harness
       }
@@ -844,11 +1414,13 @@ export default {
             )
             recordCompactionSummaryHash(db, sessionID, summaryText)
           }
-          rpcHandle?.emit?.(SUBSTRATE_UPDATED_EVENT, {
+          const payload = {
             sessionID,
             action: isCompacted ? "compacted" : "idle",
             updatedAt: new Date().toISOString(),
-          })
+          }
+          rpcHandle?.events?.emit?.(SUBSTRATE_UPDATED_EVENT, payload)
+          rpcHandle?.emit?.(SUBSTRATE_UPDATED_EVENT, payload)
         } catch {
           // ignore non-fatal subscriber error
         } finally {
@@ -902,6 +1474,7 @@ export default {
             mode: { type: "string", enum: ["step-window", "recent", "initial", "all"] },
             keepRecentSteps: { type: "number" },
             sessionID: { type: "string" },
+            full: { type: "boolean" },
             format: { type: "string", enum: ["markdown", "json", "both"] },
           },
           additionalProperties: true,
@@ -913,7 +1486,7 @@ export default {
         name: "viewport",
         options: { namespace: "substrate", codemode },
         description:
-          "Query the 4-tier Hivemind Substrate viewport (status | resolve | timeline | provenance | sync | search | repomap | skeleton | slice | coupled | brief | intents | latest).",
+          "Query the 4-tier Hivemind Substrate viewport (status | resolve | timeline | provenance | compaction | sync | persist | search | find | repomap | skeleton | slice | coupled | brief | intents | latest).",
         input: {
           type: "object",
           properties: {
@@ -924,8 +1497,11 @@ export default {
                 "resolve",
                 "timeline",
                 "provenance",
+                "compaction",
                 "sync",
+                "persist",
                 "search",
+                "find",
                 "repomap",
                 "skeleton",
                 "slice",
@@ -936,6 +1512,7 @@ export default {
               ],
             },
             sessionID: { type: "string" },
+            scope: { type: "string", enum: ["session", "project", "all-projects"] },
             query: { type: "string" },
             blob: { type: "string" },
             path: { type: "string" },
@@ -945,6 +1522,7 @@ export default {
             maxTokens: { type: "number" },
             startLine: { type: "number" },
             endLine: { type: "number" },
+            includePrivate: { type: "boolean" },
             format: { type: "string", enum: ["markdown", "json", "both"] },
           },
           additionalProperties: true,
@@ -965,9 +1543,10 @@ export default {
               type: "string",
               description: "Session to persist; defaults to the current session. The whole tree from the root is archived.",
             },
+            scope: { type: "string", enum: ["session", "project", "all-projects"] },
             format: { type: "string", enum: ["markdown", "json", "both"] },
           },
-          additionalProperties: false,
+          additionalProperties: true,
         },
         execute: executePersist as unknown as ToolExecute,
       })
@@ -983,6 +1562,7 @@ export default {
             mode: { type: "string", enum: ["step-window", "recent", "initial", "all"] },
             keepRecentSteps: { type: "number" },
             sessionID: { type: "string" },
+            full: { type: "boolean" },
             format: { type: "string", enum: ["markdown", "json", "both"] },
           },
           additionalProperties: true,

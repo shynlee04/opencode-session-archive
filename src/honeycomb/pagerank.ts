@@ -264,9 +264,404 @@ export function computeCodebasePageRank(
 
 export const computePageRank = computeCodebasePageRank
 
+export interface MudballHotspot {
+  readonly kind: "god_file" | "god_symbol" | "high_coupling_hub" | "hidden_coupling"
+  readonly path: string
+  readonly target: string
+  readonly metric: string
+  readonly symbol_name?: string
+  readonly start_line?: number
+  readonly end_line?: number
+  readonly line_span?: number
+  readonly loc?: number
+  readonly pagerank?: number
+  readonly in_degree?: number
+  readonly out_degree?: number
+  readonly coupled_path?: string
+  readonly co_commits?: number
+  readonly probability?: number
+  readonly severity: "high" | "medium" | "warn"
+  readonly detail: string
+}
+
+export interface MudballSymbolSummary {
+  readonly name: string
+  readonly kind: string
+  readonly start_line: number
+  readonly end_line: number
+  readonly line_span: number
+  readonly startLine: number
+  readonly endLine: number
+  readonly lineSpan: number
+  readonly signature: string
+}
+
+export interface MudballFileOutline {
+  readonly rank: number
+  readonly path: string
+  readonly filePath: string
+  readonly loc: number
+  readonly lineCount: number
+  readonly pagerank: number
+  readonly score: number
+  readonly in_degree: number
+  readonly out_degree: number
+  readonly inDegree: number
+  readonly outDegree: number
+  readonly symbol_count: number
+  readonly symbolsCount: number
+  readonly raw_tokens: number
+  readonly skeleton_tokens: number
+  readonly rawTokens: number
+  readonly skeletonTokens: number
+  readonly tokens_saved: number
+  readonly largest_symbols: readonly MudballSymbolSummary[]
+  readonly exportedSymbols: readonly MudballSymbolSummary[]
+}
+
+export interface MudballAdvisorReport {
+  readonly totalFiles: number
+  readonly totalSymbols: number
+  readonly rawTokensTotal: number
+  readonly skeletonTokensTotal: number
+  readonly tokensSavedTotal: number
+  readonly compressionPct: number
+  readonly topFiles: readonly MudballFileOutline[]
+  readonly hotspots: readonly MudballHotspot[]
+  readonly formatted: string
+}
+
+export interface QueryMudballAdvisorOptions {
+  readonly godFileLocThreshold?: number
+  readonly godSymbolSpanThreshold?: number
+  readonly hubDegreeThreshold?: number
+  readonly minHiddenCoCommits?: number
+  readonly minHiddenProbability?: number
+  readonly maxTopFiles?: number
+  readonly topKFiles?: number
+  readonly maxOutlineSymbolsPerFile?: number
+  readonly maxHotspots?: number
+}
+
+/**
+ * Queries the codebase structural graph + git co-change tables in index.sqlite to detect
+ * mudball hotspots (god_file, god_symbol, high_coupling_hub, hidden_coupling) and quantify
+ * AST skeleton token savings across the repository.
+ */
+export function queryMudballAdvisor(
+  db: Database,
+  options: QueryMudballAdvisorOptions = {},
+): MudballAdvisorReport {
+  ensureCodeGraphSchema(db)
+
+  const godFileLocThreshold = options.godFileLocThreshold ?? 600
+  const godSymbolSpanThreshold = options.godSymbolSpanThreshold ?? 120
+  const hubDegreeThreshold = options.hubDegreeThreshold ?? 8
+  const minHiddenCoCommits = options.minHiddenCoCommits ?? 2
+  const minHiddenProbability = options.minHiddenProbability ?? 0.5
+  const maxTopFiles = options.topKFiles ?? options.maxTopFiles ?? 15
+  const maxOutlineSymbols = options.maxOutlineSymbolsPerFile ?? 5
+
+  let fileRows = db
+    .query(
+      "SELECT path, loc, raw_tokens, skeleton_tokens, pagerank FROM code_file ORDER BY pagerank DESC, loc DESC, path ASC",
+    )
+    .all() as {
+    path: string
+    loc: number
+    raw_tokens: number
+    skeleton_tokens: number
+    pagerank: number
+  }[]
+
+  if (fileRows.length > 0 && fileRows.every((r) => r.pagerank === 0)) {
+    computeCodebasePageRank(db, { persist: true })
+    fileRows = db
+      .query(
+        "SELECT path, loc, raw_tokens, skeleton_tokens, pagerank FROM code_file ORDER BY pagerank DESC, loc DESC, path ASC",
+      )
+      .all() as {
+      path: string
+      loc: number
+      raw_tokens: number
+      skeleton_tokens: number
+      pagerank: number
+    }[]
+  }
+
+  const edgeRows = db
+    .query("SELECT from_path, to_path FROM code_import_edge")
+    .all() as { from_path: string; to_path: string }[]
+
+  const inDeg = new Map<string, number>()
+  const outDeg = new Map<string, number>()
+  for (const e of edgeRows) {
+    if (e.from_path === e.to_path) continue
+    outDeg.set(e.from_path, (outDeg.get(e.from_path) ?? 0) + 1)
+    inDeg.set(e.to_path, (inDeg.get(e.to_path) ?? 0) + 1)
+  }
+
+  const symRows = db
+    .query(
+      "SELECT path, name, kind, depth, parent_symbol, start_line, end_line, signature, exported FROM code_symbol ORDER BY path ASC, start_line ASC, depth ASC",
+    )
+    .all() as {
+    path: string
+    name: string
+    kind: string
+    depth: number
+    parent_symbol: string | null
+    start_line: number
+    end_line: number
+    signature: string
+    exported: number
+  }[]
+
+  const symsByPath = new Map<string, typeof symRows>()
+  const parentsWithChildrenByPath = new Map<string, Set<string>>()
+
+  for (const s of symRows) {
+    let list = symsByPath.get(s.path)
+    if (!list) {
+      list = []
+      symsByPath.set(s.path, list)
+    }
+    list.push(s)
+    if (s.depth === 2 && s.parent_symbol) {
+      let pSet = parentsWithChildrenByPath.get(s.path)
+      if (!pSet) {
+        pSet = new Set()
+        parentsWithChildrenByPath.set(s.path, pSet)
+      }
+      pSet.add(s.parent_symbol)
+    }
+  }
+
+  let rawTokensTotal = 0
+  let skeletonTokensTotal = 0
+  const outlines: MudballFileOutline[] = []
+
+  const godFileHotspots: MudballHotspot[] = []
+  const godSymbolHotspots: MudballHotspot[] = []
+  const hubHotspots: MudballHotspot[] = []
+  const hiddenCouplingHotspots: MudballHotspot[] = []
+
+  for (let idx = 0; idx < fileRows.length; idx++) {
+    const f = fileRows[idx]!
+    const skelTokens = Math.max(1, f.skeleton_tokens || Math.ceil(f.loc * 1.2))
+    const rawTokens = Math.max(skelTokens, f.raw_tokens || f.loc * 10)
+    const saved = Math.max(0, rawTokens - skelTokens)
+    rawTokensTotal += rawTokens
+    skeletonTokensTotal += skelTokens
+
+    const fileSyms = symsByPath.get(f.path) ?? []
+    const parentWrappers = parentsWithChildrenByPath.get(f.path)
+    const leafSyms = fileSyms.filter((s) => !(s.depth === 1 && parentWrappers?.has(s.name)))
+    const exportedOrLeafSyms =
+      fileSyms.filter((s) => s.exported === 1 || s.depth === 2).length > 0
+        ? fileSyms.filter((s) => s.exported === 1 || s.depth === 2)
+        : fileSyms
+
+    const largestSyms: MudballSymbolSummary[] = [...exportedOrLeafSyms]
+      .map((s) => {
+        const lineSpan = Math.max(1, s.end_line - s.start_line + 1)
+        return {
+          name: s.parent_symbol ? `${s.parent_symbol}.${s.name}` : s.name,
+          kind: s.kind,
+          start_line: s.start_line,
+          end_line: s.end_line,
+          line_span: lineSpan,
+          startLine: s.start_line,
+          endLine: s.end_line,
+          lineSpan,
+          signature: s.signature,
+        }
+      })
+      .sort((a, b) => b.line_span - a.line_span || a.start_line - b.start_line)
+      .slice(0, maxOutlineSymbols)
+
+    const inCount = inDeg.get(f.path) ?? 0
+    const outCount = outDeg.get(f.path) ?? 0
+
+    outlines.push({
+      rank: idx + 1,
+      path: f.path,
+      filePath: f.path,
+      loc: f.loc,
+      lineCount: f.loc,
+      pagerank: f.pagerank,
+      score: f.pagerank,
+      in_degree: inCount,
+      out_degree: outCount,
+      inDegree: inCount,
+      outDegree: outCount,
+      symbol_count: fileSyms.length,
+      symbolsCount: fileSyms.length,
+      raw_tokens: rawTokens,
+      skeleton_tokens: skelTokens,
+      rawTokens,
+      skeletonTokens: skelTokens,
+      tokens_saved: saved,
+      largest_symbols: largestSyms,
+      exportedSymbols: largestSyms,
+    })
+
+    if (f.loc >= godFileLocThreshold) {
+      const severity: "high" | "warn" = f.loc >= 1000 ? "high" : "warn"
+      godFileHotspots.push({
+        kind: "god_file",
+        path: f.path,
+        target: f.path,
+        metric: `${f.loc} LOC`,
+        loc: f.loc,
+        pagerank: f.pagerank,
+        in_degree: inCount,
+        out_degree: outCount,
+        severity,
+        detail: `${f.path} (${f.loc} LOC, ${fileSyms.length} symbols, PR=${f.pagerank.toFixed(4)})`,
+      })
+    }
+
+    const totalDegree = inCount + outCount
+    if (totalDegree >= hubDegreeThreshold) {
+      const severity: "high" | "warn" = totalDegree >= 14 ? "high" : "warn"
+      hubHotspots.push({
+        kind: "high_coupling_hub",
+        path: f.path,
+        target: f.path,
+        metric: `in=${inCount}, out=${outCount}`,
+        loc: f.loc,
+        pagerank: f.pagerank,
+        in_degree: inCount,
+        out_degree: outCount,
+        severity,
+        detail: `${f.path} (in=${inCount}, out=${outCount}, PR=${f.pagerank.toFixed(4)})`,
+      })
+    }
+
+    for (const s of leafSyms) {
+      if (s.kind === "interface" || s.kind === "type") continue
+      const span = Math.max(1, s.end_line - s.start_line + 1)
+      if (span >= godSymbolSpanThreshold) {
+        const severity: "high" | "warn" = span >= 200 ? "high" : "warn"
+        const symLabel = s.parent_symbol ? `${s.parent_symbol}.${s.name}` : s.name
+        godSymbolHotspots.push({
+          kind: "god_symbol",
+          path: f.path,
+          target: `${f.path}#${symLabel}`,
+          metric: `${span} lines [L${s.start_line}-L${s.end_line}]`,
+          symbol_name: symLabel,
+          start_line: s.start_line,
+          end_line: s.end_line,
+          line_span: span,
+          severity,
+          detail: `${f.path}#${symLabel} [L${s.start_line}-L${s.end_line}] (${span} lines)`,
+        })
+      }
+    }
+  }
+
+  godFileHotspots.sort((a, b) => (b.loc ?? 0) - (a.loc ?? 0) || a.path.localeCompare(b.path))
+  godSymbolHotspots.sort(
+    (a, b) => (b.line_span ?? 0) - (a.line_span ?? 0) || a.path.localeCompare(b.path),
+  )
+  hubHotspots.sort(
+    (a, b) =>
+      (b.in_degree ?? 0) +
+        (b.out_degree ?? 0) -
+        ((a.in_degree ?? 0) + (a.out_degree ?? 0)) ||
+      (b.pagerank ?? 0) - (a.pagerank ?? 0) ||
+      a.path.localeCompare(b.path),
+  )
+
+  const hasCochangeTable =
+    db
+      .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'git_cochange'")
+      .get() !== null
+
+  if (hasCochangeTable) {
+    const hiddenRows = db
+      .query(
+        `SELECT file_a, file_b, co_commits, prob_a_given_b, prob_b_given_a
+         FROM git_cochange
+         WHERE has_static_edge = 0 AND co_commits >= ?
+         ORDER BY co_commits DESC, MAX(prob_a_given_b, prob_b_given_a) DESC, file_a ASC, file_b ASC
+         LIMIT 25`,
+      )
+      .all(minHiddenCoCommits) as {
+      file_a: string
+      file_b: string
+      co_commits: number
+      prob_a_given_b: number
+      prob_b_given_a: number
+    }[]
+
+    for (const r of hiddenRows) {
+      const maxProb = Math.max(r.prob_a_given_b, r.prob_b_given_a)
+      if (maxProb < minHiddenProbability) continue
+      const primaryIsA = r.prob_b_given_a >= r.prob_a_given_b
+      const primaryPath = primaryIsA ? r.file_a : r.file_b
+      const partnerPath = primaryIsA ? r.file_b : r.file_a
+      const severity: "high" | "warn" =
+        r.co_commits >= 3 && maxProb >= 0.6 ? "high" : "warn"
+      hiddenCouplingHotspots.push({
+        kind: "hidden_coupling",
+        path: primaryPath,
+        target: `${primaryPath} <-> ${partnerPath}`,
+        metric: `${r.co_commits} co-commits (${(maxProb * 100).toFixed(1)}%)`,
+        coupled_path: partnerPath,
+        co_commits: r.co_commits,
+        probability: maxProb,
+        severity,
+        detail: `${primaryPath} <-> ${partnerPath} (${r.co_commits} co-commits, P=${(maxProb * 100).toFixed(1)}%, 0 static edges)`,
+      })
+    }
+  }
+
+  const allHotspots: MudballHotspot[] = [
+    ...godFileHotspots,
+    ...godSymbolHotspots,
+    ...hubHotspots,
+    ...hiddenCouplingHotspots,
+  ]
+  allHotspots.sort((a, b) => {
+    if (a.severity !== b.severity) return a.severity === "high" ? -1 : 1
+    return 0
+  })
+
+  const hotspots =
+    options.maxHotspots !== undefined ? allHotspots.slice(0, options.maxHotspots) : allHotspots
+
+  const topFiles = outlines.slice(0, maxTopFiles)
+
+  const tokensSavedTotal = Math.max(0, rawTokensTotal - skeletonTokensTotal)
+  const compressionPct =
+    rawTokensTotal > 0 ? Number(((tokensSavedTotal / rawTokensTotal) * 100).toFixed(1)) : 0
+
+  const formattedLines: string[] = [
+    `### Mudball & Architecture Advisor (saved ${tokensSavedTotal} tokens, ${compressionPct}% AST compression)`,
+  ]
+  for (const h of hotspots.slice(0, 12)) {
+    formattedLines.push(`- [${h.severity}/${h.kind}] ${h.detail}`)
+  }
+
+  return {
+    totalFiles: fileRows.length,
+    totalSymbols: symRows.length,
+    rawTokensTotal,
+    skeletonTokensTotal,
+    tokensSavedTotal,
+    compressionPct,
+    topFiles,
+    hotspots,
+    formatted: formattedLines.join("\n"),
+  }
+}
+
 /**
  * Renders the Tier-1 Architectural RepoMap (< 1,000 tokens) ranked by PageRank centrality,
- * showing each top file's PageRank score, in/out degree, LOC, and top exported symbols with [Lstart-Lend] spans.
+ * showing each top file's PageRank score, in/out degree, LOC, and top exported symbols with [Lstart-Lend] spans,
+ * plus a compact Mudball & Architecture Advisor hotspot summary when hotspots are present.
  */
 export function renderRepoMap(db: Database, options: RenderRepoMapOptions = {}): Tier1RepoMapView {
   const t0 = performance.now()
@@ -282,14 +677,30 @@ export function renderRepoMap(db: Database, options: RenderRepoMapOptions = {}):
       : null
 
   let fileRows = db
-    .query("SELECT path, loc, pagerank FROM code_file ORDER BY pagerank DESC, loc DESC, path ASC")
-    .all() as { path: string; loc: number; pagerank: number }[]
+    .query(
+      "SELECT path, loc, raw_tokens, skeleton_tokens, pagerank FROM code_file ORDER BY pagerank DESC, loc DESC, path ASC",
+    )
+    .all() as {
+    path: string
+    loc: number
+    raw_tokens: number
+    skeleton_tokens: number
+    pagerank: number
+  }[]
 
   if (fileRows.length > 0 && fileRows.every((r) => r.pagerank === 0)) {
     computeCodebasePageRank(db, { persist: true })
     fileRows = db
-      .query("SELECT path, loc, pagerank FROM code_file ORDER BY pagerank DESC, loc DESC, path ASC")
-      .all() as { path: string; loc: number; pagerank: number }[]
+      .query(
+        "SELECT path, loc, raw_tokens, skeleton_tokens, pagerank FROM code_file ORDER BY pagerank DESC, loc DESC, path ASC",
+      )
+      .all() as {
+      path: string
+      loc: number
+      raw_tokens: number
+      skeleton_tokens: number
+      pagerank: number
+    }[]
   }
 
   if (focusSet && focusSet.size > 0) {
@@ -336,6 +747,7 @@ export function renderRepoMap(db: Database, options: RenderRepoMapOptions = {}):
     .all() as { path: string; name: string; kind: string; start_line: number; end_line: number }[]
 
   const symbolsByPath = new Map<string, RepoMapSymbolSummary[]>()
+  let topGodSymbol: { path: string; name: string; start_line: number; end_line: number; span: number } | null = null
   for (const s of exportedSymbolsRows) {
     let list = symbolsByPath.get(s.path)
     if (!list) {
@@ -348,6 +760,63 @@ export function renderRepoMap(db: Database, options: RenderRepoMapOptions = {}):
       start_line: s.start_line,
       end_line: s.end_line,
     })
+    if (s.kind !== "interface" && s.kind !== "type") {
+      const span = s.end_line - s.start_line + 1
+      if (span >= 120 && (!topGodSymbol || span > topGodSymbol.span)) {
+        topGodSymbol = { path: s.path, name: s.name, start_line: s.start_line, end_line: s.end_line, span }
+      }
+    }
+  }
+
+  const advisorSummaryLines: string[] = []
+  if (effectiveCap >= 400 && fileRows.length > 0) {
+    let rawTotal = 0
+    let skelTotal = 0
+    let topGodFile: { path: string; loc: number; pagerank: number } | null = null
+    let topHub: { path: string; inCount: number; outCount: number; deg: number; pagerank: number } | null = null
+
+    for (const f of fileRows) {
+      const skel = Math.max(1, f.skeleton_tokens || Math.ceil(f.loc * 1.2))
+      const raw = Math.max(skel, f.raw_tokens || f.loc * 10)
+      rawTotal += raw
+      skelTotal += skel
+      if (f.loc >= 600 && (!topGodFile || f.loc > topGodFile.loc)) {
+        topGodFile = { path: f.path, loc: f.loc, pagerank: f.pagerank }
+      }
+      const ic = inDeg.get(f.path) ?? 0
+      const oc = outDeg.get(f.path) ?? 0
+      const deg = ic + oc
+      if (deg >= 8 && (!topHub || deg > topHub.deg)) {
+        topHub = { path: f.path, inCount: ic, outCount: oc, deg, pagerank: f.pagerank }
+      }
+    }
+
+    const bullets: string[] = []
+    if (topGodFile) {
+      const sev = topGodFile.loc >= 1000 ? "high" : "warn"
+      bullets.push(`- [${sev}/god_file] ${topGodFile.path} (${topGodFile.loc} LOC, PR=${topGodFile.pagerank.toFixed(4)})`)
+    }
+    if (topGodSymbol) {
+      const sev = topGodSymbol.span >= 200 ? "high" : "warn"
+      bullets.push(
+        `- [${sev}/god_symbol] ${topGodSymbol.path}#${topGodSymbol.name} [L${topGodSymbol.start_line}-L${topGodSymbol.end_line}] (${topGodSymbol.span} lines)`,
+      )
+    }
+    if (topHub) {
+      const sev = topHub.deg >= 14 ? "high" : "warn"
+      bullets.push(
+        `- [${sev}/high_coupling_hub] ${topHub.path} (in=${topHub.inCount}, out=${topHub.outCount}, PR=${topHub.pagerank.toFixed(4)})`,
+      )
+    }
+
+    if (bullets.length > 0) {
+      const saved = Math.max(0, rawTotal - skelTotal)
+      const pct = rawTotal > 0 ? ((saved / rawTotal) * 100).toFixed(1) : "0.0"
+      advisorSummaryLines.push(
+        `### Mudball & Architecture Advisor (saved ${saved} tokens, ${pct}% AST compression)`,
+        ...bullets,
+      )
+    }
   }
 
   const headerLine = `# Tier-1 RepoMap (${fileRows.length} files, ${edgeRows.length} import edges, sorted by PageRank)`
@@ -379,7 +848,11 @@ export function renderRepoMap(db: Database, options: RenderRepoMapOptions = {}):
         }))
     }
 
-    const topSyms = allSyms.slice(0, maxSymbolsPerFile)
+    const perFileSymbolCap =
+      advisorSummaryLines.length > 0 && i >= 6
+        ? Math.min(maxSymbolsPerFile, 3)
+        : maxSymbolsPerFile
+    const topSyms = allSyms.slice(0, perFileSymbolCap)
     const remainingCount = Math.max(0, allSyms.length - topSyms.length)
 
     const symText =
@@ -392,7 +865,7 @@ export function renderRepoMap(db: Database, options: RenderRepoMapOptions = {}):
     const outCount = outDeg.get(f.path) ?? 0
     const line = `${entries.length + 1}. ${f.path} (PR=${f.pagerank.toFixed(4)}, in=${inCount}, out=${outCount}, ${f.loc} LOC): ${symText}`
 
-    const candidateText = [...lines, line].join("\n")
+    const candidateText = [...lines, line, ...advisorSummaryLines].join("\n")
     if (estimateTokens(candidateText) > effectiveCap) {
       break
     }
@@ -408,6 +881,14 @@ export function renderRepoMap(db: Database, options: RenderRepoMapOptions = {}):
       exported_symbol_count: allSyms.length,
       top_symbols: topSyms,
     })
+  }
+
+  if (entries.length > 0 && advisorSummaryLines.length > 0) {
+    for (const advLine of advisorSummaryLines) {
+      if (estimateTokens([...lines, advLine].join("\n")) <= effectiveCap) {
+        lines.push(advLine)
+      }
+    }
   }
 
   const text = lines.join("\n")
@@ -429,3 +910,4 @@ export function renderRepoMap(db: Database, options: RenderRepoMapOptions = {}):
 }
 
 export const renderTier1RepoMap = renderRepoMap
+

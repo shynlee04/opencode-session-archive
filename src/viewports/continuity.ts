@@ -21,8 +21,10 @@ export type FileStalenessStatus =
 export type ProvenanceStalenessStatus =
   | "VERIFIED_FRESH"
   | "verified_fresh"
+  | "SLICE_FRESH"
   | "FRESH — DO NOT REREAD"
   | "verified_stale_by_later_touch"
+  | "STALE_BY_LATER_TOUCH"
   | "STALE (modified since read/review — re-verify slice)"
 
 export type SessionResolutionSource =
@@ -679,6 +681,17 @@ export function ensureContinuitySchema(db: Database): void {
     }
   }
 
+  try {
+    db.exec(`
+      DELETE FROM provenance_chain WHERE target_path IN ('session', '(unknown)', '');
+      UPDATE file_read_ledger
+      SET line_range = 'L1-L' || COALESCE(NULLIF(end_line, 0), NULLIF(total_lines, 0), 1)
+      WHERE line_range IN ('all', '#all');
+    `)
+  } catch {
+    // ignore cleanup errors on partial schemas
+  }
+
   initializedContinuityDbs.add(db)
 }
 
@@ -742,13 +755,83 @@ export function formatProvenanceStatusLabel(status: ProvenanceStalenessStatus | 
   if (status === "VERIFIED_FRESH" || status === "verified_fresh" || status === "verified_pass") {
     return "VERIFIED_FRESH (FRESH — DO NOT REREAD)"
   }
+  if (status === "SLICE_FRESH") {
+    return "SLICE_FRESH (FRESH SLICE — DO NOT REREAD SLICE)"
+  }
   if (status === "FRESH — DO NOT REREAD" || isSliceStatus(status)) {
     return status
   }
-  if (status === "verified_stale_by_later_touch") {
+  if (status === "verified_stale_by_later_touch" || status === "STALE_BY_LATER_TOUCH") {
     return "STALE (modified since read/review — re-verify slice) [verified_stale_by_later_touch]"
   }
   return "STALE (modified since read/review — re-verify slice)"
+}
+
+export function formatVerificationGateLabel(
+  verificationState: string | null | undefined,
+  stalePaths?: readonly string[],
+): string {
+  const state = (verificationState ?? "unverified").trim() || "unverified"
+  if (state === "verified_stale_by_later_touch" || state === "STALE_BY_LATER_TOUCH") {
+    const suffix =
+      stalePaths && stalePaths.length > 0
+        ? `${stalePaths.length} file(s) modified since last test pass: ${stalePaths.slice(0, 3).join(", ")}`
+        : "tracked files modified since last test pass"
+    return `verified_stale_by_later_touch — NEEDS RE-VERIFY (${suffix})`
+  }
+  if (state === "verified_passed" || state === "verified_pass") {
+    return "verified_passed — PASS (all verified files fresh on disk)"
+  }
+  if (state === "verified_failed_or_blocked" || state === "verified_fail") {
+    return `${state} — FAILED / BLOCKED`
+  }
+  if (state === "completed_report_only") {
+    return "completed_report_only — UNVERIFIED (edits recorded without test receipt)"
+  }
+  return `${state} — UNVERIFIED (no test/typecheck receipt recorded yet)`
+}
+
+function sanitizeLineRange(
+  rawLineRange: string | null | undefined,
+  totalLines?: number | null,
+  endLine?: number | null,
+): string {
+  const stripped = (rawLineRange ?? "").trim().replace(/^#+/, "")
+  if (stripped === "" || stripped.toLowerCase() === "all") {
+    if (typeof totalLines === "number" && totalLines > 0) {
+      return `L1-L${totalLines}`
+    }
+    if (typeof endLine === "number" && endLine > 0 && endLine < 1_000_000) {
+      return `L1-L${endLine}`
+    }
+    return "L1-L1"
+  }
+  return stripped
+}
+
+function cleanupProvenanceChainsForSession(db: Database, sessionId: string): void {
+  db.query(
+    `DELETE FROM provenance_chain
+     WHERE (root_session_id = ? OR session_id = ?)
+       AND (TRIM(COALESCE(target_path, '')) IN ('session', '(unknown)', ''))`,
+  ).run(sessionId, sessionId)
+
+  db.query(
+    `DELETE FROM provenance_chain
+     WHERE (root_session_id = ? OR session_id = ?)
+       AND rowid NOT IN (
+         SELECT rowid FROM (
+           SELECT rowid,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY target_path
+                    ORDER BY COALESCE(finding_seq, 0) DESC, updated_at DESC, rowid DESC
+                  ) AS rn
+           FROM provenance_chain
+           WHERE root_session_id = ? OR session_id = ?
+         )
+         WHERE rn = 1
+       )`,
+  ).run(sessionId, sessionId, sessionId, sessionId)
 }
 
 function resolveCandidateToRoot(
@@ -1095,6 +1178,8 @@ export function reconcileProvenanceStaleness(
   const diskMemo = new Map<string, string | null>()
   const nowIso = new Date().toISOString()
 
+  cleanupProvenanceChainsForSession(db, sessionId)
+
   const fileRowsBefore = db
     .query(
       `SELECT session_id, path, normalized_path, line_range, start_line, end_line,
@@ -1107,8 +1192,10 @@ export function reconcileProvenanceStaleness(
     .all(sessionId) as FileReadLedgerRow[]
 
   const chainRowsBefore = db
-    .query("SELECT * FROM provenance_chain WHERE root_session_id = ? ORDER BY chain_id ASC")
-    .all(sessionId) as ProvenanceChainRow[]
+    .query(
+      "SELECT * FROM provenance_chain WHERE root_session_id = ? OR session_id = ? ORDER BY chain_id ASC",
+    )
+    .all(sessionId, sessionId) as ProvenanceChainRow[]
 
   const updateFileStmt = db.prepare(
     "UPDATE file_read_ledger SET line_range = ?, disk_blob_sha = ?, staleness_status = ? WHERE session_id = ? AND path = ?",
@@ -1117,7 +1204,7 @@ export function reconcileProvenanceStaleness(
     "UPDATE provenance_chain SET disk_blob_sha = ?, staleness_status = ?, updated_at = ? WHERE chain_id = ?",
   )
   const updateDigestGateStmt = db.prepare(
-    "UPDATE session_semantic_digest SET verification_state = ? WHERE session_id = ?",
+    "UPDATE session_semantic_digest SET verification_state = ? WHERE session_id = ? OR root_id = ?",
   )
 
   const transitionedFilePaths: string[] = []
@@ -1135,7 +1222,7 @@ export function reconcileProvenanceStaleness(
 
       let nextDiskSha = row.disk_blob_sha || recordedSha
       let nextStatus: FileStalenessStatus = row.staleness_status
-      let nextLineRange = row.line_range
+      let nextLineRange = sanitizeLineRange(row.line_range, bounds.totalLines, bounds.endLine)
 
       if (overrideHash !== undefined) {
         nextDiskSha = stripBlobPrefix(overrideHash)
@@ -1165,14 +1252,28 @@ export function reconcileProvenanceStaleness(
           nextStatus = reconciled.stalenessStatus
           if (reconciled.state === "FRESH") {
             nextDiskSha = reconciled.diskFullSha ?? recordedSha
+            nextLineRange = sanitizeLineRange(
+              row.line_range,
+              reconciled.currentTotalLines ?? bounds.totalLines,
+              bounds.endLine,
+            )
           } else if (reconciled.state === "SLICE") {
             nextDiskSha = reconciled.diskSliceSha ?? recordedSha
-            nextLineRange = reconciled.lineRange
+            nextLineRange = sanitizeLineRange(
+              reconciled.lineRange,
+              reconciled.currentTotalLines ?? bounds.totalLines,
+              bounds.endLine,
+            )
           } else {
             nextDiskSha =
               reconciled.diskSliceSha ??
               reconciled.diskFullSha ??
               "missing"
+            nextLineRange = sanitizeLineRange(
+              row.line_range,
+              reconciled.currentTotalLines ?? bounds.totalLines,
+              bounds.endLine,
+            )
           }
         } else {
           const matches = hashesMatch(recordedSha, nextDiskSha)
@@ -1210,20 +1311,71 @@ export function reconcileProvenanceStaleness(
         chain.receipt_blob_sha ||
         chain.disk_blob_sha
       const overrideHash = hashMap.get(chain.target_path) ?? hashMap.get(norm)
-      const liveDiskSha =
-        overrideHash ?? computeFullDiskShaForPath(canonicalRoot, chain.target_path, norm, diskMemo)
-      const nextDiskSha =
-        liveDiskSha ??
-        (canonicalRoot ? "missing" : chain.disk_blob_sha || expectedSha)
       const exitCode = chain.verification_exit_code ?? chain.receipt_exit_code ?? 0
       const preferLowercaseFresh =
         calledWithCanonicalRoot || chain.staleness_status === "verified_fresh"
-      const nextStatus = classifyProvenanceStaleness({
-        expectedBlobSha: expectedSha,
-        diskBlobSha: nextDiskSha,
-        verificationExitCode: exitCode,
-        preferLowercaseFresh,
-      })
+
+      const matchingFile = updatedFiles.find(
+        (f) =>
+          f.path === chain.target_path ||
+          normalizeRepoPath(f.path, canonicalRoot) === norm,
+      )
+
+      let nextDiskSha: string
+      let nextStatus: ProvenanceStalenessStatus
+
+      if (overrideHash === undefined && matchingFile) {
+        if (
+          isSliceStatus(matchingFile.staleness_status) &&
+          (hashesMatch(expectedSha, matchingFile.read_blob_sha) ||
+            hashesMatch(expectedSha, matchingFile.disk_blob_sha))
+        ) {
+          nextDiskSha = matchingFile.disk_blob_sha || expectedSha
+          nextStatus = "SLICE_FRESH"
+        } else if (
+          matchingFile.staleness_status === "FRESH — DO NOT REREAD" &&
+          (hashesMatch(expectedSha, matchingFile.disk_blob_sha) ||
+            hashesMatch(expectedSha, matchingFile.read_blob_sha))
+        ) {
+          nextDiskSha = matchingFile.disk_blob_sha || expectedSha
+          nextStatus = preferLowercaseFresh ? "verified_fresh" : "VERIFIED_FRESH"
+        } else if (!isFreshOrSliceStatus(matchingFile.staleness_status)) {
+          nextDiskSha = matchingFile.disk_blob_sha || "missing"
+          nextStatus =
+            exitCode === 0 || exitCode === null
+              ? "verified_stale_by_later_touch"
+              : "STALE (modified since read/review — re-verify slice)"
+        } else {
+          const liveDiskSha = computeFullDiskShaForPath(
+            canonicalRoot,
+            chain.target_path,
+            norm,
+            diskMemo,
+          )
+          nextDiskSha =
+            liveDiskSha ??
+            (canonicalRoot ? "missing" : chain.disk_blob_sha || expectedSha)
+          nextStatus = classifyProvenanceStaleness({
+            expectedBlobSha: expectedSha,
+            diskBlobSha: nextDiskSha,
+            verificationExitCode: exitCode,
+            preferLowercaseFresh,
+          })
+        }
+      } else {
+        const liveDiskSha =
+          overrideHash ?? computeFullDiskShaForPath(canonicalRoot, chain.target_path, norm, diskMemo)
+        nextDiskSha =
+          liveDiskSha ??
+          (canonicalRoot ? "missing" : chain.disk_blob_sha || expectedSha)
+        nextStatus = classifyProvenanceStaleness({
+          expectedBlobSha: expectedSha,
+          diskBlobSha: nextDiskSha,
+          verificationExitCode: exitCode,
+          preferLowercaseFresh,
+        })
+      }
+
       if (nextDiskSha !== chain.disk_blob_sha || nextStatus !== chain.staleness_status) {
         updateChainStmt.run(nextDiskSha, nextStatus, nowIso, chain.chain_id)
         transitionedChainIds.push(chain.chain_id)
@@ -1236,16 +1388,27 @@ export function reconcileProvenanceStaleness(
       })
     }
 
-    if (updatedChains.some((c) => c.staleness_status === "verified_stale_by_later_touch")) {
-      updateDigestGateStmt.run("verified_stale_by_later_touch", sessionId)
-    } else if (
+    const hasStaleChain = updatedChains.some(
+      (c) =>
+        c.staleness_status === "verified_stale_by_later_touch" ||
+        c.staleness_status === "STALE_BY_LATER_TOUCH" ||
+        c.staleness_status.startsWith("STALE"),
+    )
+    const hasStaleFile = updatedFiles.some((f) => !isFreshOrSliceStatus(f.staleness_status))
+    const allChainsFresh =
       updatedChains.length > 0 &&
       updatedChains.every(
         (c) =>
-          c.staleness_status === "VERIFIED_FRESH" || c.staleness_status === "verified_fresh",
+          c.staleness_status === "VERIFIED_FRESH" ||
+          c.staleness_status === "verified_fresh" ||
+          c.staleness_status === "SLICE_FRESH" ||
+          c.staleness_status === "FRESH — DO NOT REREAD",
       )
-    ) {
-      updateDigestGateStmt.run("verified_passed", sessionId)
+
+    if (hasStaleChain || (hasStaleFile && (updatedChains.length > 0 || transitionedFilePaths.length > 0))) {
+      updateDigestGateStmt.run("verified_stale_by_later_touch", sessionId, sessionId)
+    } else if (allChainsFresh && !hasStaleFile) {
+      updateDigestGateStmt.run("verified_passed", sessionId, sessionId)
     }
   })
   tx()
@@ -1258,6 +1421,7 @@ export function reconcileProvenanceStaleness(
     (c) =>
       c.staleness_status === "VERIFIED_FRESH" ||
       c.staleness_status === "verified_fresh" ||
+      c.staleness_status === "SLICE_FRESH" ||
       c.staleness_status === "FRESH — DO NOT REREAD",
   ).length
   const staleChainsCount = updatedChains.length - verifiedFreshChainsCount
@@ -1330,6 +1494,8 @@ export function buildCompactionContinuationPacket(
   const requestedSeq = options.compactionSeq ?? options.seq
   const canonicalRoot = options.canonicalRoot ?? options.projectRoot ?? options.rootDir
 
+  cleanupProvenanceChainsForSession(db, sessionId)
+
   if (options.currentDiskHashes || canonicalRoot) {
     reconcileProvenanceStaleness(db, {
       sessionID: sessionId,
@@ -1374,7 +1540,6 @@ export function buildCompactionContinuationPacket(
   } | null
 
   const headline = digestRow?.headline ?? `[Root] Session ${sessionId}`
-  const verificationGateStatus = digestRow?.verification_state ?? "in_progress_or_unverified"
 
   // 1. Intent Pivots
   const pivots = db
@@ -1396,11 +1561,15 @@ export function buildCompactionContinuationPacket(
     .all(sessionId) as SkillLoadLedgerRow[]
   const packetSkills = selectSkillsForPacket(allSkills)
 
-  const allFiles = db
+  const allFilesRaw = db
     .query(
       "SELECT session_id, path, line_range, start_line, end_line, total_lines, is_truncated, read_blob_sha, read_seq, disk_blob_sha, staleness_status FROM file_read_ledger WHERE session_id = ? ORDER BY read_seq ASC, path ASC",
     )
     .all(sessionId) as FileReadLedgerRow[]
+  const allFiles = allFilesRaw.map((f) => ({
+    ...f,
+    line_range: sanitizeLineRange(f.line_range, f.total_lines, f.end_line),
+  }))
   const packetFiles = selectFilesForPacket(allFiles)
   const staleFiles = allFiles.filter((f) => !isFreshOrSliceStatus(f.staleness_status))
   const freshFiles = packetFiles.filter((f) => isFreshOrSliceStatus(f.staleness_status))
@@ -1440,13 +1609,32 @@ export function buildCompactionContinuationPacket(
 
   // 4. Provenance Chains
   const provenanceChains = db
-    .query("SELECT * FROM provenance_chain WHERE root_session_id = ? ORDER BY chain_id ASC")
-    .all(sessionId) as ProvenanceChainRow[]
+    .query(
+      "SELECT * FROM provenance_chain WHERE root_session_id = ? OR session_id = ? ORDER BY chain_id ASC",
+    )
+    .all(sessionId, sessionId) as ProvenanceChainRow[]
   const staleChains = provenanceChains.filter(
     (c) =>
       c.staleness_status === "verified_stale_by_later_touch" ||
+      c.staleness_status === "STALE_BY_LATER_TOUCH" ||
       c.staleness_status === "STALE (modified since read/review — re-verify slice)",
   )
+
+  const stalePathsList = [
+    ...new Set([
+      ...staleChains.map((c) => c.target_path),
+      ...staleFiles.map((f) => f.path),
+    ]),
+  ]
+
+  const verificationGateStatus =
+    staleChains.length > 0
+      ? "verified_stale_by_later_touch"
+      : (digestRow?.verification_state ??
+        (provenanceChains.length > 0 && staleFiles.length === 0
+          ? "verified_passed"
+          : "in_progress_or_unverified"))
+  const formattedGateLabel = formatVerificationGateLabel(verificationGateStatus, stalePathsList)
 
   // 5. Compact Top-Centrality RepoMap & Co-Change Alerts
   const topCodeFiles = db
@@ -1477,7 +1665,7 @@ export function buildCompactionContinuationPacket(
   }[]
 
   const lines: string[] = []
-  const headlineAndGateLine = `**Headline:** ${headline} | **Gate:** \`${verificationGateStatus}\` | **Session:** \`${sessionId}\``
+  const headlineAndGateLine = `**Headline:** ${headline} | **Gate:** \`${formattedGateLabel}\` | **Session:** \`${sessionId}\``
   lines.push(
     `## Substrate Continuity · Headline & Gate · \`${sessionId}\` (seq=${compactionSeq}, ${compactionReason}, ${compactionTokensInput} tok_in)`,
   )
@@ -1661,15 +1849,23 @@ export function buildCompactionContinuationPacket(
 export function renderProvenanceReport(
   db: Database,
   sessionId?: string,
-  options?: {
-    readonly canonicalRoot?: string
-    readonly hookContext?: SubstrateHookContext
-    readonly currentDiskHashes?: ReadonlyMap<string, string> | Record<string, string>
-  },
+  optionsOrCanonicalRoot?:
+    | string
+    | {
+        readonly canonicalRoot?: string
+        readonly hookContext?: SubstrateHookContext
+        readonly currentDiskHashes?: ReadonlyMap<string, string> | Record<string, string>
+      },
 ): string {
   ensureContinuitySchema(db)
+  const options =
+    typeof optionsOrCanonicalRoot === "string"
+      ? { canonicalRoot: optionsOrCanonicalRoot }
+      : optionsOrCanonicalRoot
   const resolved = resolveDefaultSessionId(db, sessionId, options?.hookContext)
   const targetSessionId = resolved.sessionId
+
+  cleanupProvenanceChainsForSession(db, targetSessionId)
 
   if (options?.canonicalRoot || options?.currentDiskHashes) {
     reconcileProvenanceStaleness(db, {
@@ -1680,22 +1876,57 @@ export function renderProvenanceReport(
   }
 
   const chains = db
-    .query("SELECT * FROM provenance_chain WHERE root_session_id = ? ORDER BY chain_id ASC")
-    .all(targetSessionId) as ProvenanceChainRow[]
-  const files = db
+    .query(
+      "SELECT * FROM provenance_chain WHERE root_session_id = ? OR session_id = ? ORDER BY chain_id ASC",
+    )
+    .all(targetSessionId, targetSessionId) as ProvenanceChainRow[]
+  const filesRaw = db
     .query("SELECT * FROM file_read_ledger WHERE session_id = ? ORDER BY read_seq ASC, path ASC")
     .all(targetSessionId) as FileReadLedgerRow[]
+  const files = filesRaw.map((f) => ({
+    ...f,
+    line_range: sanitizeLineRange(f.line_range, f.total_lines, f.end_line),
+  }))
   const freshFiles = files.filter((f) => isFreshOrSliceStatus(f.staleness_status))
   const sliceFiles = files.filter((f) => isSliceStatus(f.staleness_status))
+  const fullFreshFiles = freshFiles.filter((f) => !isSliceStatus(f.staleness_status))
   const staleFiles = files.filter((f) => !isFreshOrSliceStatus(f.staleness_status))
+
+  const digestRow = db
+    .query("SELECT verification_state FROM session_semantic_digest WHERE session_id = ? LIMIT 1")
+    .get(targetSessionId) as { verification_state: string } | null
+  const staleChainPaths = chains
+    .filter(
+      (c) =>
+        c.staleness_status === "verified_stale_by_later_touch" ||
+        c.staleness_status === "STALE_BY_LATER_TOUCH" ||
+        c.staleness_status.startsWith("STALE"),
+    )
+    .map((c) => c.target_path)
+  const stalePathsList = [...new Set([...staleChainPaths, ...staleFiles.map((f) => f.path)])]
+  const rawGateState =
+    staleChainPaths.length > 0
+      ? "verified_stale_by_later_touch"
+      : (digestRow?.verification_state ??
+        (chains.length > 0 && staleFiles.length === 0 ? "verified_passed" : "unverified"))
+  const gateLabel = formatVerificationGateLabel(rawGateState, stalePathsList)
 
   const lines = [
     `## Provenance & Staleness Ledger · \`${targetSessionId}\``,
+    `**Gate:** \`${gateLabel}\``,
     ...chains.map((c) => {
       const expectedSha = c.repair_blob_sha || c.read_or_review_blob_sha || c.disk_blob_sha
       return `- \`${c.chain_id}\` (\`${c.finding_id}\`) -> \`${c.target_path}\` (\`${shortBlobRef(expectedSha)}\` vs \`${shortBlobRef(c.disk_blob_sha)}\`) | **${formatProvenanceStatusLabel(c.staleness_status)}** [${c.staleness_status}]`
     }),
     `- Files tracked: ${files.length} (${freshFiles.length} FRESH [${sliceFiles.length} SLICE], ${staleFiles.length} STALE)`,
+    ...(fullFreshFiles.length > 0
+      ? [
+          `  - **FRESH — DO NOT REREAD:** ${fullFreshFiles
+            .slice(0, 14)
+            .map((f) => `\`${f.path}#${f.line_range}\`(${f.read_blob_sha.slice(0, 6)})`)
+            .join(", ")}`,
+        ]
+      : []),
     ...sliceFiles.map(
       (sl) =>
         `  - **${sl.staleness_status}:** \`${sl.path}#${sl.line_range}\` (slice=\`${shortBlobRef(sl.read_blob_sha)}\`, disk=\`${shortBlobRef(sl.disk_blob_sha)}\`)`,
@@ -1708,6 +1939,8 @@ export function renderProvenanceReport(
 
   return lines.join("\n")
 }
+
+export const renderProvenanceViewport = renderProvenanceReport
 
 export function recordCompactionSummaryHash(
   db: Database,

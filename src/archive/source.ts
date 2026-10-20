@@ -16,6 +16,10 @@ export interface SessionSource {
   children(id: string): SessionRow[]
   messages(sessionID: string, afterSeq?: number): MessageRow[]
   kvState?(sessionIDs: readonly string[], sinceTimeUpdated?: number): KvState
+  readonly listProjectRootSessions?: (projectId: string, limit?: number) => readonly SessionRow[]
+  readonly listAllRootSessions?: (limit?: number) => readonly SessionRow[]
+  readonly listProjects?: () => readonly ProjectRow[]
+  readonly listAllProjects?: () => readonly ProjectRow[]
 }
 
 const REQUIRED_COLUMNS: Record<string, readonly string[]> = {
@@ -344,6 +348,24 @@ export function sqliteSource(dbPath: string): SessionSource & { close(): void } 
     },
     kvState(sessionIDs, sinceTimeUpdated = 0) {
       return ingestHostKv(db, sessionIDs, sinceTimeUpdated)
+    },
+    listProjectRootSessions(projectId, limit = 2000) {
+      return db
+        .query("SELECT * FROM session_v2 WHERE project_id = ? AND parent_id IS NULL ORDER BY time_updated DESC, id ASC LIMIT ?")
+        .all(projectId, limit)
+        .map((row) => toSessionRow(row as Record<string, unknown>))
+    },
+    listAllRootSessions(limit = 2000) {
+      return db
+        .query("SELECT * FROM session_v2 WHERE parent_id IS NULL ORDER BY time_updated DESC, id ASC LIMIT ?")
+        .all(limit)
+        .map((row) => toSessionRow(row as Record<string, unknown>))
+    },
+    listProjects() {
+      return db.query("SELECT id, worktree FROM project ORDER BY id ASC").all() as ProjectRow[]
+    },
+    listAllProjects() {
+      return db.query("SELECT id, worktree FROM project ORDER BY id ASC").all() as ProjectRow[]
     },
     close() {
       db.close()

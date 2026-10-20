@@ -11,6 +11,28 @@ export interface SubstrateThemeColors {
   readonly success?: any
   readonly error?: any
   readonly border?: any
+  readonly raisedBg?: any
+  readonly raisedHighBg?: any
+  readonly focusBg?: any
+}
+
+export const EMPTY_BORDER_CHARS = {
+  topLeft: "",
+  bottomLeft: "",
+  vertical: "",
+  topRight: "",
+  bottomRight: "",
+  horizontal: " ",
+  bottomT: "",
+  topT: "",
+  cross: "",
+  leftT: "",
+  rightT: "",
+}
+
+export const SPLIT_BORDER_CHARS = {
+  ...EMPTY_BORDER_CHARS,
+  vertical: "┃",
 }
 
 export function resolveSubstrateColors(context?: Pick<Plugin.Context, "theme">): SubstrateThemeColors {
@@ -23,6 +45,9 @@ export function resolveSubstrateColors(context?: Pick<Plugin.Context, "theme">):
     success: t?.text?.feedback?.success?.base ?? "#22c55e",
     error: t?.text?.feedback?.error?.base ?? "#ef4444",
     border: t?.border?.base ?? "#475569",
+    raisedBg: t?.background?.raised?.base ?? "#111827",
+    raisedHighBg: t?.background?.raised?.high ?? "#1e293b",
+    focusBg: t?.background?.action?.primary?.focused ?? "#1e3a5f",
   }
 }
 
@@ -36,16 +61,12 @@ export interface SubstrateStatusProps {
 export function SubstrateStatusPill(props: SubstrateStatusProps) {
   const colors = createMemo(() => resolveSubstrateColors(props.context))
 
-  const summaryText = createMemo(() => {
-    if (props.error?.()) return "Substrate: offline"
+  const gateShort = createMemo(() => {
     const snap = props.snapshot()
-    if (!snap) return props.loading?.() ? "Substrate: syncing…" : "Substrate: idle"
+    if (!snap) return "IDLE"
     const c = snap.counts
-    const saved = snap.latestValuation?.savedTokens ?? 0
-    const staleTag =
-      c.staleFiles > 0 || c.staleChains > 0 ? ` · ${c.staleFiles + c.staleChains} STALE` : ""
-    const savedTag = saved > 0 ? ` · -${saved}t` : ""
-    return `Substrate ${c.freshFiles}F/${c.sliceFiles}S${staleTag}${savedTag}`
+    if (c.staleFiles > 0 || c.staleChains > 0) return "NEEDS RE-VERIFY"
+    return snap.gateLabel?.split(" (")[0] ?? "UNVERIFIED"
   })
 
   const statusColor = createMemo(() => {
@@ -54,18 +75,47 @@ export function SubstrateStatusPill(props: SubstrateStatusProps) {
     const snap = props.snapshot()
     if (!snap) return c.textMuted
     if (snap.counts.staleFiles > 0 || snap.counts.staleChains > 0) return c.warning
-    return c.success
+    return snap.gateLabel?.startsWith("PASS") ? c.success : c.textMuted
+  })
+
+  const fallbackText = createMemo(() => {
+    if (props.error?.()) return "Substrate: offline"
+    return props.loading?.() ? "Substrate: syncing…" : "Substrate: idle"
   })
 
   return (
-    <box flexDirection="row" gap={1}>
-      <text fg={statusColor()}>●</text>
+    <box flexDirection="row" gap={1} flexShrink={1} minWidth={0}>
+      <text fg={statusColor()} flexShrink={0} wrapMode="none">
+        ●
+      </text>
       <Show
         when={props.snapshot()}
-        fallback={<text fg={colors().textMuted}>{summaryText()}</text>}
+        fallback={
+          <text fg={colors().textMuted} wrapMode="none">
+            {fallbackText()}
+          </text>
+        }
       >
-        <text fg={colors().textBase}>{summaryText()}</text>
+        {(snap) => {
+          const c = () => snap().counts
+          const mudballCount = () => snap().mudballHotspots?.length ?? 0
+          const compressionPct = () => snap().tokenEconomics?.compressionPct ?? 0
+          const prunedTokens = () =>
+            snap().tokenEconomics?.valveSavedTokens ?? snap().latestValuation?.savedTokens ?? 0
+          return (
+            <text fg={colors().textMuted} wrapMode="none" flexShrink={1} minWidth={0}>
+              <span style={{ fg: colors().textBase }}>
+                <b>Substrate</b>
+              </span>
+              {" · "}
+              <span style={{ fg: statusColor() }}>{`Gate: ${gateShort()}`}</span>
+              {` · Files: ${c().freshFiles}F ${c().sliceFiles}P ${c().staleFiles}S · Mudball alerts: ${mudballCount()} · AST est.: ${compressionPct()}% smaller · Pruned: ${prunedTokens()} tok`}
+            </text>
+          )
+        }}
       </Show>
     </box>
   )
 }
+
+export const SubstrateFooterStatus = SubstrateStatusPill

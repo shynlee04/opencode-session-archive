@@ -629,6 +629,234 @@ describe("TWM-05: applyContextHookInMemory automatic activation & < 2.0 ms laten
     expect(statusView.manifestMarkdown).toContain("Do NOT re-read L1-L2; read offset=3")
     expect(statusView.manifestMarkdown).toContain("src/utils.ts")
     expect(statusView.manifestMarkdown).toContain("FRESH — DO NOT REREAD")
+    expect(statusView.manifestMarkdown).not.toContain("#all")
+  })
+
+  test("TWM-R4 (A1, S1-2, S3-3, S3-4, E-6): recordToolExecuteAfter updates armed ledger on write/edit, syncFromSqlite reconciles SQLite ledgers, eliminates #all, and renderCompactValveStatus stays < 250 tokens on 25-file session", async () => {
+    const { writeFileSync } = await import("node:fs")
+    const { Database } = await import("bun:sqlite")
+    const { DDL } = await import("../src/archive/index-db.ts")
+    const valveMod = (await import("../src/archive/valve.ts")) as Record<string, unknown>
+    const renderCompactValveStatus = valveMod.renderCompactValveStatus as (
+      statusResult: unknown,
+      pruneResult?: unknown,
+    ) => string
+    const estimateTokens = valveMod.estimateTokens as (text: string) => number
+
+    expect(typeof renderCompactValveStatus).toBe("function")
+
+    const tmp = mkdtempSync(join(tmpdir(), "twm-r4-valve-"))
+    try {
+      const targetFile = join(tmp, "src_target.ts")
+      writeFileSync(targetFile, "export const A = 1\nexport const B = 2\n", "utf8")
+
+      const valve = new WorkingSetValve({ persistBlobsToDisk: false, canonicalRoot: tmp })
+
+      // 1. Arm the valve with an initial read of src_target.ts (2 lines)
+      const messages = [
+        { id: "u0", type: "user", content: [{ type: "text", text: "edit src_target.ts" }] },
+        {
+          id: "a1",
+          type: "assistant",
+          content: [
+            {
+              type: "tool",
+              id: "call_r1",
+              name: "read",
+              state: {
+                status: "completed",
+                input: { path: "src_target.ts" },
+                content: [
+                  {
+                    type: "text",
+                    text: "Read file src_target.ts, lines 1-2 (of 2)\n1: export const A = 1\n2: export const B = 2\n",
+                  },
+                ],
+              },
+            },
+          ],
+        },
+        { id: "a2", type: "assistant", content: [{ type: "text", text: "planning edit" }] },
+      ]
+
+      valve.armValve({
+        sessionID: "ses_armed_r4",
+        mode: "step-window",
+        keepRecentSteps: 1,
+        messages,
+      })
+
+      // Verify initial armed state has 0 filesModified and L1-L2 (never #all)
+      const beforeStatus = valve.status("ses_armed_r4")
+      expect(beforeStatus.ledger?.manifest.filesModified).toHaveLength(0)
+      expect(beforeStatus.manifestMarkdown).not.toContain("#all")
+
+      // 2. Write a 4-line update to disk and trigger recordToolExecuteAfter on the ALREADY-ARMED session
+      const newDiskContent = "export const A = 10\nexport const B = 20\nexport const C = 30\nexport const D = 40\n"
+      writeFileSync(targetFile, newDiskContent, "utf8")
+
+      const recordToolExecuteAfter = (valve as unknown as Record<string, unknown>).recordToolExecuteAfter as (params: {
+        readonly sessionID: string
+        readonly tool: string
+        readonly callId?: string
+        readonly input?: Record<string, unknown>
+        readonly outputText?: string
+        readonly canonicalRoot?: string
+      }) => void
+      expect(typeof recordToolExecuteAfter).toBe("function")
+
+      recordToolExecuteAfter.call(valve, {
+        sessionID: "ses_armed_r4",
+        tool: "write",
+        callId: "call_w1",
+        input: { filePath: "src_target.ts", content: newDiskContent },
+        outputText: "Wrote src_target.ts",
+        canonicalRoot: tmp,
+      })
+
+      const afterStatus = valve.status("ses_armed_r4")
+      expect(afterStatus.ledger?.manifest.filesModified).toHaveLength(1)
+      expect(afterStatus.ledger?.manifest.filesModified[0]?.normalizedPath).toBe("src_target.ts")
+      const updatedRead = afterStatus.ledger?.manifest.filesRead.find((f) => f.normalizedPath === "src_target.ts")
+      expect(updatedRead?.lineRange).toBe("L1-L4")
+      expect(updatedRead?.status).toBe("FRESH — DO NOT REREAD")
+      expect(afterStatus.manifestMarkdown).toContain("src_target.ts#L1-L4")
+      expect(afterStatus.manifestMarkdown).not.toContain("#all")
+
+      // Compact status when all tracked files are FRESH
+      const allFreshCompact = renderCompactValveStatus(afterStatus)
+      expect(allFreshCompact).toContain("One-Truth File Ledger: Total tracked: 1 (1 FRESH, 0 SLICE, 0 STALE) | Modified: 1 | Skills: 0 | Delegations: 0")
+      expect(allFreshCompact).toContain("All 1 tracked files are FRESH on disk (pass full: true to list all rows).")
+      expect(estimateTokens(allFreshCompact)).toBeLessThan(250)
+
+      // 3. Verify 25-file session with mix of FRESH, SLICE, and STALE stays strictly < 250 tokens (< 1,000 chars)
+      const manyMessages: Record<string, any>[] = [
+        { id: "u_many", type: "user", content: [{ type: "text", text: "inspect 25 files" }] },
+      ]
+      const diskHashes = new Map<string, string>()
+      for (let i = 1; i <= 25; i++) {
+        const p = `src/module_${i}.ts`
+        const body = `export const M${i} = ${i}\nexport const N${i} = ${i * 2}\n`
+        const isSlice = i > 20 && i <= 23
+        const isStale = i > 23
+        if (isStale) {
+          diskHashes.set(p, "f".repeat(64))
+        }
+        manyMessages.push({
+          id: `a_many_${i}`,
+          type: "assistant",
+          content: [
+            {
+              type: "tool",
+              id: `call_many_${i}`,
+              name: "read",
+              state: {
+                status: "completed",
+                input: isSlice ? { path: p, offset: 1, limit: 1 } : { path: p },
+                content: [
+                  {
+                    type: "text",
+                    text: isSlice
+                      ? `Read file ${p}, lines 1-1\n1: export const M${i} = ${i}\n[Output truncated. Continue reading with offset: 2]`
+                      : body,
+                  },
+                ],
+              },
+            },
+          ],
+        })
+      }
+
+      const pruneMany = valve.prune({
+        sessionID: "ses_25_files",
+        mode: "step-window",
+        keepRecentSteps: 2,
+        messages: manyMessages,
+        diskHashesByPath: diskHashes,
+      })
+      const statusMany = valve.status("ses_25_files")
+      expect(statusMany.manifestMarkdown).not.toContain("#all")
+
+      const compactMany = renderCompactValveStatus(statusMany, pruneMany)
+      expect(compactMany).toContain(
+        "One-Truth File Ledger: Total tracked: 25 (20 FRESH, 3 SLICE, 2 STALE) | Modified: 0 | Skills: 0 | Delegations: 0",
+      )
+      expect(compactMany.length).toBeLessThan(1000)
+      expect(estimateTokens(compactMany)).toBeLessThan(250)
+
+      // 4. Verify syncFromSqlite reconciles SQLite file_read_ledger and file_touch rows into valve
+      const db = new Database(":memory:")
+      try {
+        db.exec(DDL)
+        const targetSha = sha256hex(newDiskContent.replace(/\n$/, ""))
+        db.prepare(`
+          INSERT INTO file_read_ledger (
+            session_id, path, normalized_path, call_id, message_id, seq, read_seq,
+            line_range, start_line, end_line, total_lines, is_truncated,
+            chars, char_len, blob_sha, blob_sha256, slice_sha, read_blob_sha, disk_blob_sha,
+            summary, staleness_status, t, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          "ses_sqlite_sync",
+          "src_target.ts",
+          "src_target.ts",
+          "call_sql_r1",
+          "msg_sql_1",
+          1,
+          1,
+          "all",
+          1,
+          4,
+          4,
+          0,
+          newDiskContent.length,
+          newDiskContent.length,
+          targetSha,
+          targetSha,
+          targetSha,
+          targetSha,
+          targetSha,
+          "exports: A, B, C, D",
+          "FRESH — DO NOT REREAD",
+          1000,
+          new Date(1000).toISOString(),
+        )
+        db.prepare(`
+          INSERT INTO file_touch (
+            session_id, seq, call_id, tool, op, path, normalized_path, detail, t
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          "ses_sqlite_sync",
+          2,
+          "call_sql_w1",
+          "write",
+          "write",
+          "src_target.ts",
+          "src_target.ts",
+          null,
+          2000,
+        )
+
+        const syncFromSqlite = (valve as unknown as Record<string, unknown>).syncFromSqlite as (
+          sessionID: string,
+          db: InstanceType<typeof Database>,
+          canonicalRoot?: string,
+        ) => void
+        expect(typeof syncFromSqlite).toBe("function")
+        syncFromSqlite.call(valve, "ses_sqlite_sync", db, tmp)
+
+        const syncedStatus = valve.status("ses_sqlite_sync")
+        expect(syncedStatus.manifestMarkdown).toContain("src_target.ts#L1-L4")
+        expect(syncedStatus.manifestMarkdown).not.toContain("#all")
+        const syncedCompact = renderCompactValveStatus(syncedStatus)
+        expect(syncedCompact).toContain("Total tracked: 1 (1 FRESH, 0 SLICE, 0 STALE) | Modified: 1")
+      } finally {
+        db.close()
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
   })
 })
+
 

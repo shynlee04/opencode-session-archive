@@ -454,4 +454,133 @@ describe("plugin shell & VSC-04 / VSC-R2 unified surface (REQ-SUB-17, A1..A4)", 
     expect(distText).toContain("WorkingSetValve")
     expect(distText).toContain("buildJitReadSkeletonFooter")
   })
+
+  test("VSC-R4: plugin.id is hivemind-substrate, compaction action preview, normalized JSON envelope, canonical telemetry, compact valve < 250 tokens, and cross-project structural resolution", async () => {
+    expect((plugin as { id?: string }).id).toBe("hivemind-substrate")
+
+    const projectRoot = makeTmpDir()
+    mkdirSync(path.join(projectRoot, "src"), { recursive: true })
+    writeFileSync(
+      path.join(projectRoot, "src", "sample.ts"),
+      "export function computeAlpha(x: number): number {\n  return x + 42\n}\n",
+      "utf8",
+    )
+
+    // Create a second independent cross-project workspace on disk
+    const externalRoot = makeTmpDir()
+    mkdirSync(path.join(externalRoot, "src"), { recursive: true })
+    writeFileSync(
+      path.join(externalRoot, "package.json"),
+      JSON.stringify({ name: "external-pkg" }),
+      "utf8",
+    )
+    const externalFile = path.join(externalRoot, "src", "foreign.ts")
+    writeFileSync(
+      externalFile,
+      "export function foreignHelper(label: string): string {\n  return `foreign:${label}`\n}\n",
+      "utf8",
+    )
+
+    const { findTool } = await setup({ dbPath: seedDb(projectRoot) }, projectRoot)
+    const viewport = findTool("substrate.viewport")
+    const valveTool = findTool("substrate.valve")
+
+    // 1. E-2: Dedicated action: "compaction" preview
+    const compactionRes = await viewport.execute(
+      { action: "compaction", format: "json" },
+      toolContext("ses_root"),
+    )
+    const compactionJson = JSON.parse(String(compactionRes.content))
+    expect(compactionJson.ok).toBe(true)
+    expect(compactionJson.action).toBe("compaction")
+    expect(compactionJson.sessionID).toBe("ses_root")
+    expect(typeof compactionJson.tokenCount).toBe("number")
+    expect(compactionJson.budgetTokens).toBe(1200)
+    expect(String(compactionJson.content)).toContain("Headline & Gate")
+    expect(String(compactionJson.content)).toContain("Working-Memory Manifest")
+    // E-7: data must not duplicate content
+    expect(compactionJson.data?.content).toBeUndefined()
+    expect(compactionJson.data?.markdown).toBeUndefined()
+
+    // 2. E-4: Canonical telemetry action names for aliases (find -> search, persist -> sync, valve -> prune)
+    const findRes = await viewport.execute(
+      { action: "find", query: "Wave 2 slice 1" },
+      toolContext("ses_root"),
+    )
+    expect(String(findRes.content)).toContain("[substrate.telemetry action=search")
+
+    const persistRes = await viewport.execute(
+      { action: "persist", scope: "project" },
+      toolContext("ses_root"),
+    )
+    expect(String(persistRes.content)).toContain("[substrate.telemetry action=sync")
+
+    // 3. E-7 & E-8: brief with format: "json" has normalized envelope without duplicate token keys in data
+    const briefJsonRes = await viewport.execute(
+      {
+        action: "brief",
+        targetPaths: ["src/sample.ts"],
+        symbolNames: ["computeAlpha"],
+        maxTokens: 800,
+        format: "json",
+      },
+      toolContext("ses_root"),
+    )
+    const briefJson = JSON.parse(String(briefJsonRes.content))
+    expect(briefJson.ok).toBe(true)
+    expect(briefJson.action).toBe("brief")
+    expect(typeof briefJson.tokenCount).toBe("number")
+    expect(briefJson.budgetTokens).toBe(800)
+    expect(briefJson.data?.tokenEstimate).toBeUndefined()
+    expect(briefJson.data?.estimatedTokens).toBeUndefined()
+    expect(briefJson.data?.markdown).toBeUndefined()
+    expect(briefJson.data?.content).toBeUndefined()
+
+    // 4. S3-1 & S3-3: substrate.valve syncs with index.sqlite and emits < 250 tokens by default
+    const valveStatusRes = await valveTool.execute(
+      { action: "status" },
+      toolContext("ses_root"),
+    )
+    const valveStatusText = String(valveStatusRes.content)
+    const estimatedValveTokens = Math.ceil(valveStatusText.length / 4)
+    expect(estimatedValveTokens).toBeLessThan(250)
+    expect(valveStatusText).toContain("src/sample.ts")
+
+    const valvePruneRes = await valveTool.execute(
+      { action: "prune" },
+      toolContext("ses_root"),
+    )
+    expect(String(valvePruneRes.content)).toContain("[substrate.telemetry action=prune")
+    expect(Math.ceil(String(valvePruneRes.content).length / 4)).toBeLessThan(250)
+
+    // 5. S2-1, S2-2, S2-3: Cross-project structural resolution for skeleton, slice, repomap, brief
+    const crossSkelRes = await viewport.execute(
+      { action: "skeleton", path: externalFile },
+      toolContext("ses_root"),
+    )
+    expect(String(crossSkelRes.content)).toContain("foreignHelper")
+
+    const crossSliceRes = await viewport.execute(
+      { action: "slice", path: externalFile, symbol: "foreignHelper" },
+      toolContext("ses_root"),
+    )
+    expect(String(crossSliceRes.content)).toContain("return `foreign:${label}`")
+
+    const crossRepomapRes = await viewport.execute(
+      { action: "repomap", path: externalRoot },
+      toolContext("ses_root"),
+    )
+    expect(String(crossRepomapRes.content)).toContain("src/foreign.ts")
+
+    const crossBriefRes = await viewport.execute(
+      {
+        action: "brief",
+        targetPaths: [externalFile],
+        symbolNames: ["foreignHelper"],
+        maxTokens: 600,
+      },
+      toolContext("ses_root"),
+    )
+    expect(String(crossBriefRes.content)).toContain("foreignHelper")
+  })
 })

@@ -325,8 +325,8 @@ describe("VSC-R3: Portable RPC Contract, Native OpenTUI Solid Surface & CLI", ()
       const frame1 = screen.captureCharFrame()
       expect(frame1).toContain("Hivemind Substrate Inspector")
       expect(frame1).toContain(TEST_SESSION_ID)
-      expect(frame1).toContain("2 FRESH (1 SLICE)")
-      expect(frame1).toContain("Substrate 2F/1S")
+      expect(frame1).toContain("1 FRESH · 1 SLICE")
+      expect(frame1).toContain("Files: 1F 1P 0S")
 
       await screen.mockInput.pressKey("2")
       await new Promise((resolve) => setTimeout(resolve, 20))
@@ -363,7 +363,7 @@ describe("VSC-R3: Portable RPC Contract, Native OpenTUI Solid Surface & CLI", ()
     }
     expect(parsedStatus.ok).toBe(true)
     expect(parsedStatus.snapshot.resolvedSessionID).toBe(TEST_SESSION_ID)
-    expect(parsedStatus.snapshot.counts.freshFiles).toBe(2)
+    expect(parsedStatus.snapshot.counts.freshFiles).toBe(1)
     expect(parsedStatus.snapshot.counts.sliceFiles).toBe(1)
 
     const repomapRes = await runSubstrateCli(["repomap"], {

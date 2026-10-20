@@ -6,6 +6,7 @@ import {
   normalizeRepoPath as normalizeRepoPathPrimitive,
   sha256Hex,
 } from "../archive/primitives.ts"
+import { formatVerificationGateLabel } from "./continuity.ts"
 
 export const INTENT_PIVOT_KINDS = [
   "initial_goal",
@@ -32,6 +33,7 @@ export type VerificationState =
 export interface ClassifyIntentPivotContext {
   readonly indexInSession?: number
   readonly isFirstPrompt?: boolean
+  readonly isFirstUserPrompt?: boolean
   readonly afterCompaction?: boolean
   readonly lastCompactionSeq?: number | null
   readonly prevPromptSeq?: number | null
@@ -91,6 +93,8 @@ export interface BuildIndexOptions {
 export interface VibeNavigationOptions {
   readonly query?: string
   readonly sessionID?: string
+  readonly rootSessionID?: string
+  readonly activeRootSessionID?: string
   readonly limit?: number
   readonly maxTokens?: number
   readonly maxTokensBudget?: number
@@ -271,9 +275,13 @@ const PIVOT_RULES: readonly { readonly kind: IntentPivotKind; readonly test: (no
   {
     kind: "prune_or_continuity",
     test: (norm) =>
-      /\b(prune\s+the\s+context|context[- ]prune|compaction[- ]continuity|context[- ]archive|(persist|perist|export)\s+(this\s+)?(fucking\s+)?(session|sezsion|sessision)|session\s+archive\s+this|archive\.persist|substrate\.valve)\b/i.test(
+      /^(?:please\s+)?(?:run|call|use|trigger|test|check)?\s*(?:substrate\.valve|context[- ]prune|\/compact|\/substrate-prune)\b/i.test(
         norm,
-      ),
+      ) ||
+      (norm.length <= 260 &&
+        /\b(prune\s+the\s+context|context[- ]prune|compaction[- ]continuity|context[- ]archive|(persist|perist|export)\s+(this\s+)?(fucking\s+)?(session|sezsion|sessision)|session\s+archive\s+this|archive\.persist|substrate\.valve)\b/i.test(
+          norm,
+        )),
   },
   {
     kind: "verification_directive",
@@ -646,7 +654,7 @@ function analyzeSessionData(params: {
 
     if (rec.kind === "assistant" && Array.isArray(rec.parts)) {
       for (const part of rec.parts as Record<string, unknown>[]) {
-        if (part.type !== "tool") continue
+        if (part.type !== "tool" && part.kind !== "tool") continue
         const toolName = String(part.name ?? "")
         const input = (part.input ?? {}) as Record<string, unknown>
         const output = typeof part.output === "string" ? part.output : ""
@@ -1195,13 +1203,17 @@ export function buildSemanticDigestIndex(options: BuildIndexOptions): {
 }
 
 export function tokenizeVibeQuery(queryText: string): string[] {
-  const expanded = expandCompoundBoundaryTokens(queryText)
+  const expanded = expandCompoundBoundaryTokens(queryText ?? "")
   const rawTokens = expanded
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .filter((tok) => tok.length > 0 && !STOP_WORDS.has(tok))
-  return [...new Set(rawTokens)]
+  const unique = [...new Set(rawTokens)]
+  const withoutSingleDigits = unique.filter((tok) => !/^\d$/.test(tok))
+  return withoutSingleDigits.length > 0 ? withoutSingleDigits : unique
 }
+
+export const extractFtsTokens = tokenizeVibeQuery
 
 export function resolvePromptBlob(
   db: Database,
@@ -1254,9 +1266,10 @@ export function renderIntentTimeline(
 
   const headline = digest?.headline ?? sessionID
   const verificationState = digest?.verification_state ?? "in_progress_or_unverified"
+  const gateLabel = formatVerificationGateLabel(verificationState)
   const lines = [
     `## Intent Pivot Timeline · \`${sessionID}\` (${pivots.length} pivots)`,
-    `**Headline:** ${headline} | **Gate:** \`${verificationState}\``,
+    `**Headline:** ${headline} | **Gate:** \`${gateLabel}\``,
     ...pivots.map(
       (p) => `- \`seq=${p.seq}\` [${p.pivot_kind}] ${p.prompt_excerpt} (\`${p.blob_ref.slice(0, 17)}\`)`,
     ),
@@ -1335,17 +1348,18 @@ export function queryVibeNavigation(
 ): VibeNavigationResult
 export function queryVibeNavigation(
   db: Database,
-  optionsWithQuery: VibeNavigationOptions & { readonly query: string },
+  optionsWithQuery: VibeNavigationOptions,
 ): VibeNavigationResult
 export function queryVibeNavigation(
   db: Database,
-  queryOrOptions: string | (VibeNavigationOptions & { readonly query: string }),
+  queryOrOptions: string | VibeNavigationOptions,
   maybeOptions: VibeNavigationOptions = {},
 ): VibeNavigationResult {
   const t0Ns = Bun.nanoseconds()
   ensureSemanticDigestSchema(db)
 
-  const queryText = typeof queryOrOptions === "string" ? queryOrOptions : queryOrOptions.query
+  const rawQueryText =
+    typeof queryOrOptions === "string" ? queryOrOptions : (queryOrOptions.query ?? "")
   const options: VibeNavigationOptions =
     typeof queryOrOptions === "string" ? maybeOptions : queryOrOptions
 
@@ -1370,7 +1384,17 @@ export function queryVibeNavigation(
   const totalDigestCount = (totalDigestsStmt.get() as { c: number } | null)?.c ?? 0
   const totalRootSessions = allRootDigests.length > 0 ? allRootDigests.length : totalDigestCount
 
+  const explicitDirectRoot = options.rootSessionID ?? (!rawQueryText.trim() ? options.sessionID : undefined)
+  const directRootDigest = explicitDirectRoot
+    ? (digestStmt.get(explicitDirectRoot) as SessionSemanticDigestRow | null)
+    : null
+  const queryText =
+    rawQueryText.trim().length > 0
+      ? rawQueryText
+      : (directRootDigest?.headline ?? explicitDirectRoot ?? "")
+
   const tokens = tokenizeVibeQuery(queryText)
+  const substantiveTokens = tokens.filter((t) => !/^\d+$/.test(t))
   const queryTokenCount = Math.max(1, tokens.length)
   const ftsQuery = tokens.map((t) => `"${t}"*`).join(" OR ")
 
@@ -1450,18 +1474,37 @@ export function queryVibeNavigation(
   for (const [rootId, st] of rootStats.entries()) {
     const matchedTokenCount = st.matchedTokens.size
     if (matchedTokenCount === 0) continue
+    if (
+      substantiveTokens.length > 0 &&
+      ![...st.matchedTokens].some((tok) => !/^\d+$/.test(tok))
+    ) {
+      continue
+    }
     const tokenCoverage = Number((matchedTokenCount / queryTokenCount).toFixed(4))
+    const activeBoost =
+      options.activeRootSessionID && rootId === options.activeRootSessionID ? 2.5 : 0
     const total =
       matchedTokenCount * 30 +
       st.bestSingleRowMatchCount * 20 +
       st.bestRowKindWeight * 5 +
-      st.bm25Sum
+      st.bm25Sum +
+      activeBoost
     scoredRoots.push({
       rootId,
       score: Number(total.toFixed(2)),
       bestBm25: Number(st.bestBm25.toFixed(2)),
       matchedTokenCount,
       tokenCoverage,
+    })
+  }
+
+  if (scoredRoots.length === 0 && directRootDigest && rawQueryText.trim().length === 0) {
+    scoredRoots.push({
+      rootId: directRootDigest.session_id,
+      score: 100,
+      bestBm25: 1.0,
+      matchedTokenCount: queryTokenCount,
+      tokenCoverage: 1.0,
     })
   }
 
@@ -1563,6 +1606,7 @@ export function queryVibeNavigation(
   const bestMatchedTokens = primaryHit.matchedTokenCount
   const bestCoverage = primaryHit.tokenCoverage
   const rootDigest = digestStmt.get(bestRootId) as SessionSemanticDigestRow
+  const formattedGate = formatVerificationGateLabel(rootDigest.verification_state)
 
   const pivots = pivotsStmt.all(bestRootId, maxPivots) as {
     seq: number
@@ -1649,7 +1693,7 @@ export function queryVibeNavigation(
     const mdLines: string[] = [
       `## Vibe Navigation Digest · \`${bestRootId}\``,
       `_Indexed root sessions: ${totalRootSessions} | Matched: ${candidates.length} | Query tokens: [${tokens.join(", ")}] (${elapsedMs.toFixed(2)} ms)_`,
-      `**Headline:** ${rootDigest.headline} | **Gate:** \`${rootDigest.verification_state}\``,
+      `**Headline:** ${rootDigest.headline} | **Gate:** \`${formattedGate}\``,
       `- **Score:** coverage=${primaryHit.matchedTokenCount}/${primaryHit.queryTokenCount} (${Math.round(primaryHit.tokenCoverage * 100)}%) | bm25=${primaryHit.bestBm25.toFixed(2)} | score=${primaryHit.combinedScore.toFixed(2)} | pivots=${primaryHit.pivotsCount} | delegations=${primaryHit.delegationsCount}`,
       ...(slicedHits.length > 1
         ? [

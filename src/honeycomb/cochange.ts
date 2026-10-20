@@ -7,6 +7,7 @@ export interface GitCommitRecord {
   readonly hash: string
   readonly subject: string
   readonly files: readonly string[]
+  readonly totalRawFilesCount?: number
 }
 
 export interface MineGitCoChangeOptions {
@@ -22,6 +23,7 @@ export interface MineGitCoChangeOptions {
   readonly commitsOverride?: readonly GitCommitRecord[]
   readonly force?: boolean
   readonly forceReapply?: boolean
+  readonly forceRebuild?: boolean
 }
 
 export interface GitCoChangeRow {
@@ -69,6 +71,9 @@ export interface IncrementalCoChangeStats {
 }
 
 export interface QueryCochangeCouplingsOptions {
+  readonly repoRoot?: string
+  readonly projectRoot?: string
+  readonly rootDir?: string
   readonly minProbability?: number
   readonly minCochangeCount?: number
   readonly minCoCommits?: number
@@ -189,10 +194,12 @@ export function parseGitLogOutput(rawOutput: string): GitCommitRecord[] {
     const line = lines[i]!
     if (line.startsWith("COMMIT:")) {
       if (inCommit && currentFiles.length > 0) {
+        const distinctRaw = [...new Set(currentFiles)]
         commits.push({
           hash: currentHash,
           subject: currentSubject,
-          files: currentFiles,
+          files: distinctRaw,
+          totalRawFilesCount: distinctRaw.length,
         })
       }
       const rest = line.slice(7)
@@ -215,10 +222,12 @@ export function parseGitLogOutput(rawOutput: string): GitCommitRecord[] {
   }
 
   if (inCommit && currentFiles.length > 0) {
+    const distinctRaw = [...new Set(currentFiles)]
     commits.push({
       hash: currentHash,
       subject: currentSubject,
-      files: currentFiles,
+      files: distinctRaw,
+      totalRawFilesCount: distinctRaw.length,
     })
   }
 
@@ -304,18 +313,16 @@ function applyIncrementalCommits(
       }
       seenInBatch.add(c.hash)
 
-      const filteredFiles = [
-        ...new Set(
-          c.files
-            .map(normalizeRelPath)
-            .filter((f) => (pathPrefix.length > 0 ? f.startsWith(pathPrefix) : true)),
-        ),
-      ].sort()
+      const rawDistinctFiles = [...new Set(c.files.map(normalizeRelPath).filter(Boolean))]
+      const totalRawFilesCount = c.totalRawFilesCount ?? rawDistinctFiles.length
+      const filteredFiles = rawDistinctFiles
+        .filter((f) => (pathPrefix.length > 0 ? f.startsWith(pathPrefix) : true))
+        .sort()
       if (filteredFiles.length === 0) {
         insertCommit.run(c.hash, c.subject, "[]", now)
         continue
       }
-      if (filteredFiles.length > maxFilesPerCommit) {
+      if (totalRawFilesCount > maxFilesPerCommit || filteredFiles.length > maxFilesPerCommit) {
         commitsSkippedBulk++
         insertCommit.run(c.hash, c.subject, "[]", now)
         continue
@@ -420,7 +427,7 @@ export function mineGitCochange(
   const minCoCommits = options.minCoCommits ?? 1
   const maxRecentSubjects = options.maxRecentSubjects ?? 5
   const range = options.range ?? options.revRange
-  const forceReapply = Boolean(options.force ?? options.forceReapply)
+  let forceReapply = Boolean(options.force ?? options.forceReapply ?? options.forceRebuild)
 
   let commits: readonly GitCommitRecord[]
   let gitSpawnMs = 0
@@ -445,6 +452,22 @@ export function mineGitCochange(
   const existingCommitCount = (
     db.query("SELECT COUNT(*) AS cnt FROM git_cochange_commit").get() as { cnt: number }
   ).cnt
+
+  if (range === undefined && !forceReapply && existingCommitCount > 0) {
+    const checkPolluted = db.query(
+      "SELECT files_json FROM git_cochange_commit WHERE hash = ? LIMIT 1",
+    )
+    for (const c of commits) {
+      const totalRaw = c.totalRawFilesCount ?? c.files.length
+      if (totalRaw > maxFilesPerCommit) {
+        const row = checkPolluted.get(c.hash) as { files_json: string } | null
+        if (row && row.files_json !== "[]") {
+          forceReapply = true
+          break
+        }
+      }
+    }
+  }
 
   // If range is provided, or if DB already has commits and we are not overriding with synthetic commits,
   // apply incrementally with commit-SHA deduplication.
@@ -509,15 +532,10 @@ export function mineGitCochange(
     }
     seenHashes.add(commit.hash)
 
-    const filteredFiles = [
-      ...new Set(
-        commit.files
-          .map(normalizeRelPath)
-          .filter((f) => (pathPrefix.length > 0 ? f.startsWith(pathPrefix) : true)),
-      ),
-    ].sort()
-
-    if (filteredFiles.length === 0) {
+    const rawDistinctFiles = [...new Set(commit.files.map(normalizeRelPath))]
+    const totalRawFilesCount = commit.totalRawFilesCount ?? rawDistinctFiles.length
+    if (totalRawFilesCount > maxFilesPerCommit) {
+      commitsSkippedBulk++
       scannedCommitRows.push({
         hash: commit.hash,
         subject: commit.subject,
@@ -525,8 +543,12 @@ export function mineGitCochange(
       })
       continue
     }
-    if (filteredFiles.length > maxFilesPerCommit) {
-      commitsSkippedBulk++
+
+    const filteredFiles = rawDistinctFiles
+      .filter((f) => (pathPrefix.length > 0 ? f.startsWith(pathPrefix) : true))
+      .sort()
+
+    if (filteredFiles.length === 0) {
       scannedCommitRows.push({
         hash: commit.hash,
         subject: commit.subject,
@@ -757,6 +779,33 @@ export function updateGitCoChangeIncremental(
   }
 }
 
+function resolveCochangeTargetPath(
+  db: Database,
+  targetPath: string,
+  options: QueryCochangeCouplingsOptions = {},
+): string {
+  const rootDir = options.repoRoot ?? options.projectRoot ?? options.rootDir ?? process.cwd()
+  const normCandidate = normalizeRelPath(normalizeRepoPath(targetPath, rootDir))
+  const direct = db
+    .query("SELECT path FROM git_cochange_file_stats WHERE path = ? LIMIT 1")
+    .get(normCandidate) as { path: string } | null
+  if (direct) return direct.path
+
+  const srcIdx = normCandidate.indexOf("src/")
+  if (srcIdx > 0) {
+    const sub = normCandidate.slice(srcIdx)
+    const subMatch = db
+      .query("SELECT path FROM git_cochange_file_stats WHERE path = ? LIMIT 1")
+      .get(sub) as { path: string } | null
+    if (subMatch) return subMatch.path
+    const pairMatch = db
+      .query("SELECT file_a FROM git_cochange WHERE file_a = ? OR file_b = ? LIMIT 1")
+      .get(sub, sub) as { file_a: string } | null
+    if (pairMatch) return sub
+  }
+  return normCandidate
+}
+
 /**
  * Queries temporal co-change couplings for a target file path and returns CoChangeCouplingRow[].
  */
@@ -766,7 +815,7 @@ export function queryCochangeCouplings(
   options: QueryCochangeCouplingsOptions = {},
 ): CoChangeCouplingRow[] {
   ensureCochangeSchema(db)
-  const normTarget = normalizeRelPath(targetPath)
+  const normTarget = resolveCochangeTargetPath(db, targetPath, options)
   const minCoCommits = options.minCochangeCount ?? options.minCoCommits ?? 2
   const minProbability = options.minProbability ?? 0.3
   const onlyHidden = options.onlyHidden ?? false
@@ -842,13 +891,14 @@ export function queryCoupledFiles(
   options: QueryCoupledOptions = {},
 ): CoupledViewportResult {
   ensureCochangeSchema(db)
-  const normTarget = normalizeRelPath(targetPath)
+  const normTarget = resolveCochangeTargetPath(db, targetPath, options)
   const minCoCommits = options.minCochangeCount ?? options.minCoCommits ?? 2
   const minProbability = options.minProbability ?? 0.2
   const onlyHidden = options.onlyHidden ?? false
   const limit = options.limit ?? 15
 
   const rows = queryCochangeCouplings(db, normTarget, {
+    ...options,
     minCochangeCount: minCoCommits,
     minProbability,
     onlyHidden,

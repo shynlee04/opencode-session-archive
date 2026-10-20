@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -8,6 +8,7 @@ import {
   estimateTokens,
   normalizeRepoPath,
   parseReadToolOutput,
+  resolveTargetWorkspace,
   sha256Hex,
 } from "../src/archive/primitives.ts"
 
@@ -56,7 +57,7 @@ describe("src/archive/primitives", () => {
       expect(capture.endLine).toBe(7)
       expect(capture.isTruncated).toBe(false)
       expect(capture.coverageKind).toBe("full")
-      expect(capture.lineRange).toBe("all")
+      expect(capture.lineRange).toBe("L1-L7")
       expect(capture.blobSha).toBe(sha256Hex(formattedOutput))
       expect(capture.sliceSha).toBe(sha256Hex(fileLines.join("\n")))
 
@@ -116,6 +117,44 @@ describe("src/archive/primitives", () => {
       expect(reconciled.stalenessStatus).toBe("SLICE L1-L50 of 200 — FRESH SLICE")
     } finally {
       rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("resolveTargetWorkspace resolves sibling repos and worktree directories", () => {
+    const workspaceDir = mkdtempSync(path.join(tmpdir(), "substrate-ws-"))
+    try {
+      const repoA = path.join(workspaceDir, "repo-a")
+      const repoB = path.join(workspaceDir, "repo-b")
+      const worktreeA = path.join(repoA, ".worktree", "lane-1")
+      mkdirSync(path.join(repoA, ".git"), { recursive: true })
+      mkdirSync(path.join(repoB, "src"), { recursive: true })
+      writeFileSync(path.join(repoB, "package.json"), "{}", "utf8")
+      writeFileSync(path.join(repoB, "src", "index.ts"), "export const x = 1\n", "utf8")
+      mkdirSync(path.join(worktreeA, "src"), { recursive: true })
+      writeFileSync(path.join(worktreeA, ".git"), "gitdir: ../../.git/worktrees/lane-1\n", "utf8")
+      writeFileSync(path.join(worktreeA, "src", "worker.ts"), "export const w = 2\n", "utf8")
+
+      const sameRepo = resolveTargetWorkspace("src/plugin.ts", repoA)
+      expect(sameRepo.targetRoot).toBe(repoA)
+      expect(sameRepo.relPath).toBe("src/plugin.ts")
+      expect(sameRepo.isCrossProject).toBe(false)
+
+      const siblingRoot = resolveTargetWorkspace("../repo-b", repoA)
+      expect(siblingRoot.targetRoot).toBe(repoB)
+      expect(siblingRoot.relPath).toBe("")
+      expect(siblingRoot.isCrossProject).toBe(true)
+
+      const siblingFile = resolveTargetWorkspace(path.join(repoB, "src", "index.ts"), repoA)
+      expect(siblingFile.targetRoot).toBe(repoB)
+      expect(siblingFile.relPath).toBe("src/index.ts")
+      expect(siblingFile.isCrossProject).toBe(true)
+
+      const worktreeFile = resolveTargetWorkspace(".worktree/lane-1/src/worker.ts", repoA)
+      expect(worktreeFile.targetRoot).toBe(worktreeA)
+      expect(worktreeFile.relPath).toBe("src/worker.ts")
+      expect(worktreeFile.isCrossProject).toBe(true)
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true })
     }
   })
 })

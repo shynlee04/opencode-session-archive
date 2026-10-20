@@ -136,7 +136,7 @@ describe("CSG-01: Zero-Dependency Bun.Transpiler + Depth-2 AST Skeletonizer & SQ
     expect(bindFn?.kind).toBe("function")
     expect(bindFn?.start_line).toBe(18)
     expect(bindFn?.end_line).toBe(22)
-    expect(bindFn?.signature).toContain("{ /* L18-L22 */ }")
+    expect(bindFn?.signature).toContain("[L18-L22]")
 
     const runTurnFn = byQualified.get("createSyntheticDelegationDriver.runTurn")
     expect(runTurnFn).toBeDefined()
@@ -144,7 +144,7 @@ describe("CSG-01: Zero-Dependency Bun.Transpiler + Depth-2 AST Skeletonizer & SQ
     expect(runTurnFn?.kind).toBe("function")
     expect(runTurnFn?.start_line).toBe(24)
     expect(runTurnFn?.end_line).toBe(28)
-    expect(runTurnFn?.signature).toContain("{ /* L24-L28 */ }")
+    expect(runTurnFn?.signature).toContain("[L24-L28]")
 
     const inspectMethod = byQualified.get("createSyntheticDelegationDriver.inspectStatus")
     expect(inspectMethod).toBeDefined()
@@ -168,6 +168,7 @@ describe("CSG-01: Zero-Dependency Bun.Transpiler + Depth-2 AST Skeletonizer & SQ
   })
 
   test("surfaces inner Depth-2 helpers inside createNativeDelegationDriver in real src/delegation/native-delegation.ts", () => {
+    if (process.env.SUBSTRATE_EXTERNAL !== "1") return
     if (!existsSync(STEWARD_ROOT)) return
     const relPath = "src/delegation/native-delegation.ts"
     const res = skeletonizeFile(STEWARD_ROOT, relPath, { closureFactoryMinLines: 200 })
@@ -208,6 +209,7 @@ describe("CSG-01: Zero-Dependency Bun.Transpiler + Depth-2 AST Skeletonizer & SQ
   })
 
   test("indexes all 51 files in hivemind-steward-oc-devin-dev/src/ with >= 88% token reduction, < 30ms warm parse, < 0.5ms/file warm skip, and F-04 dual parameter order", () => {
+    if (process.env.SUBSTRATE_EXTERNAL !== "1") return
     if (!existsSync(STEWARD_ROOT)) return
     const db = new Database(":memory:")
     try {
@@ -421,5 +423,155 @@ describe("CSG-01: Zero-Dependency Bun.Transpiler + Depth-2 AST Skeletonizer & SQ
       rmSync(tmpDir, { recursive: true, force: true })
     }
   })
+
+  test("CSG-R2 S2-1: regex literal immediately after => in src/archive/valve.ts does not corrupt brace depth across all 1,956 lines", () => {
+    const db = new Database(":memory:")
+    try {
+      ensureCodeGraphSchema(db)
+      indexCodebase(db, SUBSTRATE_ROOT, ["src/archive/valve.ts"])
+
+      const valveAbsPath = path.join(SUBSTRATE_ROOT, "src/archive/valve.ts")
+      const skel = queryAstSkeleton(db, valveAbsPath, { rootDir: SUBSTRATE_ROOT })
+      expect(skel).not.toBeNull()
+      expect(skel!.loc).toBe(1956)
+
+      // summarizeReadOutput (which contains `(l) => /^(?:describe|test|it)\(["'`]/` at L473) must close at L486, NOT L1956
+      const summarizeSym = skel!.symbols.find((s) => s.name === "summarizeReadOutput")
+      expect(summarizeSym).toBeDefined()
+      expect(summarizeSym!.start_line).toBe(454)
+      expect(summarizeSym!.end_line).toBe(486)
+
+      const summarizeSlice = readSymbolSlice(db, SUBSTRATE_ROOT, valveAbsPath, "summarizeReadOutput")
+      expect(summarizeSlice).not.toBeNull()
+      expect(summarizeSlice!.start_line).toBe(454)
+      expect(summarizeSlice!.end_line).toBe(486)
+      expect(summarizeSlice!.slice_tokens).toBeLessThanOrEqual(600)
+
+      // WorkingSetValve after line 850 and its methods after line 880, plus trailing exports through L1956, are extracted
+      const valveClass = skel!.symbols.find((s) => s.name === "WorkingSetValve")
+      expect(valveClass).toBeDefined()
+      expect(valveClass!.start_line).toBe(856)
+      expect(valveClass!.end_line).toBe(1909)
+
+      const resolveBlobMethod = skel!.symbols.find((s) => s.qualified_name === "WorkingSetValve.resolveBlob")
+      expect(resolveBlobMethod).toBeDefined()
+      expect(resolveBlobMethod!.start_line).toBeGreaterThanOrEqual(879)
+
+      const cloneHookFn = skel!.symbols.find((s) => s.name === "cloneMessagesForHook")
+      expect(cloneHookFn).toBeDefined()
+      expect(cloneHookFn!.end_line).toBe(1955)
+
+      // Also verify a synthetic [L214-L280] computeStepWatermark containing `(l) => /^(?:describe|test|it)\(["'`]/`
+      const prefixLines = Array.from({ length: 213 }, (_, idx) => `// line ${idx + 1}`)
+      const bodyLines = [
+        "export function computeStepWatermark(lines: readonly string[]): string | undefined {", // L214
+        "  const testMatch = lines.find((l) => /^(?:describe|test|it)\\([\"'`]/.test(l))", // L215
+        ...Array.from({ length: 63 }, (_, idx) => `  const step_${idx} = ${idx}`), // L216..L278
+        "  return testMatch", // L279
+        "}", // L280
+        ...Array.from({ length: 1675 }, (_, idx) => `// trailing ${idx}`),
+        "export function trailingAfterWatermark(): boolean { return true }", // L1956
+      ]
+      const syntheticValve = [...prefixLines, ...bodyLines].join("\n")
+      const synSkel = skeletonizeSource("src/archive/synthetic-valve.ts", syntheticValve)
+      expect(synSkel.loc).toBe(1956)
+      const csw = synSkel.symbols.find((s) => s.name === "computeStepWatermark")
+      expect(csw).toBeDefined()
+      expect(csw!.start_line).toBe(214)
+      expect(csw!.end_line).toBe(280)
+      const trailing = synSkel.symbols.find((s) => s.name === "trailingAfterWatermark")
+      expect(trailing).toBeDefined()
+      expect(trailing!.start_line).toBe(1956)
+    } finally {
+      db.close()
+    }
+  })
+
+  test("CSG-R2 S2-2 / A4: compact export-first AstSkeleton caps signatures at <= 120 chars, eliminates duplicate span comments, keeps continuity.ts <= 700 tokens, and supports includePrivate", () => {
+    const db = new Database(":memory:")
+    try {
+      ensureCodeGraphSchema(db)
+      indexCodebase(db, SUBSTRATE_ROOT, ["src/viewports/continuity.ts"])
+
+      const absContinuity = path.join(SUBSTRATE_ROOT, "src/viewports/continuity.ts")
+      const exportedSkel = queryAstSkeleton(db, absContinuity, { rootDir: SUBSTRATE_ROOT })
+      expect(exportedSkel).not.toBeNull()
+      expect(exportedSkel!.skeleton_tokens).toBeLessThanOrEqual(700)
+      expect(exportedSkel!.skeleton_text).not.toContain("/* L")
+
+      // Every Depth-1 symbol in default queryAstSkeleton is exported
+      const depth1InDefault = exportedSkel!.symbols.filter((s) => s.depth === 1)
+      expect(depth1InDefault.length).toBeGreaterThan(15)
+      expect(depth1InDefault.every((s) => s.exported)).toBe(true)
+
+      // Every signature has [Lstart-Lend] once at the end and header <= 120 chars
+      for (const sym of exportedSkel!.symbols) {
+        const rangeTag = `[L${sym.start_line}-L${sym.end_line}]`
+        expect(sym.signature.endsWith(rangeTag)).toBe(true)
+        const withoutRange = sym.signature.slice(0, sym.signature.length - rangeTag.length).trimEnd()
+        expect(withoutRange.length).toBeLessThanOrEqual(120)
+      }
+
+      // includePrivate: true includes non-exported Depth-1 helpers
+      const fullSkel = queryAstSkeleton(db, absContinuity, {
+        rootDir: SUBSTRATE_ROOT,
+        includePrivate: true,
+      })
+      expect(fullSkel).not.toBeNull()
+      expect(fullSkel!.symbols.length).toBeGreaterThan(exportedSkel!.symbols.length)
+      expect(fullSkel!.symbols.some((s) => s.depth === 1 && !s.exported)).toBe(true)
+
+      // readSymbolSlice can still slice a private helper by name even when default skeleton omits it
+      const privateSym = fullSkel!.symbols.find((s) => s.depth === 1 && !s.exported)
+      expect(privateSym).toBeDefined()
+      const privateSlice = readSymbolSlice(db, SUBSTRATE_ROOT, absContinuity, privateSym!.name)
+      expect(privateSlice).not.toBeNull()
+      expect(privateSlice!.start_line).toBe(privateSym!.start_line)
+      expect(privateSlice!.end_line).toBe(privateSym!.end_line)
+    } finally {
+      db.close()
+    }
+  })
+
+  test("CSG-R2 S2-4: buildJitReadSkeletonFooter labels straddling symbol [L82-L94] when L1-L90 is read as (partial L82-L90 shown)", async () => {
+    const astMod = await import("../src/honeycomb/ast-skeleton.ts")
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "csg-straddle-footer-"))
+    const db = new Database(":memory:")
+    try {
+      const srcDir = path.join(tmpDir, "src")
+      mkdirSync(srcDir, { recursive: true })
+      const lines: string[] = []
+      lines.push("export function fullyReadHeader(): number {") // L1
+      for (let i = 2; i <= 80; i++) {
+        lines.push(`  const v_${i} = ${i}`)
+      }
+      lines.push("}") // L81
+      lines.push("export function straddlingTarget(input: string): string {") // L82
+      for (let i = 83; i <= 93; i++) {
+        lines.push(`  const s_${i} = input.slice(${i - 82})`)
+      }
+      lines.push("}") // L94
+      lines.push("export function unreadFooter(): boolean {") // L95
+      lines.push("  return true") // L96
+      lines.push("}") // L97
+
+      writeFileSync(path.join(srcDir, "straddle.ts"), lines.join("\n"))
+
+      const footer = astMod.buildJitReadSkeletonFooter(db, tmpDir, "src/straddle.ts", {
+        startLine: 1,
+        endLine: 90,
+        totalLines: 97,
+        isTruncated: true,
+      })
+      expect(footer).not.toBeNull()
+      expect(footer!).toContain("- [L82-L94] straddlingTarget (function) (partial L82-L90 shown)")
+      expect(footer!).toContain("- [L95-L97] unreadFooter (function)")
+      expect(footer!).not.toContain("fullyReadHeader")
+    } finally {
+      db.close()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })
+
 

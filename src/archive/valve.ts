@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
-import { isAbsolute, join } from "node:path"
+import { isAbsolute, join } from "node:path"; import type { Database } from "bun:sqlite"
 import {
   computeDiskSliceSha,
   estimateTokens as estimateStringTokens,
@@ -8,7 +8,7 @@ import {
   normalizeRepoPath as normalizePrimitiveRepoPath,
   parseReadToolOutput,
   resolveDiskPath,
-  sha256Hex,
+  sha256Hex, splitDiskLines,
   type FileReadCapture,
 } from "./primitives.ts"
 
@@ -813,13 +813,13 @@ export function renderWorkingMemoryManifest(
   ]
 
   for (const f of manifest.filesRead) {
-    const shortPath = f.normalizedPath || f.path
+    const shortPath = f.normalizedPath || f.path; const explicitRange = normalizeExplicitLineRange(f.lineRange, f.startLine, f.endLine, f.totalLines)
     const sliceHint =
       f.status.startsWith("SLICE ") && f.startLine != null && f.endLine != null
         ? ` (Do NOT re-read L${f.startLine}-L${f.endLine}; read offset=${f.endLine + 1})`
         : ""
     lines.push(
-      `- \`${shortPath}#${f.lineRange}\` (${f.chars} chars) -> \`${f.blobRef}\` | ${f.summary.slice(0, 72)} | **${f.status}**${sliceHint}`,
+      `- \`${shortPath}#${explicitRange}\` (${f.chars} chars) -> \`${f.blobRef}\` | ${f.summary.slice(0, 72)} | **${f.status}**${sliceHint}`,
     )
   }
 
@@ -857,6 +857,8 @@ export class WorkingSetValve {
   readonly blobStore: BlobStore
   private readonly ledgers = new Map<string, ValveExecutionLedger>()
   private readonly hookReads = new Map<string, Map<string, ManifestFileReadEntry>>()
+  private readonly hookModified = new Map<string, Map<string, ManifestFileModifiedEntry>>()
+  private readonly hookSkills = new Map<string, Map<string, ManifestSkillEntry>>()
   private readonly options: ValveOptions
 
   constructor(options: ValveOptions = {}) {
@@ -906,6 +908,26 @@ export class WorkingSetValve {
     }
   }
 
+  private refreshArmedLedgerManifest(sessionID: string): void {
+    const ledger = this.ledgers.get(sessionID)
+    if (!ledger) return
+    const filesReadByPath = new Map(ledger.manifest.filesRead.map((f) => [f.normalizedPath || f.path, f]))
+    for (const [k, v] of this.hookReads.get(sessionID) ?? []) filesReadByPath.set(k, v)
+    const filesModByPath = new Map(ledger.manifest.filesModified.map((m) => [m.normalizedPath || m.path, m]))
+    for (const [k, v] of this.hookModified.get(sessionID) ?? []) filesModByPath.set(k, v)
+    const skillsByName = new Map(ledger.manifest.activeSkills.map((s) => [s.name, s]))
+    for (const [k, v] of this.hookSkills.get(sessionID) ?? []) skillsByName.set(k, v)
+    const manifestCore = {
+      sessionID,
+      filesRead: [...filesReadByPath.values()],
+      filesModified: [...filesModByPath.values()],
+      activeSkills: [...skillsByName.values()],
+      delegationOutcomes: ledger.manifest.delegationOutcomes,
+    }
+    const renderedMarkdown = renderWorkingMemoryManifest(manifestCore)
+    this.ledgers.set(sessionID, { ...ledger, manifest: { ...manifestCore, renderedMarkdown, markdown: renderedMarkdown } })
+  }
+
   recordReadFromHook(
     sessionIDOrParams:
       | string
@@ -922,47 +944,27 @@ export class WorkingSetValve {
     rawOutputArg?: string,
     canonicalRootArg?: string,
   ): FileReadCapture & { readonly status: FreshnessStatus } {
-    let sessionID: string
-    let input: Record<string, unknown>
-    let rawOutput: string
-    let canonicalRoot: string | undefined
-    let callId = "hook_read"
-
-    if (typeof sessionIDOrParams === "string") {
-      sessionID = sessionIDOrParams
-      input = inputArg ?? {}
-      rawOutput = rawOutputArg ?? ""
-      canonicalRoot = canonicalRootArg
-    } else {
-      sessionID = sessionIDOrParams.sessionID
-      callId = sessionIDOrParams.callId ?? "hook_read"
-      rawOutput = sessionIDOrParams.outputText ?? sessionIDOrParams.rawOutput ?? ""
-      input = {
-        ...(sessionIDOrParams.input ?? {}),
-        ...(sessionIDOrParams.path ? { filePath: sessionIDOrParams.path } : {}),
-      }
-      canonicalRoot = sessionIDOrParams.canonicalRoot
-    }
-
-    const effectiveRoot = canonicalRoot ?? this.options.canonicalRoot
+    const isStr = typeof sessionIDOrParams === "string"
+    const sessionID = isStr ? sessionIDOrParams : sessionIDOrParams.sessionID
+    const callId = isStr ? "hook_read" : (sessionIDOrParams.callId ?? "hook_read")
+    const rawOutput = isStr ? (rawOutputArg ?? "") : (sessionIDOrParams.outputText ?? sessionIDOrParams.rawOutput ?? "")
+    const input = isStr
+      ? (inputArg ?? {})
+      : { ...(sessionIDOrParams.input ?? {}), ...(sessionIDOrParams.path ? { filePath: sessionIDOrParams.path } : {}) }
+    const effectiveRoot = (isStr ? canonicalRootArg : sessionIDOrParams.canonicalRoot) ?? this.options.canonicalRoot
     const capture = parseReadToolOutput(rawOutput, input, effectiveRoot)
     const { blobRef, sha256 } = this.blobStore.sink(rawOutput)
     const status: FreshnessStatus =
-      capture.isTruncated ||
-      capture.startLine > 1 ||
-      (capture.totalLines !== null && capture.endLine < capture.totalLines)
+      capture.isTruncated || capture.startLine > 1 || (capture.totalLines !== null && capture.endLine < capture.totalLines)
         ? (formatStalenessStatus("SLICE", capture.startLine, capture.endLine, capture.totalLines) as FreshnessStatus)
         : "FRESH — DO NOT REREAD"
-
+    const explicitLineRange = normalizeExplicitLineRange(capture.lineRange, capture.startLine, capture.endLine, capture.totalLines)
     let sessionMap = this.hookReads.get(sessionID)
-    if (!sessionMap) {
-      sessionMap = new Map()
-      this.hookReads.set(sessionID, sessionMap)
-    }
+    if (!sessionMap) { sessionMap = new Map(); this.hookReads.set(sessionID, sessionMap) }
     sessionMap.set(capture.normalizedPath, {
       path: capture.path,
       normalizedPath: capture.normalizedPath,
-      lineRange: capture.lineRange,
+      lineRange: explicitLineRange,
       startLine: capture.startLine,
       endLine: capture.endLine,
       totalLines: capture.totalLines,
@@ -976,11 +978,162 @@ export class WorkingSetValve {
       messageId: callId,
       sourceSessionId: sessionID,
     })
+    this.refreshArmedLedgerManifest(sessionID)
+    return { ...capture, lineRange: explicitLineRange, status }
+  }
 
-    return {
-      ...capture,
-      status,
+  recordToolExecuteAfter(params: {
+    readonly sessionID: string
+    readonly tool: string
+    readonly callId?: string
+    readonly input?: Record<string, unknown>
+    readonly outputText?: string
+    readonly canonicalRoot?: string
+  }): void {
+    const toolName = params.tool.toLowerCase()
+    const effectiveRoot = params.canonicalRoot ?? this.options.canonicalRoot
+    const input = params.input ?? {}
+    const outputText = params.outputText ?? ""
+    const callId = params.callId ?? `hook_${toolName}_${Date.now()}`
+    if (toolName === "read" || toolName === "read_file" || toolName === "view_file") {
+      this.recordReadFromHook({ sessionID: params.sessionID, callId, input, outputText, canonicalRoot: effectiveRoot })
+      return
     }
+    if (["write", "edit", "patch", "apply_patch", "multi_edit", "write_to_file", "replace_file_content"].includes(toolName)) {
+      const targets: Array<{ path: string; operation: "add" | "update" | "write" | "edit"; fallbackBody: string }> = []
+      const patchText = typeof input.patchText === "string" ? input.patchText : typeof input.patch === "string" ? input.patch : null
+      if ((toolName === "patch" || toolName === "apply_patch") && patchText) {
+        for (const p of extractPatchFiles(patchText)) targets.push({ path: p.path, operation: p.operation, fallbackBody: p.hunkText })
+      }
+      if (targets.length === 0) {
+        const rawPath = String(input.filePath ?? input.path ?? input.TargetFile ?? input.file ?? "")
+        if (rawPath.length > 0) {
+          const fallbackBody = String(input.content ?? input.CodeContent ?? input.newString ?? input.ReplacementContent ?? outputText)
+          targets.push({ path: rawPath, operation: toolName.includes("write") ? "write" : "edit", fallbackBody })
+        }
+      }
+      if (targets.length === 0) return
+      let modMap = this.hookModified.get(params.sessionID)
+      if (!modMap) { modMap = new Map(); this.hookModified.set(params.sessionID, modMap) }
+      let readMap = this.hookReads.get(params.sessionID)
+      if (!readMap) { readMap = new Map(); this.hookReads.set(params.sessionID, readMap) }
+      for (const target of targets) {
+        const normPath = normalizeRepoPath(target.path, effectiveRoot)
+        let body = target.fallbackBody
+        if ((typeof effectiveRoot === "string" && effectiveRoot.length > 0) || (isAbsolute(target.path) && existsSync(target.path))) {
+          const diskPath = resolveDiskPath(target.path, effectiveRoot)
+          if (existsSync(diskPath)) { try { body = readFileSync(diskPath, "utf8") } catch {} }
+        }
+        const { sha256, blobRef } = this.blobStore.sink(body)
+        const cleanBody = body.replace(/\n$/, "")
+        const totalLines = Math.max(1, splitDiskLines(body).length)
+        modMap.set(normPath, {
+          path: target.path, normalizedPath: normPath, operation: target.operation, tool: toolName,
+          messageId: callId, blobRef, status: "COMMITTED_OR_APPLIED",
+        })
+        readMap.set(normPath, {
+          path: target.path, normalizedPath: normPath, lineRange: `L1-L${totalLines}`,
+          startLine: 1, endLine: totalLines, totalLines, isTruncated: false, chars: body.length,
+          blobSha256: sha256, sliceSha256: sha256Hex(cleanBody), blobRef,
+          summary: summarizeReadOutput(normPath, cleanBody), status: FRESH_STATUS, messageId: callId, sourceSessionId: params.sessionID,
+        })
+      }
+      this.refreshArmedLedgerManifest(params.sessionID)
+      return
+    }
+    if (toolName === "skill" || toolName === "load_skill") {
+      const skillName = String(input.name ?? input.skill ?? input.id ?? extractTargetLabel("skill", input as Record<string, any>, outputText))
+      if (!skillName || skillName === "unknown") return
+      const { sha256, blobRef } = this.blobStore.sink(outputText)
+      let skillMap = this.hookSkills.get(params.sessionID)
+      if (!skillMap) { skillMap = new Map(); this.hookSkills.set(params.sessionID, skillMap) }
+      skillMap.set(skillName, {
+        name: skillName, chars: outputText.length, blobSha256: sha256, blobRef,
+        summary: summarizeSkillOutput(skillName, outputText), status: ACTIVE_SKILL_STATUS, messageId: callId, sourceSessionId: params.sessionID,
+      })
+      this.refreshArmedLedgerManifest(params.sessionID)
+    }
+  }
+
+  syncFromSqlite(sessionID: string, db: Database, canonicalRoot?: string): void {
+    const effectiveRoot = canonicalRoot ?? this.options.canonicalRoot
+    let readMap = this.hookReads.get(sessionID); if (!readMap) { readMap = new Map(); this.hookReads.set(sessionID, readMap) }
+    let modMap = this.hookModified.get(sessionID); if (!modMap) { modMap = new Map(); this.hookModified.set(sessionID, modMap) }
+    let skillMap = this.hookSkills.get(sessionID); if (!skillMap) { skillMap = new Map(); this.hookSkills.set(sessionID, skillMap) }
+    const readSeqByPath = new Map<string, number>()
+    try {
+      const readRows = db.query(`SELECT path, normalized_path, call_id, message_id, read_seq, line_range, start_line, end_line, total_lines, is_truncated, chars, blob_sha256, slice_sha, read_blob_sha, summary, staleness_status FROM file_read_ledger WHERE session_id = ? ORDER BY read_seq ASC`).all(sessionID) as Array<Record<string, any>>
+      for (const r of readRows) {
+        const normPath = String(r.normalized_path || normalizeRepoPath(String(r.path), effectiveRoot))
+        const startLine = Number(r.start_line ?? 1)
+        const endLine = Math.max(startLine, Number(r.end_line ?? r.total_lines ?? 1))
+        const isTruncated = r.is_truncated === 1
+        const fullSha = String(r.blob_sha256 || r.slice_sha || r.read_blob_sha)
+        const rawReadSha = String(r.read_blob_sha ?? "")
+        const sliceSha = String(r.slice_sha || (rawReadSha.startsWith("blob:") ? rawReadSha.slice(5) : rawReadSha) || fullSha)
+        const blobRef = this.blobStore.registerExistingSha(fullSha)
+        let totalLines: number | null = typeof r.total_lines === "number" ? r.total_lines : null
+        let status: FreshnessStatus = (r.staleness_status as FreshnessStatus) || FRESH_STATUS
+        let lineRange = normalizeExplicitLineRange(String(r.line_range ?? ""), startLine, endLine, totalLines)
+        if ((typeof effectiveRoot === "string" && effectiveRoot.length > 0) || (isAbsolute(String(r.path)) && existsSync(String(r.path)))) {
+          const diskPath = resolveDiskPath(String(r.path), effectiveRoot)
+          if (existsSync(diskPath)) {
+            const recon = computeDiskSliceSha(diskPath, { startLine, endLine, totalLines, isTruncated, sliceSha })
+            totalLines = recon.currentTotalLines; status = recon.stalenessStatus
+            lineRange = normalizeExplicitLineRange(recon.state === "SLICE" ? recon.lineRange : lineRange, startLine, endLine, totalLines)
+          }
+        }
+        readSeqByPath.set(normPath, Number(r.read_seq ?? 0))
+        readMap.set(normPath, {
+          path: String(r.path), normalizedPath: normPath, lineRange, startLine, endLine, totalLines, isTruncated,
+          chars: Number(r.chars ?? 0), blobSha256: fullSha, sliceSha256: sliceSha, blobRef,
+          summary: String(r.summary || normPath), status, messageId: String(r.call_id || r.message_id), sourceSessionId: sessionID,
+        })
+      }
+    } catch {}
+    try {
+      const touchRows = db.query(`SELECT call_id, seq, tool, op, path, normalized_path FROM file_touch WHERE session_id = ? ORDER BY seq ASC`).all(sessionID) as Array<Record<string, any>>
+      for (const t of touchRows) {
+        const rawPath = String(t.path); const normPath = String(t.normalized_path || normalizeRepoPath(rawPath, effectiveRoot))
+        let fullSha = sha256Hex(`${sessionID}:${normPath}:${t.seq}`); let diskTotalLines: number | null = null
+        if ((typeof effectiveRoot === "string" && effectiveRoot.length > 0) || (isAbsolute(rawPath) && existsSync(rawPath))) {
+          const diskPath = resolveDiskPath(rawPath, effectiveRoot)
+          if (existsSync(diskPath)) {
+            try {
+              const diskContent = readFileSync(diskPath, "utf8")
+              fullSha = sha256Hex(diskContent.replace(/\n$/, "")); diskTotalLines = Math.max(1, splitDiskLines(diskContent).length)
+            } catch {}
+          }
+        }
+        const blobRef = this.blobStore.registerExistingSha(fullSha)
+        const opRaw = String(t.op || "edit")
+        const operation: "add" | "update" | "write" | "edit" = opRaw === "write" || opRaw === "add" || opRaw === "update" ? opRaw : "edit"
+        modMap.set(normPath, {
+          path: rawPath, normalizedPath: normPath, operation, tool: String(t.tool),
+          messageId: String(t.call_id || `touch_${t.seq}`), blobRef, status: "COMMITTED_OR_APPLIED",
+        })
+        const prevRead = readMap.get(normPath)
+        if (prevRead && Number(t.seq ?? 0) > (readSeqByPath.get(normPath) ?? -1)) {
+          readMap.set(
+            normPath,
+            diskTotalLines !== null
+              ? { ...prevRead, lineRange: `L1-L${diskTotalLines}`, startLine: 1, endLine: diskTotalLines, totalLines: diskTotalLines, isTruncated: false, blobSha256: fullSha, sliceSha256: fullSha, status: FRESH_STATUS }
+              : { ...prevRead, status: STALE_STATUS },
+          )
+        }
+      }
+    } catch {}
+    try {
+      const skillRows = db.query(`SELECT skill_name, call_id, message_id, chars, blob_sha256, summary FROM skill_load_ledger WHERE session_id = ? ORDER BY load_seq ASC`).all(sessionID) as Array<Record<string, any>>
+      for (const s of skillRows) {
+        const sSha = String(s.blob_sha256 ?? ""); const sName = String(s.skill_name ?? "")
+        skillMap.set(sName, {
+          name: sName, chars: Number(s.chars ?? 0), blobSha256: sSha, blobRef: this.blobStore.registerExistingSha(sSha),
+          summary: String(s.summary || `Loaded ${sName}`), status: ACTIVE_SKILL_STATUS, messageId: String(s.call_id || s.message_id), sourceSessionId: sessionID,
+        })
+      }
+    } catch {}
+    this.refreshArmedLedgerManifest(sessionID)
   }
 
   prune(params: {
@@ -992,6 +1145,7 @@ export class WorkingSetValve {
   }): {
     readonly ledger: ValveExecutionLedger
     readonly summaryMarkdown: string
+    readonly compactMarkdown: string
   } {
     const ledger = this.armValve({
       sessionID: params.sessionID,
@@ -1005,40 +1159,49 @@ export class WorkingSetValve {
       `Anchor: \`${ledger.watermark.anchorMessageID ?? "none"}\` (index ${ledger.watermark.anchorIndex}); ${ledger.watermark.assistantStepsThinned}/${ledger.watermark.assistantStepsTotal} assistant steps thinned (${ledger.metrics.toolPartsThinned} tool parts, ~${ledger.metrics.netTokensFreed} net tokens freed).`,
       `Manifest: ${ledger.manifest.filesRead.length} files read, ${ledger.manifest.filesModified.length} files modified, ${ledger.manifest.activeSkills.length} active skills.`,
     ].join("\n")
-    return { ledger, summaryMarkdown }
+    return { ledger, summaryMarkdown, compactMarkdown: renderCompactValveStatus({ armed: true, sessionID: params.sessionID, ledger }) }
   }
 
   status(sessionID: string): {
     readonly armed: boolean
+    readonly sessionID: string
     readonly ledger: ValveExecutionLedger | null
+    readonly filesRead: readonly ManifestFileReadEntry[]
+    readonly filesModified: readonly ManifestFileModifiedEntry[]
+    readonly activeSkills: readonly ManifestSkillEntry[]
+    readonly delegationOutcomes: readonly ManifestDelegationEntry[]
     readonly summaryMarkdown: string
     readonly manifestMarkdown: string
+    readonly compactMarkdown: string
   } {
     const ledger = this.ledgers.get(sessionID) ?? null
-    const hookMap = this.hookReads.get(sessionID)
-    const fallbackManifest = renderWorkingMemoryManifest({
-      sessionID,
-      filesRead: hookMap ? [...hookMap.values()] : [],
-      filesModified: [],
-      activeSkills: [],
-      delegationOutcomes: [],
-    })
+    const fallbackFilesRead = [...(this.hookReads.get(sessionID)?.values() ?? [])]
+    const fallbackFilesModified = [...(this.hookModified.get(sessionID)?.values() ?? [])]
+    const fallbackSkills = [...(this.hookSkills.get(sessionID)?.values() ?? [])]
     if (!ledger) {
+      const fallbackManifest = renderWorkingMemoryManifest({
+        sessionID, filesRead: fallbackFilesRead, filesModified: fallbackFilesModified, activeSkills: fallbackSkills, delegationOutcomes: [],
+      })
+      const compactMarkdown = renderCompactValveStatus({
+        armed: false, sessionID, ledger: null, filesRead: fallbackFilesRead, filesModified: fallbackFilesModified, activeSkills: fallbackSkills, delegationOutcomes: [],
+      })
       return {
-        armed: false,
-        ledger: null,
+        armed: false, sessionID, ledger: null, filesRead: fallbackFilesRead, filesModified: fallbackFilesModified,
+        activeSkills: fallbackSkills, delegationOutcomes: [],
         summaryMarkdown: `WorkingSetValve is currently unarmed for session \`${sessionID}\`.`,
-        manifestMarkdown: fallbackManifest,
+        manifestMarkdown: fallbackManifest, compactMarkdown,
       }
     }
     return {
-      armed: true,
-      ledger,
+      armed: true, sessionID, ledger,
+      filesRead: ledger.manifest.filesRead, filesModified: ledger.manifest.filesModified,
+      activeSkills: ledger.manifest.activeSkills, delegationOutcomes: ledger.manifest.delegationOutcomes,
       summaryMarkdown: [
         `WorkingSetValve is armed for session \`${sessionID}\` (mode: \`${ledger.mode}\`, keepRecentSteps: \`${ledger.keepRecentSteps}\`, anchor: \`${ledger.watermark.anchorMessageID ?? "none"}\`).`,
         `Thinned: ${ledger.metrics.toolPartsThinned} tool parts (~${ledger.metrics.netTokensFreed} net tokens freed).`,
       ].join("\n"),
       manifestMarkdown: ledger.manifest.renderedMarkdown,
+      compactMarkdown: renderCompactValveStatus({ armed: true, sessionID, ledger }),
     }
   }
 
@@ -1048,7 +1211,7 @@ export class WorkingSetValve {
     readonly summaryMarkdown: string
   } {
     const existed = this.ledgers.delete(sessionID)
-    this.hookReads.delete(sessionID)
+    this.hookReads.delete(sessionID); this.hookModified.delete(sessionID); this.hookSkills.delete(sessionID)
     return {
       reset: existed,
       sessionID,
@@ -1116,34 +1279,16 @@ export class WorkingSetValve {
 
     for (const prior of this.options.priorWorktreeMessages ?? []) {
       this.scanMessagesIntoManifest(
-        prior.sessionID,
-        prior.messages,
-        prior.messages.length,
-        false,
-        persistToDisk,
-        breadcrumbsByCallId,
-        thinnedInputsByCallId,
-        skillBreadcrumbsByName,
-        recordCrossSessionFileRead,
-        filesModifiedMap,
-        recordSkill,
-        delegationMap,
+        prior.sessionID, prior.messages, prior.messages.length, false, persistToDisk,
+        breadcrumbsByCallId, thinnedInputsByCallId, skillBreadcrumbsByName,
+        recordCrossSessionFileRead, filesModifiedMap, recordSkill, delegationMap,
       )
     }
 
     const stats = this.scanMessagesIntoManifest(
-      params.sessionID,
-      params.messages,
-      watermark.anchorIndex,
-      true,
-      persistToDisk,
-      breadcrumbsByCallId,
-      thinnedInputsByCallId,
-      skillBreadcrumbsByName,
-      recordFileRead,
-      filesModifiedMap,
-      recordSkill,
-      delegationMap,
+      params.sessionID, params.messages, watermark.anchorIndex, true, persistToDisk,
+      breadcrumbsByCallId, thinnedInputsByCallId, skillBreadcrumbsByName,
+      recordFileRead, filesModifiedMap, recordSkill, delegationMap,
     )
 
     const diskHashes = params.diskHashesByPath ?? this.options.diskHashesByPath
@@ -1160,15 +1305,9 @@ export class WorkingSetValve {
               breadcrumbsByCallId.set(
                 callId,
                 formatFactBreadcrumb({
-                  callId: bc.callId,
-                  messageId: bc.messageId,
-                  tool: bc.tool,
-                  target: bc.target,
-                  lineRange: bc.lineRange,
-                  originalChars: bc.originalChars,
-                  blobSha256: bc.blobSha256,
-                  summary: bc.summary,
-                  status: STALE_STATUS,
+                  callId: bc.callId, messageId: bc.messageId, tool: bc.tool, target: bc.target,
+                  lineRange: bc.lineRange, originalChars: bc.originalChars, blobSha256: bc.blobSha256,
+                  summary: bc.summary, status: STALE_STATUS,
                 }),
               )
             }
@@ -1176,6 +1315,7 @@ export class WorkingSetValve {
         }
         continue
       }
+
 
       if (entry.status === STALE_STATUS) continue
 
@@ -1506,12 +1646,18 @@ export class WorkingSetValve {
     let breadcrumbCharsAfter = 0
     let rawInputCharsBefore = 0
     let thinnedInputCharsAfter = 0
-
     let activeStart = 0
     if (isPrimarySession) {
       for (let i = 0; i < messages.length; i++) {
         if (isCompactionMessage(messages[i]!)) activeStart = i + 1
       }
+    }
+
+    const localReadsByPath = new Map<string, ManifestFileReadEntry>()
+    const filesReadMapGet = (normPath: string) => localReadsByPath.get(normPath)
+    const recordAndTrackRead = (entry: ManifestFileReadEntry) => {
+      localReadsByPath.set(entry.normalizedPath || entry.path, entry)
+      recordFileRead(entry)
     }
 
     const markExistingReadsStale = (normPath: string, newSha256: string) => {
@@ -1528,26 +1674,13 @@ export class WorkingSetValve {
           breadcrumbsByCallId.set(
             cId,
             formatFactBreadcrumb({
-              callId: prevBc.callId,
-              messageId: prevBc.messageId,
-              tool: prevBc.tool,
-              target: prevBc.target,
-              lineRange: prevBc.lineRange,
-              originalChars: prevBc.originalChars,
-              blobSha256: prevBc.blobSha256,
-              summary: prevBc.summary,
-              status: STALE_STATUS,
+              callId: prevBc.callId, messageId: prevBc.messageId, tool: prevBc.tool, target: prevBc.target,
+              lineRange: prevBc.lineRange, originalChars: prevBc.originalChars, blobSha256: prevBc.blobSha256,
+              summary: prevBc.summary, status: STALE_STATUS,
             }),
           )
         }
       }
-    }
-
-    const localReadsByPath = new Map<string, ManifestFileReadEntry>()
-    const filesReadMapGet = (normPath: string) => localReadsByPath.get(normPath)
-    const recordAndTrackRead = (entry: ManifestFileReadEntry) => {
-      localReadsByPath.set(entry.normalizedPath || entry.path, entry)
-      recordFileRead(entry)
     }
 
     for (let idx = 0; idx < messages.length; idx++) {
@@ -1557,20 +1690,12 @@ export class WorkingSetValve {
 
       if (Array.isArray(m.skills)) {
         for (const s of m.skills) {
-          const name = String(s.name ?? s.id ?? "")
-          const text = String(s.text ?? "")
+          const name = String(s.name ?? s.id ?? ""); const text = String(s.text ?? "")
           if (name && text) {
             const { sha256, blobRef } = this.blobStore.sink(text, { persistToDisk })
-            const summary = summarizeSkillOutput(name, text)
             recordSkill({
-              name,
-              chars: text.length,
-              blobSha256: sha256,
-              blobRef,
-              summary,
-              status: ACTIVE_SKILL_STATUS,
-              messageId: msgId,
-              sourceSessionId: sessionID,
+              name, chars: text.length, blobSha256: sha256, blobRef, summary: summarizeSkillOutput(name, text),
+              status: ACTIVE_SKILL_STATUS, messageId: msgId, sourceSessionId: sessionID,
             })
           }
         }
@@ -1583,32 +1708,20 @@ export class WorkingSetValve {
 
         if (part.type === "text" && typeof part.text === "string" && part.text.includes("<skill_content")) {
           for (const match of part.text.matchAll(SKILL_TAG_RE)) {
-            const blob = match[0]!
-            const name = SKILL_NAME_RE.exec(blob)?.[1] ?? "unknown"
+            const blob = match[0]!; const name = SKILL_NAME_RE.exec(blob)?.[1] ?? "unknown"
             const { sha256, blobRef } = this.blobStore.sink(blob, { persistToDisk })
             const summary = summarizeSkillOutput(name, blob)
             recordSkill({
+              name, chars: blob.length, blobSha256: sha256, blobRef, summary,
+              status: ACTIVE_SKILL_STATUS, messageId: msgId, sourceSessionId: sessionID,
+            })
+            skillBreadcrumbsByName.set(
               name,
-              chars: blob.length,
-              blobSha256: sha256,
-              blobRef,
-              summary,
-              status: ACTIVE_SKILL_STATUS,
-              messageId: msgId,
-              sourceSessionId: sessionID,
-            })
-            const bc = formatFactBreadcrumb({
-              callId: `inline_skill_${name}`,
-              messageId: msgId,
-              tool: "skill",
-              target: name,
-              lineRange: null,
-              originalChars: blob.length,
-              blobSha256: sha256,
-              summary,
-              status: ACTIVE_SKILL_BREADCRUMB_STATUS,
-            })
-            skillBreadcrumbsByName.set(name, bc)
+              formatFactBreadcrumb({
+                callId: `inline_skill_${name}`, messageId: msgId, tool: "skill", target: name,
+                lineRange: null, originalChars: blob.length, blobSha256: sha256, summary, status: ACTIVE_SKILL_BREADCRUMB_STATUS,
+              }),
+            )
           }
         }
 
@@ -1616,23 +1729,16 @@ export class WorkingSetValve {
         const isHookResult = part.type === "tool-result" && part.providerExecuted !== true
         if (!isDurableTool && !isHookResult) continue
 
-        const callId = String(part.id ?? "")
-        const name = String(part.name ?? "")
+        const callId = String(part.id ?? ""); const name = String(part.name ?? "")
         const input: Record<string, any> = isDurableTool
           ? (part.state?.input ?? {})
           : (m.content.find((p: any) => p.type === "tool-call" && p.id === callId)?.input ?? {})
 
         const outputText: string = isDurableTool
           ? Array.isArray(part.state?.content)
-            ? part.state.content
-                .map((c: any) => (c && c.type === "text" && typeof c.text === "string" ? c.text : ""))
-                .join("")
-            : typeof part.state?.output === "string"
-              ? part.state.output
-              : ""
-          : typeof part.result?.value === "string"
-            ? part.result.value
-            : ""
+            ? part.state.content.map((c: any) => (c && c.type === "text" && typeof c.text === "string" ? c.text : "")).join("")
+            : typeof part.state?.output === "string" ? part.state.output : ""
+          : typeof part.result?.value === "string" ? part.result.value : ""
 
         const { sha256, blobRef } = this.blobStore.sink(outputText, { persistToDisk })
         const target = extractTargetLabel(name, input, outputText)
@@ -1640,77 +1746,40 @@ export class WorkingSetValve {
         let readCaptureLineRange: string | null = null
 
         if (name === "read") {
-          const capture = parseReadToolOutput(
-            outputText,
-            { ...input, path: target },
-            this.options.canonicalRoot,
-          )
+          const capture = parseReadToolOutput(outputText, { ...input, path: target }, this.options.canonicalRoot)
           readCaptureStatus =
             capture.isTruncated || capture.startLine > 1
               ? formatStalenessStatus("SLICE", capture.startLine, capture.endLine, capture.totalLines)
               : FRESH_STATUS
           readCaptureLineRange =
-            capture.isTruncated || capture.startLine > 1
-              ? capture.lineRange
-              : extractReadLineRange(input, outputText)
+            capture.isTruncated || capture.startLine > 1 ? capture.lineRange : extractReadLineRange(input, outputText)
           const summary = summarizeReadOutput(target, outputText)
           const normPath = normalizeRepoPath(target, this.options.canonicalRoot)
           recordAndTrackRead({
-            path: target,
-            normalizedPath: normPath,
-            lineRange: readCaptureLineRange,
-            startLine: capture.startLine,
-            endLine: capture.endLine,
-            totalLines: capture.totalLines,
-            isTruncated: capture.isTruncated,
-            chars: outputText.length,
-            blobSha256: sha256,
-            sliceSha256: capture.sliceSha,
-            blobRef,
-            summary,
-            status: readCaptureStatus,
-            messageId: msgId,
-            sourceSessionId: sessionID,
+            path: target, normalizedPath: normPath, lineRange: readCaptureLineRange,
+            startLine: capture.startLine, endLine: capture.endLine, totalLines: capture.totalLines,
+            isTruncated: capture.isTruncated, chars: outputText.length, blobSha256: sha256,
+            sliceSha256: capture.sliceSha, blobRef, summary, status: readCaptureStatus,
+            messageId: msgId, sourceSessionId: sessionID,
           })
-
           const skillFileMatch = /\/skills\/([^/]+)\/SKILL\.md$/.exec(target)
           if (skillFileMatch) {
-            const skillName = skillFileMatch[1]!
             recordSkill({
-              name: skillName,
-              chars: outputText.length,
-              blobSha256: sha256,
-              blobRef,
-              summary,
-              status: ACTIVE_SKILL_STATUS,
-              messageId: msgId,
-              sourceSessionId: sessionID,
+              name: skillFileMatch[1]!, chars: outputText.length, blobSha256: sha256, blobRef,
+              summary, status: ACTIVE_SKILL_STATUS, messageId: msgId, sourceSessionId: sessionID,
             })
           }
         } else if (name === "skill") {
           const summary = summarizeSkillOutput(target, outputText)
           recordSkill({
-            name: target,
-            chars: outputText.length,
-            blobSha256: sha256,
-            blobRef,
-            summary,
-            status: ACTIVE_SKILL_STATUS,
-            messageId: msgId,
-            sourceSessionId: sessionID,
+            name: target, chars: outputText.length, blobSha256: sha256, blobRef,
+            summary, status: ACTIVE_SKILL_STATUS, messageId: msgId, sourceSessionId: sessionID,
           })
           skillBreadcrumbsByName.set(
             target,
             formatFactBreadcrumb({
-              callId,
-              messageId: msgId,
-              tool: "skill",
-              target,
-              lineRange: null,
-              originalChars: outputText.length,
-              blobSha256: sha256,
-              summary,
-              status: ACTIVE_SKILL_BREADCRUMB_STATUS,
+              callId, messageId: msgId, tool: "skill", target, lineRange: null,
+              originalChars: outputText.length, blobSha256: sha256, summary, status: ACTIVE_SKILL_BREADCRUMB_STATUS,
             }),
           )
         } else if (name === "patch" && typeof input.patchText === "string") {
@@ -1719,13 +1788,8 @@ export class WorkingSetValve {
             const normPath = normalizeRepoPath(patched.path, this.options.canonicalRoot)
             if (isPrimarySession || isCrossSessionContinuityArtifact(normPath)) {
               filesModifiedMap.set(normPath, {
-                path: patched.path,
-                normalizedPath: normPath,
-                operation: patched.operation,
-                tool: "patch",
-                messageId: msgId,
-                blobRef: pRef,
-                status: "COMMITTED_OR_APPLIED",
+                path: patched.path, normalizedPath: normPath, operation: patched.operation,
+                tool: "patch", messageId: msgId, blobRef: pRef, status: "COMMITTED_OR_APPLIED",
               })
             }
             if (localReadsByPath.has(normPath)) {
@@ -1733,19 +1797,10 @@ export class WorkingSetValve {
             } else {
               const pLines = Math.max(1, patched.hunkText.split("\n").length)
               recordAndTrackRead({
-                path: patched.path,
-                normalizedPath: normPath,
-                lineRange: `L1-L${pLines}`,
-                startLine: 1,
-                endLine: pLines,
-                isTruncated: false,
-                chars: patched.hunkText.length,
-                blobSha256: pSha,
-                blobRef: pRef,
-                summary: summarizeReadOutput(patched.path, patched.hunkText),
-                status: FRESH_STATUS,
-                messageId: msgId,
-                sourceSessionId: sessionID,
+                path: patched.path, normalizedPath: normPath, lineRange: `L1-L${pLines}`,
+                startLine: 1, endLine: pLines, isTruncated: false, chars: patched.hunkText.length,
+                blobSha256: pSha, blobRef: pRef, summary: summarizeReadOutput(patched.path, patched.hunkText),
+                status: FRESH_STATUS, messageId: msgId, sourceSessionId: sessionID,
               })
             }
           }
@@ -1756,13 +1811,8 @@ export class WorkingSetValve {
           const { sha256: wSha, blobRef: wRef } = this.blobStore.sink(body, { persistToDisk })
           if (isPrimarySession || isCrossSessionContinuityArtifact(normPath)) {
             filesModifiedMap.set(normPath, {
-              path: filePath,
-              normalizedPath: normPath,
-              operation: name,
-              tool: name,
-              messageId: msgId,
-              blobRef: wRef,
-              status: "COMMITTED_OR_APPLIED",
+              path: filePath, normalizedPath: normPath, operation: name, tool: name,
+              messageId: msgId, blobRef: wRef, status: "COMMITTED_OR_APPLIED",
             })
           }
           if (localReadsByPath.has(normPath)) {
@@ -1770,19 +1820,10 @@ export class WorkingSetValve {
           } else {
             const wLines = Math.max(1, body.replace(/\n$/, "").split("\n").length)
             recordAndTrackRead({
-              path: filePath,
-              normalizedPath: normPath,
-              lineRange: `L1-L${wLines}`,
-              startLine: 1,
-              endLine: wLines,
-              isTruncated: false,
-              chars: body.length,
-              blobSha256: wSha,
-              blobRef: wRef,
-              summary: summarizeReadOutput(filePath, body),
-              status: FRESH_STATUS,
-              messageId: msgId,
-              sourceSessionId: sessionID,
+              path: filePath, normalizedPath: normPath, lineRange: `L1-L${wLines}`,
+              startLine: 1, endLine: wLines, isTruncated: false, chars: body.length,
+              blobSha256: wSha, blobRef: wRef, summary: summarizeReadOutput(filePath, body),
+              status: FRESH_STATUS, messageId: msgId, sourceSessionId: sessionID,
             })
           }
         } else if ((name === "shell" || name === "bash") && typeof input.command === "string") {
@@ -1792,45 +1833,22 @@ export class WorkingSetValve {
             const summary = summarizeReadOutput(catSlice.path, catSlice.content)
             const cLines = Math.max(1, catSlice.content.replace(/\n$/, "").split("\n").length)
             recordAndTrackRead({
-              path: catSlice.path,
-              normalizedPath: normPath,
-              lineRange: `L1-L${cLines}`,
-              startLine: 1,
-              endLine: cLines,
-              isTruncated: false,
-              chars: catSlice.content.length,
-              blobSha256: cSha,
-              blobRef: cRef,
-              summary,
-              status: FRESH_STATUS,
-              messageId: msgId,
-              sourceSessionId: sessionID,
+              path: catSlice.path, normalizedPath: normPath, lineRange: `L1-L${cLines}`,
+              startLine: 1, endLine: cLines, isTruncated: false, chars: catSlice.content.length,
+              blobSha256: cSha, blobRef: cRef, summary, status: FRESH_STATUS, messageId: msgId, sourceSessionId: sessionID,
             })
             const skillMatch = /\/skills\/([^/]+)\/SKILL\.md$/.exec(catSlice.path)
             if (skillMatch) {
               const sName = skillMatch[1]!
               recordSkill({
-                name: sName,
-                chars: catSlice.content.length,
-                blobSha256: cSha,
-                blobRef: cRef,
-                summary,
-                status: ACTIVE_SKILL_STATUS,
-                messageId: msgId,
-                sourceSessionId: sessionID,
+                name: sName, chars: catSlice.content.length, blobSha256: cSha, blobRef: cRef,
+                summary, status: ACTIVE_SKILL_STATUS, messageId: msgId, sourceSessionId: sessionID,
               })
               skillBreadcrumbsByName.set(
                 sName,
                 formatFactBreadcrumb({
-                  callId: `${callId}_skill_${sName}`,
-                  messageId: msgId,
-                  tool: "skill",
-                  target: sName,
-                  lineRange: null,
-                  originalChars: catSlice.content.length,
-                  blobSha256: cSha,
-                  summary,
-                  status: ACTIVE_SKILL_BREADCRUMB_STATUS,
+                  callId: `${callId}_skill_${sName}`, messageId: msgId, tool: "skill", target: sName,
+                  lineRange: null, originalChars: catSlice.content.length, blobSha256: cSha, summary, status: ACTIVE_SKILL_BREADCRUMB_STATUS,
                 }),
               )
             }
@@ -1841,17 +1859,10 @@ export class WorkingSetValve {
             /sessionID[:=]\s*"?([a-zA-Z0-9_]+)"?/.exec(outputText)?.[1] ??
             null
           const harness = String(input.harness ?? (name === "delegate-devin" ? "devin" : "opencode"))
-          const agent = String(input.agent ?? name)
-          const description = String(input.description ?? target)
-          const isCompleted =
-            outputText.includes('state="completed"') || !outputText.includes("working in the background")
+          const isCompleted = outputText.includes('state="completed"') || !outputText.includes("working in the background")
           delegationMap.set(callId, {
-            callId,
-            childSessionID,
-            tool: name,
-            harness,
-            agent,
-            description,
+            callId, childSessionID, tool: name, harness, agent: String(input.agent ?? name),
+            description: String(input.description ?? target),
             reportedStatus: isCompleted ? "completed" : "dispatched_background",
             verifiedStatus: isCompleted ? "completed_report_only" : "unverified_in_flight",
             blobRef,
@@ -1862,30 +1873,19 @@ export class WorkingSetValve {
           toolPartsThinned += 1
           const lineRange = name === "read" ? (readCaptureLineRange ?? extractReadLineRange(input, outputText)) : null
           const summary =
-            name === "read"
-              ? summarizeReadOutput(target, outputText)
-              : name === "skill"
-                ? summarizeSkillOutput(target, outputText)
+            name === "read" ? summarizeReadOutput(target, outputText)
+              : name === "skill" ? summarizeSkillOutput(target, outputText)
                 : summarizeToolOutput(name, input, outputText)
-
           const bc = formatFactBreadcrumb({
-            callId,
-            messageId: msgId,
-            tool: name,
-            target,
-            lineRange,
-            originalChars: outputText.length,
-            blobSha256: sha256,
-            summary,
+            callId, messageId: msgId, tool: name, target, lineRange, originalChars: outputText.length,
+            blobSha256: sha256, summary,
             status: name === "skill" ? ACTIVE_SKILL_BREADCRUMB_STATUS : name === "read" ? readCaptureStatus : FRESH_STATUS,
           })
           breadcrumbsByCallId.set(callId, bc)
-
           if (!KEEP_RESULT.has(name)) {
             rawOutputCharsBefore += outputText.length
             breadcrumbCharsAfter += bc.rendered.length
           }
-
           if (!KEEP_INPUT.has(name)) {
             const rawInStr = JSON.stringify(input) ?? "{}"
             const thinnedIn = thinInputShapePreserving(input)
@@ -1908,48 +1908,48 @@ export class WorkingSetValve {
   }
 }
 
-export function applyContextHookInMemory(
-  event: {
-    sessionID: string
-    messages: Array<Record<string, any>>
-    system?: Array<string | { type: "text"; text: string }>
-  },
-  valveOrLedger?: WorkingSetValve | ValveExecutionLedger | null,
-  options?: ContextHookApplyOptions,
-): ContextHookApplyResult {
-  if (valveOrLedger instanceof WorkingSetValve) {
-    return valveOrLedger.applyContextHookInMemory(event, options)
+function normalizeExplicitLineRange(lineRange: string, startLine?: number, endLine?: number, totalLines?: number | null): string {
+  if (lineRange === "all" || lineRange === "#all" || lineRange.trim().length === 0) {
+    const start = startLine ?? 1; const end = Math.max(start, endLine ?? totalLines ?? 1)
+    return `L${start}-L${end}`
   }
-  const tempValve = new WorkingSetValve({
-    persistBlobsToDisk: false,
-    autoPruneThresholdRatio: options?.autoPruneThresholdRatio,
-    autoKeepRecentSteps: options?.autoKeepRecentSteps ?? options?.autoPruneKeepRecentSteps,
-    modelContextWindowTokens: options?.modelContextWindowTokens,
-  })
-  if (valveOrLedger) {
-    ;(tempValve as any).ledgers.set(event.sessionID, valveOrLedger)
-  }
-  return tempValve.applyContextHookInMemory(event, options)
+  return lineRange.startsWith("#") ? lineRange.slice(1) : lineRange
 }
 
-export function cloneMessagesForHook(messages: readonly Record<string, any>[]): Array<Record<string, any>> {
-  return messages.map((m) => {
-    if (!Array.isArray(m.content)) return { ...m }
-    return {
-      ...m,
-      content: m.content.map((p: any) => {
-        if (!p || typeof p !== "object") return p
-        if (p.type === "tool" && p.state) {
-          return {
-            ...p,
-            state: {
-              ...p.state,
-              content: Array.isArray(p.state.content) ? [...p.state.content] : p.state.content,
-            },
-          }
-        }
-        return { ...p }
-      }),
+export function renderCompactValveStatus(statusResult: Record<string, any>, pruneResult?: Record<string, any>): string {
+  const ledger = (pruneResult?.ledger ?? statusResult.ledger ?? null) as ValveExecutionLedger | null
+  const sessionID = String(ledger?.sessionID ?? statusResult.sessionID ?? "unknown")
+  const filesRead = (ledger?.manifest.filesRead ?? statusResult.filesRead ?? []) as readonly ManifestFileReadEntry[]
+  const filesModified = (ledger?.manifest.filesModified ?? statusResult.filesModified ?? []) as readonly ManifestFileModifiedEntry[]
+  const activeSkills = (ledger?.manifest.activeSkills ?? statusResult.activeSkills ?? []) as readonly ManifestSkillEntry[]
+  const delegationOutcomes = (ledger?.manifest.delegationOutcomes ?? statusResult.delegationOutcomes ?? []) as readonly ManifestDelegationEntry[]
+  const staleEntries = filesRead.filter((f) => f.status.startsWith("STALE"))
+  const sliceEntries = filesRead.filter((f) => !f.status.startsWith("STALE") && (f.status.startsWith("SLICE") || f.isTruncated))
+  const freshCount = filesRead.length - staleEntries.length - sliceEntries.length
+  const headerLine = ledger ? `WorkingSetValve [ARMED · ${ledger.mode} · keep=${ledger.keepRecentSteps} · anchor=${ledger.watermark.anchorMessageID ?? "none"} · thinned=${ledger.metrics.toolPartsThinned} parts (~${ledger.metrics.netTokensFreed} tok freed)]` : `WorkingSetValve [UNARMED · session=${sessionID}]`
+  const ledgerLine = `One-Truth File Ledger: Total tracked: ${filesRead.length} (${freshCount} FRESH, ${sliceEntries.length} SLICE, ${staleEntries.length} STALE) | Modified: ${filesModified.length} | Skills: ${activeSkills.length} | Delegations: ${delegationOutcomes.length}`
+  const lines = [headerLine, ledgerLine]
+  if (staleEntries.length === 0 && sliceEntries.length === 0) {
+    lines.push(filesRead.length > 0 ? `All ${filesRead.length} tracked files are FRESH on disk (pass full: true to list all rows).` : "No tracked files in ledger yet.")
+  } else {
+    const nonFresh = [...staleEntries, ...sliceEntries]
+    for (const f of nonFresh.slice(0, 8)) {
+      const range = normalizeExplicitLineRange(f.lineRange, f.startLine, f.endLine, f.totalLines)
+      const tag = f.status.startsWith("STALE") ? "STALE — re-verify slice" : `SLICE L${f.startLine ?? 1}-L${f.endLine ?? 1} (offset=${(f.endLine ?? 1) + 1})`
+      lines.push(`- \`${f.normalizedPath || f.path}#${range}\` -> \`${f.blobRef}\` | ${tag}`)
     }
+    if (nonFresh.length > 8) lines.push(`... +${nonFresh.length - 8} more non-fresh files (pass full: true for full manifest)`)
+  }
+  const out = lines.join("\n"); return out.length > 950 ? `${out.slice(0, 940)}…` : out
+}
+export function applyContextHookInMemory(event: { sessionID: string; messages: Array<Record<string, any>>; system?: Array<string | { type: "text"; text: string }> }, valveOrLedger?: WorkingSetValve | ValveExecutionLedger | null, options?: ContextHookApplyOptions): ContextHookApplyResult {
+  if (valveOrLedger instanceof WorkingSetValve) return valveOrLedger.applyContextHookInMemory(event, options)
+  const tempValve = new WorkingSetValve({ persistBlobsToDisk: false, autoPruneThresholdRatio: options?.autoPruneThresholdRatio, autoKeepRecentSteps: options?.autoKeepRecentSteps ?? options?.autoPruneKeepRecentSteps, modelContextWindowTokens: options?.modelContextWindowTokens })
+  if (valveOrLedger) (tempValve as any).ledgers.set(event.sessionID, valveOrLedger)
+  return tempValve.applyContextHookInMemory(event, options)
+}
+export function cloneMessagesForHook(messages: readonly Record<string, any>[]): Array<Record<string, any>> {
+  return messages.map((m) => !Array.isArray(m.content) ? { ...m } : {
+    ...m, content: m.content.map((p: any) => p && typeof p === "object" && p.type === "tool" && p.state ? { ...p, state: { ...p.state, content: Array.isArray(p.state.content) ? [...p.state.content] : p.state.content } } : p && typeof p === "object" ? { ...p } : p),
   })
 }

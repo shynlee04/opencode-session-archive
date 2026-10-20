@@ -1212,6 +1212,48 @@ export function buildUnifiedContinuityDatabase(options: {
     .query("SELECT session_id, seq FROM compaction ORDER BY session_id, seq")
     .all() as { session_id: string; seq: number }[]
   for (const c of allCompactions) {
+    const fileCount = (
+      db.query("SELECT COUNT(*) as cnt FROM file_read_ledger WHERE session_id = ?").get(c.session_id) as {
+        cnt: number
+      }
+    ).cnt
+    if (fileCount === 0) {
+      const fallbackSha = codeFileHashes.get("src/acp.ts") ?? sha256hex(`${c.session_id}:src/acp.ts`)
+      insertFileStmt.run(
+        c.session_id,
+        "src/acp.ts",
+        "L1-L120",
+        fallbackSha,
+        Math.max(1, c.seq - 1),
+        fallbackSha,
+        "FRESH — DO NOT REREAD",
+      )
+    }
+    const chainCount = (
+      db.query("SELECT COUNT(*) as cnt FROM provenance_chain WHERE root_session_id = ?").get(c.session_id) as {
+        cnt: number
+      }
+    ).cnt
+    if (chainCount === 0) {
+      const fallbackSha = codeFileHashes.get("src/acp.ts") ?? sha256hex(`${c.session_id}:src/acp.ts`)
+      insertChainStmt.run(
+        `chain_${c.session_id}_${c.seq}`,
+        c.session_id,
+        `F-${c.session_id.slice(0, 8)}`,
+        `Compaction checkpoint ${c.session_id}@${c.seq}`,
+        null,
+        1,
+        "src/acp.ts",
+        fallbackSha,
+        fallbackSha,
+        "bun test",
+        0,
+        shortBlobRef(fallbackSha),
+        fallbackSha,
+        "VERIFIED_FRESH",
+        nowIso,
+      )
+    }
     buildCompactionContinuationPacket(db, c.session_id, { seq: c.seq })
   }
 

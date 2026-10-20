@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { builtinModules } from "node:module"
 import path from "node:path"
 
@@ -46,7 +46,28 @@ const header = [
   "",
 ].join("\n")
 
-mkdirSync(path.join(root, "dist"), { recursive: true })
-const target = path.join(root, "dist/session-archive.ts")
-writeFileSync(target, header + code)
-console.log(`wrote ${path.relative(root, target)} (${Buffer.byteLength(header + code)} bytes)`)
+const bundledServerCode = header + code
+
+const distDir = path.join(root, "dist")
+mkdirSync(path.join(distDir, "src/tui"), { recursive: true })
+const target = path.join(distDir, "session-archive.ts")
+writeFileSync(target, bundledServerCode)
+
+const tuiFiles = ["view.tsx", "panel.tsx", "sidebar.tsx", "status.tsx", "commands.tsx"] as const
+copyFileSync(path.join(root, "tui.tsx"), path.join(distDir, "tui.tsx"))
+copyFileSync(path.join(root, "src/rpc.ts"), path.join(distDir, "src/rpc.ts"))
+for (const f of tuiFiles) {
+  copyFileSync(path.join(root, "src/tui", f), path.join(distDir, "src/tui", f))
+}
+
+const legacySingleFilePlugin = path.join(root, ".opencode/plugins/session-archive.ts")
+if (existsSync(legacySingleFilePlugin)) {
+  rmSync(legacySingleFilePlugin, { force: true })
+}
+const legacyDirPlugin = path.join(root, ".opencode/plugins/hivemind-substrate")
+if (existsSync(legacyDirPlugin)) {
+  rmSync(legacyDirPlugin, { recursive: true, force: true })
+}
+
+console.log(`wrote ${path.relative(root, target)} (${Buffer.byteLength(bundledServerCode)} bytes)`)
+

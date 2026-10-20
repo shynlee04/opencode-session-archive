@@ -340,4 +340,133 @@ describe("VSC-01 / VSC-R1: semantic session digest, 9-category IntentPivot, and 
       rmSync(tmpDir, { recursive: true, force: true })
     }
   })
+
+  test("VSC-R4 (S1-1, S1-2, S1-3, S1-5): FTS single-digit noise filtering, zero-overlap activeRootSessionID guard, long-prompt prune_or_continuity guard, and gate label", () => {
+    const tmpDir = makeTmpDir()
+    const archiveDir = join(tmpDir, ".session-archive")
+    const sqlitePath = join(archiveDir, "index.sqlite")
+    const db = initSyncDatabase(sqlitePath)
+    try {
+      ensureSemanticDigestSchema(db)
+
+      const rootA = "ses_root_alpha"
+      const rootB = "ses_root_beta"
+      const insertSession = db.query(`
+        INSERT INTO session (
+          id, root_id, project_id, parent_id, depth, lane_kind, lane_path,
+          title, agent, harness, outcome, message_count, transcript_path, t_created, t_updated
+        ) VALUES (?, ?, 'proj_test', null, 0, 'root', '', ?, 'ultra', 'opencode', 'succeeded', 2, ?, 1000, 2000)
+      `)
+      insertSession.run(
+        rootA,
+        rootA,
+        "Wave2-Slice1 Semantic Digest & Vibe Navigation",
+        `sessions/${rootA}/${rootA}.jsonl`,
+      )
+      insertSession.run(
+        rootB,
+        rootB,
+        "Database Migration & CoChange Matrix",
+        `sessions/${rootB}/${rootB}.jsonl`,
+      )
+
+      const rootADir = join(archiveDir, "sessions", rootA)
+      mkdirSync(rootADir, { recursive: true })
+      writeFileSync(
+        join(rootADir, `${rootA}.jsonl`),
+        [
+          JSON.stringify({ kind: "session", id: rootA }),
+          JSON.stringify({
+            id: "msg_1",
+            kind: "user",
+            t: 1001,
+            raw_ref: { session_id: rootA, message_id: "msg_1", seq: 1 },
+            text: "Implement wave2-slice1 semantic session digest and FTS5 vibe navigation",
+          }),
+          JSON.stringify({
+            id: "msg_2",
+            kind: "assistant",
+            t: 1002,
+            raw_ref: { session_id: rootA, message_id: "msg_2", seq: 2 },
+            parts: [
+              {
+                kind: "tool",
+                name: "shell",
+                input: { command: "bun test" },
+                output: "10 pass\n0 fail",
+              },
+            ],
+          }),
+        ].join("\n"),
+        "utf8",
+      )
+
+      const rootBDir = join(archiveDir, "sessions", rootB)
+      mkdirSync(rootBDir, { recursive: true })
+      writeFileSync(
+        join(rootBDir, `${rootB}.jsonl`),
+        [
+          JSON.stringify({ kind: "session", id: rootB }),
+          JSON.stringify({
+            id: "msg_b1",
+            kind: "user",
+            t: 1100,
+            raw_ref: { session_id: rootB, message_id: "msg_b1", seq: 1 },
+            text: "Build git cochange matrix and pagerank centrality map in 2 steps",
+          }),
+        ].join("\n"),
+        "utf8",
+      )
+
+      materializeSemanticDigests(db, { archiveDir })
+
+      // S1-2 & S1-3: Single-digit numeric noise ("Stage 1 Stage 2") + unmatched substantive token
+      // must NOT match every session via "1" / "2" or activeRootSessionID fallback
+      const stageNoiseMatch = queryVibeNavigation(db, {
+        query: "Stage 1 Stage 2 xyznonexistenttoken",
+        activeRootSessionID: rootA,
+        limit: 5,
+      })
+      expect(stageNoiseMatch.matchedSessions).toEqual([])
+      expect(stageNoiseMatch.matchedRootSessionID).toBe("")
+      expect(stageNoiseMatch.markdown).toContain("No matching sessions found")
+
+      const pureStageNumbers = queryVibeNavigation(db, {
+        query: "Stage 1 Stage 2",
+        activeRootSessionID: rootA,
+        limit: 5,
+      })
+      // Neither session contains "stage", and "1"/"2" single-digit noise is stripped
+      expect(pureStageNumbers.matchedSessions).toEqual([])
+
+      // S1-1: Gate rendered in queryVibeNavigation matches formatVerificationGateLabel
+      const alphaNav = queryVibeNavigation(db, {
+        rootSessionID: rootA,
+      })
+      expect(alphaNav.markdown).toContain(
+        "verified_passed — PASS (all verified files fresh on disk)",
+      )
+
+      // S1-5: Long pasted report (> 260 chars) mentioning substrate.valve or context-prune in prose
+      // must NOT be misclassified as prune_or_continuity
+      const longWalkPrompt =
+        "Execute the full multi-stage architectural verification walk across the repository. " +
+        "In Stage 1 and Stage 2, compare native baseline telemetry against substrate.viewport and substrate.valve " +
+        "to evaluate token budgets, context-prune watermarks, and compaction continuity across all 4 viewports " +
+        "before writing the final engineering report in .audit/2026-10-19-uat-walk-orchestrator/REPORT.md."
+      expect(longWalkPrompt.length).toBeGreaterThan(260)
+
+      const shortPruneCommand =
+        "Please run substrate.valve({ action: 'prune' }) to check the step watermark."
+      expect(shortPruneCommand.length).toBeLessThanOrEqual(260)
+
+      const longKind = classifyIntentPivot(longWalkPrompt, 2)
+      const shortKind = classifyIntentPivot(shortPruneCommand, 2)
+      expect(longKind).not.toBe("prune_or_continuity")
+      expect(shortKind).toBe("prune_or_continuity")
+    } finally {
+      db.close()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })

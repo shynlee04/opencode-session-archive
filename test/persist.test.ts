@@ -798,6 +798,145 @@ describe("TWM-02, TWM-03 & TWM-04: spine tables, incremental watermark sync, and
       index.close()
     }
   })
+
+  test("TWM-R4 (A2): SessionSource lists project/all root sessions and persistProject syncs multi-session project and all-projects scopes with warm watermark skip", async () => {
+    const archiveMod = (await import("../src/archive/index.ts")) as Record<string, unknown>
+    const persistProject = archiveMod.persistProject as (
+      input: {
+        readonly projectID: string
+        readonly projectRoot: string
+        readonly dir?: string
+        readonly dbPath?: string
+        readonly sessionID?: string
+        readonly scope?: "session" | "project" | "all-projects"
+        readonly maxRootSessions?: number
+      },
+      source?: ReturnType<typeof sqliteSource>,
+    ) => Promise<{
+      readonly scope: "session" | "project" | "all-projects"
+      readonly rootSessionsSynced: number
+      readonly totalSessionsSynced: number
+      readonly skippedWarmTrees: number
+      readonly warnings: readonly string[]
+    }>
+    expect(typeof persistProject).toBe("function")
+
+    // Seed a second root session in the same project and a third root session in another project
+    addSession(db, {
+      id: "ses_root_2",
+      project_id: PROJECT_ID,
+      directory: projectRoot,
+      title: "second root in project",
+      time_created: 6000,
+      time_updated: 6100,
+    })
+    addSession(db, {
+      id: "ses_root_2_child",
+      project_id: PROJECT_ID,
+      parent_id: "ses_root_2",
+      directory: projectRoot,
+      title: "child of second root",
+      time_created: 6050,
+      time_updated: 6080,
+    })
+    addMessage(db, {
+      id: "msg_r2_u1",
+      session_id: "ses_root_2",
+      type: "user",
+      seq: 1,
+      data: { time: { created: 6001 }, text: "second root prompt" },
+    })
+
+    addProject(db, "proj_other", "/other-repo")
+    addSession(db, {
+      id: "ses_other_root",
+      project_id: "proj_other",
+      directory: "/other-repo",
+      title: "cross-project root",
+      time_created: 7000,
+      time_updated: 7100,
+    })
+    addMessage(db, {
+      id: "msg_other_u1",
+      session_id: "ses_other_root",
+      type: "user",
+      seq: 1,
+      data: { time: { created: 7001 }, text: "cross-project prompt" },
+    })
+
+    const source = sqliteSource(dbPath)
+    try {
+      expect(typeof source.listProjectRootSessions).toBe("function")
+      expect(typeof source.listAllRootSessions).toBe("function")
+      expect(typeof source.listProjects).toBe("function")
+
+      const projects = source.listProjects!()
+      expect(projects.map((p) => p.id).sort()).toEqual([PROJECT_ID, "proj_other"].sort())
+
+      const projRoots = source.listProjectRootSessions!(PROJECT_ID)
+      expect(projRoots.map((s) => s.id)).toEqual(["ses_root_2", "ses_root"])
+
+      const allRoots = source.listAllRootSessions!()
+      expect(allRoots.map((s) => s.id)).toEqual(["ses_other_root", "ses_root_2", "ses_root"])
+
+      // 1. Project scope syncs both ses_root (5 sessions) and ses_root_2 (2 sessions)
+      const projRes = await persistProject(
+        {
+          projectID: PROJECT_ID,
+          projectRoot,
+          scope: "project",
+        },
+        source,
+      )
+      expect(projRes.scope).toBe("project")
+      expect(projRes.rootSessionsSynced).toBe(2)
+      expect(projRes.totalSessionsSynced).toBe(7)
+      expect(projRes.skippedWarmTrees).toBe(0)
+
+      // 2. Second project sync hits warm watermarks on both root trees
+      const warmRes = await persistProject(
+        {
+          projectID: PROJECT_ID,
+          projectRoot,
+          scope: "project",
+        },
+        source,
+      )
+      expect(warmRes.rootSessionsSynced).toBe(2)
+      expect(warmRes.skippedWarmTrees).toBe(2)
+
+      // 3. All-projects scope syncs ses_other_root as well while skipping warm project roots
+      const allRes = await persistProject(
+        {
+          projectID: PROJECT_ID,
+          projectRoot,
+          scope: "all-projects",
+        },
+        source,
+      )
+      expect(allRes.scope).toBe("all-projects")
+      expect(allRes.rootSessionsSynced).toBe(3)
+      expect(allRes.totalSessionsSynced).toBe(8)
+      expect(allRes.skippedWarmTrees).toBe(2)
+
+      const index = new Database(path.join(archiveDir(), "index.sqlite"), { readonly: true })
+      try {
+        const rootRows = index
+          .query("SELECT id, project_id FROM session WHERE depth = 0 ORDER BY id ASC")
+          .all() as Array<{ id: string; project_id: string }>
+        expect(rootRows).toEqual([
+          { id: "ses_other_root", project_id: "proj_other" },
+          { id: "ses_root", project_id: PROJECT_ID },
+          { id: "ses_root_2", project_id: PROJECT_ID },
+        ])
+      } finally {
+        index.close()
+      }
+    } finally {
+      source.close()
+    }
+  })
 })
+
 
 

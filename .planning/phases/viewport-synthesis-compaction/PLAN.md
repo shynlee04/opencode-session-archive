@@ -47,7 +47,36 @@
    - `app` slot (`SubstrateCommands`): global keymap layer registering palette & slash commands (`/substrate`, `/substrate-prune`, `/substrate-repomap`, `/substrate-provenance`) that open the `substrate.inspector` panel or trigger live RPC actions with toast feedback.
 3. Create `src/cli.ts` (`bun run substrate <status|sync|repomap|skeleton|slice|coupled|provenance|timeline|search|brief|prune> [args...]`) for zero-config terminal inspection.
 
+### Unit VSC-R4: Unified Plain-Language Gate, Honest Zero-Hit Search, `compaction` Preview Action & JSON Envelope (`decisions.tsv` #7: `A2`, `A3`)
+1. Run `reconcileProvenanceStaleness(db, sessionId, activeWorktreeRoot)` during `ensureSyncedDb` / `materializeSemanticDigests` and inside `action === "provenance"` (`src/plugin.ts`) so `session_semantic_digest.verification_state` and `compaction_continuation_ledger.verification_gate_status` never disagree, and format the gate in plain language (`PASS (N verified files fresh)` vs `NEEDS RE-VERIFY (K files modified since last test pass: ...)`).
+2. Update `queryVibeNavigation` (`src/viewports/semantic-digest.ts`) to filter out single-digit noise tokens and require at least `1` non-numeric query token match before applying active-session boost, returning `Matched: 0` on unrelated queries.
+3. Tighten `PIVOT_RULES[0]` (`prune_or_continuity` in `src/viewports/semantic-digest.ts`) so long pasted reports or benchmark prompts mentioning `substrate.valve` are classified by their actual intent rather than `prune_or_continuity`.
+4. Add `action: "compaction"` to `substrate.viewport` (`src/plugin.ts`, `src/cli.ts`, `src/rpc.ts`) to preview the `< 1,200`-token `CompactionContinuationPacket`, normalize `format: "json"` across all actions to `{ ok, action, sessionID, tokenCount, budgetTokens, content, data }`, remove duplicate token keys in `src/viewports/brief.ts`, and normalize telemetry `action` on aliases (`search`, `sync`, `prune`).
+
+### Unit VSC-R5: OpenCode V2 Package Directory Install, Full-Screen `/substrate` Route & Mudball Advisor TUI (`decisions.tsv` #7: `A1`)
+1. Unify plugin ID to `"hivemind-substrate"` in both `src/plugin.ts` and `tui.tsx`.
+2. Fix RPC client/server wiring (`tui.tsx`, `src/plugin.ts`, `src/rpc.ts`): pass `{ location: { directory } }` on `rpcClient.snapshot` and `rpcClient.action`, subscribe via `rpcClient.events.on(SUBSTRATE_UPDATED_EVENT, ...)`, and emit via `rpcHandle?.events?.emit(SUBSTRATE_UPDATED_EVENT, ...)` in `src/plugin.ts`.
+3. Enrich `SubstrateSnapshot` (`src/rpc.ts`, `src/cli.ts`) with full top PageRank `RepoMap` files + per-file `AstSkeleton` symbol outlines, `MudballHotspot` items (high-LOC files, fan-in/fan-out hubs, god symbols `>= 150` lines, and `has_static_edge = 0` hidden coupling pairs), `compactionPreview` markdown, and aggregate token-compression metrics (`valveTokensSaved`, `skeletonTokensSaved`, `compressionPct`).
+4. Model `tui.tsx` and `src/tui/{view.tsx,panel.tsx,sidebar.tsx,status.tsx,commands.tsx}` on `hivemind-steward-oc-devin-dev/src/hosted/{registration.tsx,view.tsx,panel.tsx,sidebar.tsx,render.tsx,commands.ts}`:
+   - Register full-screen route `context.ui.router.register({ name: "substrate", render: () => <SubstrateView ... /> })` so `/substrate` pops the 100% full-screen Mudball & Architecture Advisor view (`escape` returns to `{ type: "home" }`).
+   - Mount `<SubstrateCommands>` inside `context.ui.slot({ append: "app", render: ... })`.
+   - Gate `SubstratePanel` (`session.panel`) keybindings via `context.keymap.layer` with `enabled: () => props.input.focused` so typing in the main chat prompt is never intercepted when unfocused.
+   - Render interactive `up`/`down`/`return` file selection over PageRank `RepoMap` -> live `AstSkeleton` symbol outline -> `Hidden Coupling` & complexity hotspots + One-Truth Provenance & Gate + Compaction Continuity preview + live token savings in header, sidebar, and footer pill.
+5. Update `scripts/build.ts` to materialize the OpenCode V2 plugin package directory (`.opencode/plugins/hivemind-substrate/` with `package.json`, `index.ts`, `server.ts`, `tui.tsx`, `rpc.ts`, and `src/tui/*`, plus `opencode.json` registration) alongside `dist/session-archive.ts`.
+
 ## Verification & Acceptance Gate
 - `rg "S2 msg\[124|/Users/MAC|hivemind-steward-oc-devin-dev" src/` returns `0` matches.
 - `bun test && bun run typecheck && bun run build` passes 100%.
-- Live UAT re-verification against `.session-archive/index.sqlite` confirms `D1`, `D2`, and `D3` are resolved with durable runtime evidence.
+- Live verification against `~/.local/share/opencode/opencode.db` (`hivemind-steward-oc-devin-dev`'s 924 sessions, 1,413 delegations, 124 compactions) and cross-project queries confirms all 21 findings (`S1-1..S1-5`, `S2-1..S2-5`, `S3-1..S3-9`, `E-3`, `E-4`, `E-8`, and the 3-arm benchmark gaps) are resolved with measured runtime evidence.
+
+## Owner-reported command and status regression, 2026-10-19
+
+Tracked by `tickets/VSC-R6-command-status-regression.md`. Restore the existing
+VSC-R3/R5 command and inspector contract, not a new capability or redesign.
+Preserve the dirty working tree and immutable prior builds. No commit, external
+agent run, host database access, service restart, or global configuration change.
+
+Ordered checks are reproduction, discriminating diagnosis, behavioral red/green,
+independent review, full tests/typecheck/build, and a fresh local build selection.
+Terminal interaction against an isolated host is required if available. Otherwise
+record the precise runtime gap and leave owner UAT pending.

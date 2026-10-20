@@ -61,6 +61,12 @@ export interface SkeletonizeOptions {
   readonly knownPaths?: ReadonlySet<string>
   readonly closureFactoryMinLines?: number
   readonly factoryLineThreshold?: number
+  readonly includePrivate?: boolean
+}
+
+export interface QueryAstSkeletonOptions {
+  readonly includePrivate?: boolean
+  readonly rootDir?: string
 }
 
 export interface SkeletonizeResult {
@@ -304,9 +310,10 @@ function normalizeWhitespace(s: string): string {
 }
 
 function isRegexTriggerCharCode(code: number): boolean {
-  // =(,:[!&|?{};~+-*%^
+  // =(,:[!&|?{};~+-*%^>
   return (
     code === 61 ||
+    code === 62 ||
     code === 40 ||
     code === 44 ||
     code === 58 ||
@@ -938,6 +945,11 @@ function findDeclarationSpan(lex: LexicalLines, startLine: number, kind: SymbolK
   return { sigEndLine, endLine: numLines, isFunctionLike: seenArrow }
 }
 
+function capSignatureHeader(header: string): string {
+  const trimmed = header.trim()
+  return trimmed.length > 120 ? `${trimmed.slice(0, 117).trimEnd()}...` : trimmed
+}
+
 function buildSignature(
   lex: LexicalLines,
   startLine: number,
@@ -950,31 +962,93 @@ function buildSignature(
     const t = lex.getDisplayLine(L).trim()
     if (t) raw.push(t)
   }
-  let joined = normalizeWhitespace(raw.join(" "))
+  const joined = normalizeWhitespace(raw.join(" "))
+  let header: string
   if (kind === "interface" || kind === "class" || kind === "enum") {
-    joined = joined.replace(/\s*\{.*$/, "")
-    return `${joined} { /* L${startLine}-L${endLine} */ }`
+    header = joined.replace(/\s*\{.*$/, "")
+  } else if (kind === "type") {
+    if (startLine === endLine && joined.length <= 120) {
+      header = joined
+    } else {
+      const eqIdx = joined.indexOf("=")
+      header = eqIdx !== -1 ? joined.slice(0, eqIdx + 1).trim() : joined
+    }
+  } else {
+    const arrowIdx = joined.lastIndexOf("=>")
+    if (arrowIdx !== -1) {
+      header = joined.slice(0, arrowIdx + 2).trim()
+    } else if (kind === "function" || kind === "method") {
+      const braceIdx = joined.lastIndexOf("{")
+      header = braceIdx !== -1 ? joined.slice(0, braceIdx).trim() : joined
+    } else if (startLine === endLine && joined.length <= 120) {
+      header = joined
+    } else {
+      const eqIdx = joined.indexOf("=")
+      header = eqIdx !== -1 ? joined.slice(0, eqIdx + 1).trim() : joined
+    }
   }
-  if (kind === "type") {
-    if (startLine === endLine && joined.length <= 100) return joined
-    const eqIdx = joined.indexOf("=")
-    const lhs = eqIdx !== -1 ? joined.slice(0, eqIdx + 1).trim() : joined
-    return `${lhs} /* L${startLine}-L${endLine} */`
+  return `${capSignatureHeader(header)} [L${startLine}-L${endLine}]`
+}
+
+export function filterAstSkeletonSymbols(
+  symbols: readonly ExtractedSymbol[],
+  includePrivate = false,
+): ExtractedSymbol[] {
+  if (includePrivate) return [...symbols]
+  const includedDepth1 = new Set<string>()
+  for (const s of symbols) {
+    if (s.depth === 1 && s.exported) {
+      includedDepth1.add(s.name)
+    }
   }
-  const arrowIdx = joined.lastIndexOf("=>")
-  if (arrowIdx !== -1) {
-    const header = joined.slice(0, arrowIdx + 2).trim()
-    return `${header} { /* L${startLine}-L${endLine} */ }`
+  if (includedDepth1.size === 0) {
+    return [...symbols]
   }
-  if (kind === "function" || kind === "method") {
-    const braceIdx = joined.lastIndexOf("{")
-    const header = braceIdx !== -1 ? joined.slice(0, braceIdx).trim() : joined
-    return `${header} { /* L${startLine}-L${endLine} */ }`
+  return symbols.filter((s) =>
+    s.depth === 1
+      ? s.exported
+      : Boolean((s.parent_symbol && includedDepth1.has(s.parent_symbol)) || s.exported),
+  )
+}
+
+export function renderAstSkeleton(
+  target: {
+    readonly path?: string
+    readonly filePath?: string
+    readonly loc: number
+    readonly imports?: readonly {
+      readonly to_path?: string
+      readonly resolvedPath?: string | null
+      readonly specifier: string
+    }[]
+    readonly importHeaderLine?: string | null
+    readonly symbols: readonly ExtractedSymbol[]
+  },
+  options?: { readonly includePrivate?: boolean },
+): string {
+  const normPath = normalizeRelPath(target.path ?? target.filePath ?? "")
+  const includePrivate = Boolean(options?.includePrivate)
+  const visibleSymbols = filterAstSkeletonSymbols(target.symbols, includePrivate)
+  const skeletonLines: string[] = [`// ${normPath} (${target.loc} LOC)`]
+
+  if (target.importHeaderLine) {
+    skeletonLines.push(target.importHeaderLine)
+  } else if (target.imports && target.imports.length > 0) {
+    const specs = target.imports.map((im) => im.resolvedPath ?? im.to_path ?? im.specifier)
+    skeletonLines.push(`// imports: ${specs.join(", ")}`)
   }
-  if (startLine === endLine && joined.length <= 100) return joined
-  const eqIdx = joined.indexOf("=")
-  const lhs = eqIdx !== -1 ? joined.slice(0, eqIdx + 1).trim() : joined
-  return `${lhs} /* L${startLine}-L${endLine} */`
+
+  for (const sym of visibleSymbols) {
+    const rangeTag = `[L${sym.start_line}-L${sym.end_line}]`
+    const cleanedSig = sym.signature
+      .replace(/\s*\{\s*\/\*\s*L\d+-L\d+\s*\*\/\s*\}\s*$/, "")
+      .replace(/\s*\/\*\s*L\d+-L\d+\s*\*\/\s*$/, "")
+      .trim()
+    const lineBody = cleanedSig.includes(rangeTag) ? cleanedSig : `${capSignatureHeader(cleanedSig)} ${rangeTag}`
+    skeletonLines.push(sym.depth === 2 ? `  ${lineBody}` : lineBody)
+  }
+
+  return skeletonLines.join("\n")
 }
 
 export function skeletonizeSource(
@@ -982,7 +1056,7 @@ export function skeletonizeSource(
   sourceText: string,
   options: SkeletonizeOptions = {},
 ): SkeletonizeResult {
-  const normPath = normalizeRelPath(filePath)
+  const normPath = normalizeRepoPath(filePath, options.rootDir)
   const isTsx = normPath.endsWith(".tsx")
   const scanned = (isTsx ? tsxTranspiler : tsTranspiler).scan(sourceText)
   const lex = scanLexicalLines(sourceText)
@@ -998,12 +1072,6 @@ export function skeletonizeSource(
   const explicitThreshold = options.closureFactoryMinLines ?? options.factoryLineThreshold
   const factoryThreshold = explicitThreshold ?? 200
   const symbols: ExtractedSymbol[] = []
-  const skeletonLines: string[] = [`// ${normPath} (${lex.numLines} LOC)`]
-
-  if (imports.length > 0) {
-    const specs = imports.map((im) => im.resolvedPath ?? im.specifier)
-    skeletonLines.push(`// imports: ${specs.join(", ")}`)
-  }
 
   const { numLines, rawLines, lineStartBrace, lineStartParen, lineStartInLiteral } = lex
 
@@ -1054,7 +1122,6 @@ export function skeletonizeSource(
       signature: sig,
       exported,
     })
-    skeletonLines.push(`[L${L}-L${span.endLine}] ${sig}`)
 
     const spanLen = span.endLine - L + 1
     const shouldDescendDepth2 =
@@ -1096,7 +1163,6 @@ export function skeletonizeSource(
               signature: mSig,
               exported,
             })
-            skeletonLines.push(`  [L${cL}-L${mSpan.endLine}] ${mSig}`)
             cL = mSpan.endLine
           }
         } else {
@@ -1119,7 +1185,6 @@ export function skeletonizeSource(
                 signature: fSig,
                 exported: false,
               })
-              skeletonLines.push(`  [L${cL}-L${fSpan.endLine}] ${fSig}`)
             }
             cL = fSpan.endLine
             continue
@@ -1154,7 +1219,6 @@ export function skeletonizeSource(
                   signature: rSig,
                   exported: true,
                 })
-                skeletonLines.push(`  [L${rL}-L${rSpan.endLine}] ${rSig}`)
                 rL = rSpan.endLine
               }
             }
@@ -1167,7 +1231,15 @@ export function skeletonizeSource(
     L = span.endLine
   }
 
-  const skeletonText = skeletonLines.join("\n")
+  const skeletonText = renderAstSkeleton(
+    {
+      filePath: normPath,
+      loc: numLines,
+      imports,
+      symbols,
+    },
+    { includePrivate: options.includePrivate ?? false },
+  )
   const rawChars = sourceText.length
   const skeletonChars = skeletonText.length
   const rawTokens = estimateTokens(sourceText)
@@ -1194,7 +1266,7 @@ export function skeletonizeFile(
   relPath: string,
   options: SkeletonizeOptions = {},
 ): SkeletonizeResult {
-  const normPath = normalizeRelPath(relPath)
+  const normPath = normalizeRepoPath(relPath, rootDir)
   const absPath = path.join(rootDir, normPath)
   const sourceText = readFileSync(absPath, "utf8")
   return skeletonizeSource(normPath, sourceText, { ...options, rootDir: options.rootDir ?? rootDir })
@@ -1444,10 +1516,23 @@ export function indexCodebase(
   }
 }
 
-export function readAstSkeleton(db: Database, filePath: string): AstSkeletonView | null {
+export function readAstSkeleton(
+  db: Database,
+  filePath: string,
+  options?: QueryAstSkeletonOptions,
+): AstSkeletonView | null {
   ensureCodeGraphSchema(db)
-  const normPath = normalizeRelPath(filePath)
-  const fileRow = db.query("SELECT * FROM code_file WHERE path = ?").get(normPath) as CodeFileRow | null
+  const normCandidate = normalizeRepoPath(filePath, options?.rootDir ?? process.cwd())
+  let fileRow = db.query("SELECT * FROM code_file WHERE path = ?").get(normCandidate) as CodeFileRow | null
+  let normPath = normCandidate
+  if (!fileRow) {
+    const srcIdx = normCandidate.indexOf("src/")
+    if (srcIdx > 0) {
+      const fallbackPath = normCandidate.slice(srcIdx)
+      fileRow = db.query("SELECT * FROM code_file WHERE path = ?").get(fallbackPath) as CodeFileRow | null
+      if (fileRow) normPath = fallbackPath
+    }
+  }
   if (!fileRow) return null
 
   const symbolRows = db
@@ -1462,36 +1547,54 @@ export function readAstSkeleton(db: Database, filePath: string): AstSkeletonView
     .query("SELECT * FROM code_import_edge WHERE to_path = ? ORDER BY from_path ASC")
     .all(normPath) as CodeImportEdgeRow[]
 
+  const allSymbols: ExtractedSymbol[] = symbolRows.map((s) => {
+    const qName =
+      s.qualified_name && s.qualified_name.length > 0
+        ? s.qualified_name
+        : s.parent_symbol
+          ? `${s.parent_symbol}.${s.name}`
+          : s.name
+    return {
+      path: s.path,
+      name: s.name,
+      qualified_name: qName,
+      kind: s.kind,
+      depth: (s.depth === 2 ? 2 : 1) as 1 | 2,
+      parent_symbol: s.parent_symbol,
+      start_line: s.start_line,
+      end_line: s.end_line,
+      signature: s.signature,
+      exported: Boolean(s.exported),
+    }
+  })
+
+  const includePrivate = Boolean(options?.includePrivate)
+  const visibleSymbols = filterAstSkeletonSymbols(allSymbols, includePrivate)
+  const storedImportLine =
+    fileRow.skeleton_text.split("\n").find((l) => l.startsWith("// imports: ")) ?? null
+  const renderedSkeletonText = renderAstSkeleton(
+    {
+      path: fileRow.path,
+      loc: fileRow.loc,
+      importHeaderLine: storedImportLine,
+      imports: outEdgeRows.map((e) => ({ to_path: e.to_path, specifier: e.specifier || e.to_path })),
+      symbols: allSymbols,
+    },
+    { includePrivate },
+  )
+  const renderedSkeletonTokens = estimateTokens(renderedSkeletonText)
+
   return {
     path: fileRow.path,
     blob_sha: fileRow.blob_sha,
     loc: fileRow.loc,
     raw_tokens: fileRow.raw_tokens,
-    skeleton_tokens: fileRow.skeleton_tokens,
-    reduction_ratio: fileRow.raw_tokens > 0 ? 1 - fileRow.skeleton_tokens / fileRow.raw_tokens : 0,
+    skeleton_tokens: renderedSkeletonTokens,
+    reduction_ratio: fileRow.raw_tokens > 0 ? 1 - renderedSkeletonTokens / fileRow.raw_tokens : 0,
     pagerank: fileRow.pagerank,
     updated_at: fileRow.updated_at,
-    skeleton_text: fileRow.skeleton_text,
-    symbols: symbolRows.map((s) => {
-      const qName =
-        s.qualified_name && s.qualified_name.length > 0
-          ? s.qualified_name
-          : s.parent_symbol
-            ? `${s.parent_symbol}.${s.name}`
-            : s.name
-      return {
-        path: s.path,
-        name: s.name,
-        qualified_name: qName,
-        kind: s.kind,
-        depth: (s.depth === 2 ? 2 : 1) as 1 | 2,
-        parent_symbol: s.parent_symbol,
-        start_line: s.start_line,
-        end_line: s.end_line,
-        signature: s.signature,
-        exported: Boolean(s.exported),
-      }
-    }),
+    skeleton_text: renderedSkeletonText,
+    symbols: visibleSymbols,
     imports: outEdgeRows.map((e) => {
       const parsed = JSON.parse(e.symbols_json || e.specifiers_json || "[]") as string[]
       return {
@@ -1529,8 +1632,9 @@ export function readSymbolSlice(
   const { db, rootDir } = resolveDbAndRootDir(first, second)
   ensureCodeGraphSchema(db)
 
-  const normPath = normalizeRelPath(filePath)
-  const absPath = path.join(rootDir, normPath)
+  const normPath = normalizeRepoPath(filePath, rootDir)
+  const candidateAbs = path.join(rootDir, normPath)
+  const absPath = existsSync(candidateAbs) ? candidateAbs : resolveDiskPath(filePath, rootDir)
   if (!existsSync(absPath)) return null
 
   const sourceText = readFileSync(absPath, "utf8")
@@ -1653,16 +1757,16 @@ export function indexSingleFileSkeleton(
   const normPath = normalizeRepoPath(filePath, rootDir)
   const absPath = resolveDiskPath(filePath, rootDir)
   if (!existsSync(absPath)) {
-    return readAstSkeleton(db, normPath)
+    return readAstSkeleton(db, normPath, { rootDir })
   }
 
   let content: string
   try {
     const st = statSync(absPath)
-    if (!st.isFile()) return readAstSkeleton(db, normPath)
+    if (!st.isFile()) return readAstSkeleton(db, normPath, { rootDir })
     content = readFileSync(absPath, "utf8")
   } catch {
-    return readAstSkeleton(db, normPath)
+    return readAstSkeleton(db, normPath, { rootDir })
   }
 
   const blobSha = computeBlobSha(content)
@@ -1670,7 +1774,7 @@ export function indexSingleFileSkeleton(
     .query("SELECT blob_sha FROM code_file WHERE path = ?")
     .get(normPath) as { blob_sha: string } | null
   if (existing && existing.blob_sha === blobSha) {
-    return readAstSkeleton(db, normPath)
+    return readAstSkeleton(db, normPath, { rootDir })
   }
 
   const skeleton = skeletonizeSource(normPath, content, { rootDir })
@@ -1749,7 +1853,7 @@ export function indexSingleFileSkeleton(
   })
   upsertTx()
 
-  return readAstSkeleton(db, normPath)
+  return readAstSkeleton(db, normPath, { rootDir })
 }
 
 export function buildJitReadSkeletonFooter(
@@ -1786,7 +1890,11 @@ export function buildJitReadSkeletonFooter(
 
   for (let i = 0; i < unread.length; i++) {
     const s = unread[i]!
-    const item = `- [L${s.start_line}-L${s.end_line}] ${s.qualified_name} (${s.kind})`
+    const partialSuffix =
+      s.start_line <= readMeta.endLine && s.end_line > readMeta.endLine
+        ? ` (partial L${s.start_line}-L${readMeta.endLine} shown)`
+        : ""
+    const item = `- [L${s.start_line}-L${s.end_line}] ${s.qualified_name} (${s.kind})${partialSuffix}`
     const remaining = unread.length - (i + 1)
     const moreLine = remaining > 0 ? `- ... (+${remaining} more unread symbols)` : ""
     const projected = usedChars + 1 + item.length + (moreLine ? 1 + moreLine.length : 0)

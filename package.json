@@ -5,13 +5,13 @@
   "license": "MIT",
   "author": "shynlee04",
   "type": "module",
-  "main": "src/plugin.ts",
-  "types": "src/plugin.ts",
+  "main": "index.ts",
+  "types": "./index.ts",
   "exports": {
-    ".": "./src/plugin.ts",
+    ".": "./index.ts",
+    "./server": "./index.ts",
     "./tui": "./tui.tsx",
     "./rpc": "./src/rpc.ts",
-    "./dist/session-archive.ts": "./dist/session-archive.ts",
     "./package.json": "./package.json"
   },
   "bin": {
@@ -19,9 +19,9 @@
     "hivemind-session-archive": "bin/install.mjs"
   },
   "files": [
-    "src",
+    "index.ts",
     "tui.tsx",
-    "dist",
+    "src",
     "bin",
     "README.md",
     "LICENSE",
@@ -29,6 +29,7 @@
     "GLOSSARY.md"
   ],
   "scripts": {
+    "local-build": "node scripts/local-build.mjs",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "build": "bun scripts/build.ts",
@@ -45,10 +46,18 @@
     "session-archive",
     "context-prune",
     "compaction-continuity",
-    "repomap"
+    "repomap",
+    "tui"
   ],
   "dependencies": {
     "jsonc-parser": "^3.3.1"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.28 <3",
+    "@opencode/theme": ">=2.0.28 <3",
+    "@opentui/core": ">=0.5.17",
+    "@opentui/solid": ">=0.5.17",
+    "solid-js": ">=1.9.0"
   },
   "devDependencies": {
     "@opencode/plugin": "2.0.32",
@@ -58,5 +67,10 @@
     "@types/bun": "latest",
     "solid-js": "1.9.15",
     "typescript": "latest"
+  },
+  "overrides": {
+    "@opencode/theme": {
+      "@opentui/core": "0.5.17"
+    }
   }
 }

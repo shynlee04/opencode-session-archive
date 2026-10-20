@@ -112,7 +112,10 @@ export function formatSliceLineRange(
 ): string {
   const isFull =
     startLine === 1 && !isTruncated && (totalLines === null || endLine >= totalLines)
-  if (isFull) return "all"
+  if (isFull) {
+    const finalEnd = totalLines !== null && totalLines > 0 ? Math.max(endLine, totalLines) : Math.max(1, endLine)
+    return `L1-L${finalEnd}`
+  }
   if (totalLines !== null && totalLines > 0) {
     return `SLICE L${startLine}-L${endLine} of ${totalLines}${isTruncated ? " (truncated)" : ""}`
   }
@@ -260,6 +263,98 @@ export function resolveDiskPath(filePath: string, canonicalRoot?: string): strin
   if (path.isAbsolute(filePath)) return filePath
   const norm = normalizeRepoPath(filePath, canonicalRoot)
   return canonicalRoot ? path.resolve(canonicalRoot, norm) : path.resolve(norm)
+}
+
+export interface TargetWorkspaceResolution {
+  readonly targetRoot: string
+  readonly archiveDir: string
+  readonly indexDbPath: string
+  readonly relPath: string
+  readonly isCrossProject: boolean
+}
+
+function findNearestRepoRoot(startPath: string): string | null {
+  let current = path.resolve(startPath)
+  try {
+    if (existsSync(current) && !statSync(current).isDirectory()) {
+      current = path.dirname(current)
+    }
+  } catch {
+    current = path.dirname(current)
+  }
+
+  for (let depth = 0; depth < 24; depth++) {
+    try {
+      if (existsSync(path.join(current, ".git")) || existsSync(path.join(current, "package.json"))) {
+        return current
+      }
+    } catch {
+      // ignore permission errors while walking up
+    }
+    const parent = path.dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+  return null
+}
+
+export function resolveTargetWorkspace(
+  inputPath: string | undefined,
+  defaultRoot: string,
+): TargetWorkspaceResolution {
+  const baseRoot = path.resolve(defaultRoot || process.cwd())
+  if (!inputPath || typeof inputPath !== "string" || inputPath.trim().length === 0) {
+    const archiveDir = path.join(baseRoot, ".session-archive")
+    return {
+      targetRoot: baseRoot,
+      archiveDir,
+      indexDbPath: path.join(archiveDir, "index.sqlite"),
+      relPath: "",
+      isCrossProject: false,
+    }
+  }
+
+  let cleaned = inputPath.trim()
+  if (cleaned.startsWith("file://")) {
+    try {
+      cleaned = decodeURIComponent(new URL(cleaned).pathname)
+    } catch {
+      cleaned = cleaned.slice("file://".length)
+    }
+  }
+
+  const candidateAbs = path.isAbsolute(cleaned)
+    ? path.resolve(cleaned)
+    : path.resolve(baseRoot, cleaned)
+
+  const insideBase =
+    candidateAbs === baseRoot || candidateAbs.startsWith(`${baseRoot}${path.sep}`)
+
+  const discoveredRoot = findNearestRepoRoot(candidateAbs)
+  const targetRoot =
+    discoveredRoot && (!insideBase || discoveredRoot !== baseRoot)
+      ? discoveredRoot
+      : insideBase
+        ? baseRoot
+        : discoveredRoot ?? baseRoot
+
+  let relPath = ""
+  if (candidateAbs === targetRoot) {
+    relPath = ""
+  } else if (candidateAbs.startsWith(`${targetRoot}${path.sep}`)) {
+    relPath = normalizeRepoPath(candidateAbs, targetRoot)
+  } else {
+    relPath = normalizeRepoPath(cleaned, targetRoot)
+  }
+
+  const archiveDir = path.join(targetRoot, ".session-archive")
+  return {
+    targetRoot,
+    archiveDir,
+    indexDbPath: path.join(archiveDir, "index.sqlite"),
+    relPath,
+    isCrossProject: targetRoot !== baseRoot,
+  }
 }
 
 export function computeDiskSliceSha(

@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite"
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import {
@@ -40,7 +41,7 @@ import type {
   SpillArtifactRow,
   SyncWatermarkRow,
 } from "./types.ts"
-import type { SessionSource } from "./source.ts"
+import { sqliteSource, type SessionSource } from "./source.ts"
 import type {
   IndexCompactionRow,
   IndexDelegationRow,
@@ -119,6 +120,28 @@ export interface PersistOptions {
   readonly snapshotRootDir?: string
   readonly opencodeDataDir?: string
   readonly forceColdFull?: boolean
+  readonly allowCrossProject?: boolean
+}
+
+export interface PersistProjectInput {
+  readonly projectID?: string
+  readonly projectRoot: string
+  readonly dir?: string
+  readonly dbPath?: string
+  readonly sessionID?: string
+  readonly scope?: "session" | "project" | "all-projects"
+  readonly maxRootSessions?: number
+  readonly snapshotRootDir?: string
+  readonly opencodeDataDir?: string
+  readonly forceColdFull?: boolean
+}
+
+export interface PersistProjectResult {
+  readonly scope: "session" | "project" | "all-projects"
+  readonly rootSessionsSynced: number
+  readonly totalSessionsSynced: number
+  readonly skippedWarmTrees: number
+  readonly warnings: readonly string[]
 }
 
 export interface PersistReport {
@@ -188,7 +211,7 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
     throw new Error(`session-archive: session ${input.sessionID} not found`)
   }
   const root = findRoot(seed, source)
-  if (root.project_id !== input.projectID) {
+  if (!input.allowCrossProject && root.project_id !== input.projectID) {
     throw new Error(
       `session-archive: session ${input.sessionID} belongs to project ${root.project_id}, not ${input.projectID}`,
     )
@@ -616,6 +639,155 @@ export function persist(input: PersistOptions, source: SessionSource): PersistRe
     spillsSunk: spillArtifacts.length,
     elapsedMs: performance.now() - tStart,
     warnings,
+  }
+}
+
+function countIndexedRootSessions(sqlitePath: string): number {
+  if (!existsSync(sqlitePath)) return 0
+  const db = new Database(sqlitePath, { readonly: true })
+  try {
+    db.exec("PRAGMA busy_timeout = 5000;")
+    const row = db
+      .query("SELECT COUNT(*) AS c FROM session WHERE depth = 0")
+      .get() as { c?: number } | null
+    return typeof row?.c === "number" ? row.c : 0
+  } catch {
+    return 0
+  } finally {
+    db.close()
+  }
+}
+
+export async function persistProject(
+  input: PersistProjectInput,
+  source?: SessionSource,
+): Promise<PersistProjectResult> {
+  const defaultDbPath = (): string => {
+    const dataHome = Bun.env.XDG_DATA_HOME ?? `${Bun.env.HOME}/.local/share`
+    return `${dataHome}/opencode/opencode.db`
+  }
+
+  const ownedSource = source ? null : sqliteSource(input.dbPath ?? defaultDbPath())
+  const src = source ?? ownedSource!
+
+  try {
+    const effectiveScope: "session" | "project" | "all-projects" =
+      input.scope ?? (input.sessionID ? "session" : "project")
+
+    const archiveDir = path.isAbsolute(input.dir ?? "")
+      ? path.resolve(input.dir!)
+      : path.resolve(input.projectRoot, input.dir ?? ".session-archive")
+    const sqlitePath = path.join(archiveDir, "index.sqlite")
+
+    const seenRootIds = new Set<string>()
+    const warnings: string[] = []
+    let rootSessionsSynced = 0
+    let totalSessionsSynced = 0
+    let skippedWarmTrees = 0
+
+    const syncOne = (sessionID: string, projectID: string) => {
+      try {
+        const seed = src.session(sessionID)
+        if (!seed) {
+          warnings.push(`session ${sessionID} not found`)
+          return
+        }
+        const root = findRoot(seed, src)
+        if (seenRootIds.has(root.id)) return
+        seenRootIds.add(root.id)
+
+        const report = persist(
+          {
+            sessionID: root.id,
+            projectID: root.project_id || projectID,
+            projectRoot: input.projectRoot,
+            dir: input.dir,
+            snapshotRootDir: input.snapshotRootDir,
+            opencodeDataDir: input.opencodeDataDir,
+            forceColdFull: input.forceColdFull,
+            allowCrossProject: true,
+          },
+          src,
+        )
+        rootSessionsSynced += 1
+        totalSessionsSynced += report.sessions
+        if (report.mode === "noop_delta") {
+          skippedWarmTrees += 1
+        }
+        if (report.warnings && report.warnings.length > 0) {
+          warnings.push(...report.warnings)
+        }
+      } catch (err) {
+        warnings.push(
+          `persist(${sessionID}) failed: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
+    }
+
+    const collectProjectRoots = (limit: number): SessionRow[] => {
+      if (!src.listProjectRootSessions) return []
+      const projectIds = new Set<string>()
+      if (input.projectID) projectIds.add(input.projectID)
+      if (input.projectRoot && src.listProjects) {
+        const normRoot = path.resolve(input.projectRoot)
+        for (const p of src.listProjects()) {
+          if (!p.worktree) continue
+          const normWorktree = path.resolve(p.worktree)
+          if (normWorktree === normRoot || normWorktree.startsWith(normRoot + path.sep)) {
+            projectIds.add(p.id)
+          }
+        }
+      }
+      const allRoots: SessionRow[] = []
+      const seenIds = new Set<string>()
+      for (const pid of projectIds) {
+        for (const row of src.listProjectRootSessions(pid, limit)) {
+          if (!seenIds.has(row.id)) {
+            seenIds.add(row.id)
+            allRoots.push(row)
+          }
+        }
+      }
+      allRoots.sort((a, b) => b.time_updated - a.time_updated || a.id.localeCompare(b.id))
+      return allRoots.slice(0, limit)
+    }
+
+    if (input.sessionID) {
+      syncOne(input.sessionID, input.projectID ?? "")
+    }
+
+    if (effectiveScope === "all-projects") {
+      const limit = input.maxRootSessions ?? 1000
+      const roots = src.listAllRootSessions?.(limit) ?? []
+      for (const root of roots) {
+        syncOne(root.id, root.project_id)
+      }
+    } else if (effectiveScope === "project") {
+      const limit = input.maxRootSessions ?? 500
+      const roots = collectProjectRoots(limit)
+      for (const root of roots) {
+        syncOne(root.id, root.project_id)
+      }
+    } else if (effectiveScope === "session" && src.listProjectRootSessions) {
+      const indexedRoots = countIndexedRootSessions(sqlitePath)
+      if (indexedRoots <= 1) {
+        const limit = input.maxRootSessions ?? 500
+        const roots = collectProjectRoots(limit)
+        for (const root of roots) {
+          syncOne(root.id, root.project_id)
+        }
+      }
+    }
+
+    return {
+      scope: effectiveScope,
+      rootSessionsSynced,
+      totalSessionsSynced,
+      skippedWarmTrees,
+      warnings,
+    }
+  } finally {
+    ownedSource?.close()
   }
 }
 

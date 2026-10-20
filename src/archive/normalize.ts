@@ -7,6 +7,7 @@ import {
   parseReadToolOutput,
   resolveDiskPath,
   sha256Hex,
+  splitDiskLines,
 } from "./primitives.ts"
 import type {
   AssistantPart,
@@ -43,7 +44,7 @@ const BLOB_LIMIT = 4096
 
 const DELEGATION_TOOLS = new Set(["subagent", "delegate-devin", "hivemind-delegate"])
 const READ_TOOLS = new Set(["read", "read_file", "view_file"])
-const TOUCH_TOOLS = new Set(["write", "edit", "patch", "multi_edit", "write_to_file", "replace_file_content"])
+const TOUCH_TOOLS = new Set(["write", "edit", "patch", "apply_patch", "multi_edit", "write_to_file", "replace_file_content"])
 const SKILL_TOOLS = new Set(["skill", "load_skill"])
 const SHELL_VERIFY_TOOLS = new Set(["bash", "shell", "run_command", "exec"])
 
@@ -338,6 +339,11 @@ const toolPart = (
         }
       }
 
+      const explicitLineRange =
+        capture.lineRange === "all" || capture.lineRange === "#all"
+          ? `L${capture.startLine}-L${Math.max(capture.startLine, capture.endLine || capture.totalLines || splitDiskLines(capture.cleanText).length || 1)}`
+          : capture.lineRange
+
       fileReads.push({
         session_id: row.session_id,
         path: rawPath,
@@ -346,7 +352,7 @@ const toolPart = (
         message_id: row.id,
         seq: row.seq,
         read_seq: row.seq,
-        line_range: capture.lineRange,
+        line_range: explicitLineRange,
         start_line: capture.startLine,
         end_line: capture.endLine,
         total_lines: capture.totalLines,
@@ -356,7 +362,7 @@ const toolPart = (
         blob_sha: blobSha,
         blob_sha256: blobSha,
         slice_sha: capture.sliceSha,
-        read_blob_sha: capture.sliceSha,
+        read_blob_sha: capture.sliceSha === blobSha ? `blob:${capture.sliceSha}` : capture.sliceSha,
         disk_blob_sha: diskBlobSha,
         summary: summarizePayload(outputText, normPath),
         staleness_status: stalenessStatus,
@@ -753,7 +759,11 @@ export function foldSessionLedgers(
     const key = `${r.session_id}\0${r.path}`
     const prev = readsByKey.get(key)
     if (!prev || r.read_seq >= prev.read_seq) {
-      readsByKey.set(key, r)
+      const normalizedLineRange =
+        r.line_range === "all" || r.line_range === "#all"
+          ? `L${r.start_line ?? 1}-L${Math.max(r.start_line ?? 1, r.end_line ?? r.total_lines ?? 1)}`
+          : r.line_range
+      readsByKey.set(key, normalizedLineRange === r.line_range ? r : { ...r, line_range: normalizedLineRange })
     }
   }
 
@@ -836,8 +846,8 @@ export function extractSessionProvenanceChains(
     for (const r of rawRows) rawById.set(r.id, r)
   }
 
-  const readBlobByPath = new Map<string, string>()
-  const touchBlobByPath = new Map<string, string>()
+  const latestReadByPath = new Map<string, FileReadLedgerRow>()
+  const latestTouchByPath = new Map<string, FileTouchRow>()
 
   interface ChainBuilder {
     intentSeq: number
@@ -846,7 +856,7 @@ export function extractSessionProvenanceChains(
     decisionSeq: number | null
     decisionSummary: string | null
     touchedFiles: Set<string>
-    lastReadPath: string | null
+    readFiles: Set<string>
     repairSeq: number | null
     verificationCommand: string | null
     verificationExitCode: number | null
@@ -856,87 +866,132 @@ export function extractSessionProvenanceChains(
     hasActivity: boolean
   }
 
-  const chains: ProvenanceChainRow[] = []
+  const chainsByTargetPath = new Map<string, ProvenanceChainRow>()
   let current: ChainBuilder | null = null
 
   const flushCurrent = (): void => {
     if (!current || !current.hasActivity) return
     const touchedFiles = [...current.touchedFiles]
-    const outcome: ProvenanceChainRow["outcome"] =
-      current.verificationCommand !== null && current.verificationExitCode !== null
-        ? current.verificationExitCode === 0
-          ? "VERIFIED_PASS"
-          : "VERIFIED_FAIL"
-        : touchedFiles.length > 0
-          ? "UNVERIFIED"
-          : "IN_PROGRESS"
+    const readFiles = [...current.readFiles]
+    if (touchedFiles.length === 0 && readFiles.length === 0) return
 
-    const targetPath = touchedFiles[0] ?? current.lastReadPath ?? "session"
-    const readOrReviewSha = readBlobByPath.get(targetPath) ?? touchBlobByPath.get(targetPath) ?? ""
-    const repairSha =
-      touchedFiles.length > 0
-        ? touchBlobByPath.get(targetPath) ||
-          readOrReviewSha ||
-          sha256hex(`${sessionId}:${targetPath}:${current.repairSeq ?? current.intentSeq}`)
-        : null
-
-    let diskSha = repairSha ?? readOrReviewSha
-    if (canonicalRoot && targetPath !== "session") {
-      const absPath = resolveDiskPath(targetPath, canonicalRoot)
-      if (existsSync(absPath)) {
-        try {
-          diskSha = sha256Hex(readFileSync(absPath))
-        } catch {
-          // keep fallback sha
-        }
-      }
-    }
-
-    const stalenessStatus =
-      outcome === "VERIFIED_PASS"
-        ? "VERIFIED_FRESH"
-        : outcome === "VERIFIED_FAIL"
-          ? "STALE (modified since read/review — re-verify slice)"
-          : "FRESH — DO NOT REREAD"
-
+    const targetPaths = [...new Set([...touchedFiles, ...readFiles])]
     const updatedIso = new Date(current.lastTimestamp).toISOString()
 
-    chains.push({
-      chain_id: `${sessionId}:chain:${current.intentSeq}`,
-      root_session_id: rootSessionId,
-      session_id: sessionId,
-      finding_id: `F-${sessionId.slice(-6).toUpperCase()}-${current.intentSeq}`,
-      finding_seq: current.intentSeq,
-      finding_session_id: sessionId,
-      finding_summary: current.decisionSummary ?? current.intentSummary,
-      child_session_id: sessionId !== rootSessionId ? sessionId : null,
-      intent_seq: current.intentSeq,
-      intent_message_id: current.intentMessageId,
-      intent_summary: current.intentSummary,
-      decision_seq: current.decisionSeq,
-      decision_pivot_seq: current.decisionSeq ?? current.intentSeq,
-      decision_summary: current.decisionSummary,
-      target_path: targetPath,
-      touched_files_json: JSON.stringify(touchedFiles),
-      read_or_review_blob_sha: readOrReviewSha,
-      repair_seq: current.repairSeq,
-      repair_session_id: current.repairSeq !== null ? sessionId : null,
-      repair_blob_sha: repairSha,
-      receipt_command: current.verificationCommand,
-      verification_command: current.verificationCommand,
-      receipt_exit_code: current.verificationExitCode,
-      verification_exit_code: current.verificationExitCode,
-      verification_seq: current.verificationSeq,
-      receipt_blob_sha: current.verificationBlobRef,
-      verification_blob_ref: current.verificationBlobRef,
-      head_sha: null,
-      worktree_tree_sha: null,
-      disk_blob_sha: diskSha,
-      staleness_status: stalenessStatus,
-      outcome,
-      created_at: current.lastTimestamp,
-      updated_at: updatedIso,
-    })
+    for (let targetIdx = 0; targetIdx < targetPaths.length; targetIdx += 1) {
+      const targetPath = targetPaths[targetIdx]!
+      if (!targetPath || targetPath === "session" || targetPath === "(unknown)") continue
+
+      const existing = chainsByTargetPath.get(targetPath)
+      const wasTouchedInTurn = current.touchedFiles.has(targetPath)
+      const latestRead = latestReadByPath.get(targetPath)
+      const latestTouch = latestTouchByPath.get(targetPath)
+      const isTouchedFile = wasTouchedInTurn || latestTouch !== undefined
+
+      const readSliceSha =
+        latestRead?.slice_sha ||
+        stripBlobPrefix(latestRead?.read_blob_sha ?? "") ||
+        latestRead?.blob_sha256 ||
+        existing?.read_or_review_blob_sha ||
+        ""
+      const touchSha = latestTouch?.blob_sha256 || ""
+      const readOrReviewSha = readSliceSha || touchSha || ""
+
+      const repairSha = isTouchedFile
+        ? touchSha || readSliceSha || existing?.repair_blob_sha || null
+        : readSliceSha || existing?.repair_blob_sha || null
+
+      let diskSha = (isTouchedFile ? touchSha : "") || readSliceSha || existing?.disk_blob_sha || ""
+      if (canonicalRoot) {
+        const absPath = resolveDiskPath(targetPath, canonicalRoot)
+        if (existsSync(absPath)) {
+          try {
+            diskSha = sha256Hex(readFileSync(absPath))
+          } catch {
+            // keep fallback sha
+          }
+        }
+      }
+
+      const outcome: ProvenanceChainRow["outcome"] =
+        current.verificationCommand !== null &&
+        current.verificationExitCode !== null &&
+        (isTouchedFile || touchedFiles.length === 0)
+          ? current.verificationExitCode === 0
+            ? "VERIFIED_PASS"
+            : "VERIFIED_FAIL"
+          : isTouchedFile
+            ? existing?.outcome === "VERIFIED_PASS" && !wasTouchedInTurn
+              ? "VERIFIED_PASS"
+              : "UNVERIFIED"
+            : existing?.outcome ?? "IN_PROGRESS"
+
+      const stalenessStatus =
+        outcome === "VERIFIED_PASS"
+          ? "VERIFIED_FRESH"
+          : outcome === "VERIFIED_FAIL"
+            ? "STALE (modified since read/review — re-verify slice)"
+            : "FRESH — DO NOT REREAD"
+
+      const defaultChainId =
+        targetIdx === 0
+          ? `${sessionId}:chain:${current.intentSeq}`
+          : `${sessionId}:chain:${current.intentSeq}:${targetIdx}`
+      const defaultFindingId =
+        targetIdx === 0
+          ? `F-${sessionId.slice(-6).toUpperCase()}-${current.intentSeq}`
+          : `F-${sessionId.slice(-6).toUpperCase()}-${current.intentSeq}-${targetIdx}`
+
+      const prevTouchedFiles: string[] = existing
+        ? (() => {
+            try {
+              const parsed = JSON.parse(existing.touched_files_json)
+              return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : []
+            } catch {
+              return []
+            }
+          })()
+        : []
+      const mergedTouchedFiles = [...new Set([...prevTouchedFiles, ...touchedFiles])]
+      const repairSeq = wasTouchedInTurn ? current.repairSeq : (existing?.repair_seq ?? null)
+
+      chainsByTargetPath.set(targetPath, {
+        chain_id: existing?.chain_id ?? defaultChainId,
+        root_session_id: rootSessionId,
+        session_id: sessionId,
+        finding_id: existing?.finding_id ?? defaultFindingId,
+        finding_seq: existing?.finding_seq ?? current.intentSeq,
+        finding_session_id: existing?.finding_session_id ?? sessionId,
+        finding_summary: existing?.finding_summary ?? (current.decisionSummary ?? current.intentSummary),
+        child_session_id: sessionId !== rootSessionId ? sessionId : null,
+        intent_seq: current.intentSeq,
+        intent_message_id: current.intentMessageId,
+        intent_summary: current.intentSummary,
+        decision_seq: current.decisionSeq ?? existing?.decision_seq ?? null,
+        decision_pivot_seq: current.decisionSeq ?? existing?.decision_pivot_seq ?? current.intentSeq,
+        decision_summary: current.decisionSummary ?? existing?.decision_summary ?? null,
+        target_path: targetPath,
+        touched_files_json: JSON.stringify(mergedTouchedFiles),
+        read_or_review_blob_sha: readOrReviewSha,
+        repair_seq: repairSeq,
+        repair_session_id: repairSeq !== null ? sessionId : null,
+        repair_blob_sha: repairSha,
+        receipt_command: current.verificationCommand ?? existing?.receipt_command ?? null,
+        verification_command: current.verificationCommand ?? existing?.verification_command ?? null,
+        receipt_exit_code: current.verificationExitCode ?? existing?.receipt_exit_code ?? null,
+        verification_exit_code: current.verificationExitCode ?? existing?.verification_exit_code ?? null,
+        verification_seq: current.verificationSeq ?? existing?.verification_seq ?? null,
+        receipt_blob_sha: current.verificationBlobRef ?? existing?.receipt_blob_sha ?? null,
+        verification_blob_ref: current.verificationBlobRef ?? existing?.verification_blob_ref ?? null,
+        head_sha: null,
+        worktree_tree_sha: null,
+        disk_blob_sha: diskSha,
+        staleness_status: stalenessStatus,
+        outcome,
+        created_at: existing?.created_at ?? current.lastTimestamp,
+        updated_at: updatedIso,
+      })
+    }
   }
 
   for (const norm of messages) {
@@ -946,8 +1001,11 @@ export function extractSessionProvenanceChains(
 
     for (const r of norm.fileReads) {
       const p = normalizeLedgerPath(r.path, canonicalRoot)
-      readBlobByPath.set(p, r.read_blob_sha || r.blob_sha256)
-      if (current) current.lastReadPath = p
+      latestReadByPath.set(p, r)
+      if (current) {
+        current.readFiles.add(p)
+        current.hasActivity = true
+      }
     }
 
     if (rec.kind === "user") {
@@ -959,7 +1017,7 @@ export function extractSessionProvenanceChains(
         decisionSeq: null,
         decisionSummary: null,
         touchedFiles: new Set<string>(),
-        lastReadPath: null,
+        readFiles: new Set<string>(),
         repairSeq: null,
         verificationCommand: null,
         verificationExitCode: null,
@@ -979,7 +1037,7 @@ export function extractSessionProvenanceChains(
         decisionSeq: null,
         decisionSummary: null,
         touchedFiles: new Set<string>(),
-        lastReadPath: null,
+        readFiles: new Set<string>(),
         repairSeq: null,
         verificationCommand: null,
         verificationExitCode: null,
@@ -995,7 +1053,7 @@ export function extractSessionProvenanceChains(
     for (const touch of norm.fileTouches) {
       const tp = normalizeLedgerPath(touch.path, canonicalRoot)
       current.touchedFiles.add(tp)
-      if (touch.blob_sha256) touchBlobByPath.set(tp, touch.blob_sha256)
+      latestTouchByPath.set(tp, touch)
       current.repairSeq = seq
       current.hasActivity = true
     }
@@ -1056,7 +1114,7 @@ export function extractSessionProvenanceChains(
   }
 
   flushCurrent()
-  return chains
+  return [...chainsByTargetPath.values()]
 }
 
 type FileLoadOrSkillRow = SkillLoadLedgerRow

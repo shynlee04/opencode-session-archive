@@ -77,6 +77,7 @@ export interface ImplementorViewportBriefResult {
   readonly tokenEstimate: number
   readonly estimatedTokens: number
   readonly tokenCount: number
+  readonly budgetTokens: number
   readonly maxTokens: number
   readonly withinBudget: boolean
   readonly targetPaths: string[]
@@ -500,21 +501,23 @@ export function buildImplementorViewportBrief(
 
   const tokenEstimate = estimateTokens(markdown)
   const elapsedMs = performance.now() - t0
+  const includedSlices = symbolSlices.map(
+    (s) => `${s.path}#${s.symbol}[L${s.startLine}-L${s.endLine}]`,
+  )
 
-  return {
+  const result: ImplementorViewportBriefResult & { toJSON?: () => Record<string, unknown> } = {
     markdown,
     tokenEstimate,
     estimatedTokens: tokenEstimate,
     tokenCount: tokenEstimate,
+    budgetTokens: maxTokens,
     maxTokens,
     withinBudget: tokenEstimate <= maxTokens,
     targetPaths,
     includedTargetPaths: targetPaths,
     writeLeasePaths: targetPaths,
     includedSymbols,
-    includedSlices: symbolSlices.map(
-      (s) => `${s.path}#${s.symbol}[L${s.startLine}-L${s.endLine}]`,
-    ),
+    includedSlices,
     coupledWarnings: cochangeWarnings.length,
     hiddenCouplingWarnings,
     cochangeWarnings,
@@ -527,4 +530,29 @@ export function buildImplementorViewportBrief(
     resolvedSessionID,
     elapsedMs,
   }
+
+  Object.defineProperty(result, "toJSON", {
+    enumerable: false,
+    value: () => ({
+      tokenCount: tokenEstimate,
+      budgetTokens: maxTokens,
+      withinBudget: tokenEstimate <= maxTokens,
+      targetPaths,
+      includedSymbols,
+      includedSlices,
+      coupledWarnings: cochangeWarnings.length,
+      hiddenCouplingWarnings,
+      cochangeWarnings,
+      provenanceChains: sortedChains.length,
+      provenanceConstraints,
+      skeletons,
+      symbolSlices,
+      goal: options.goal ?? "",
+      verificationCommand: options.verificationCommand ?? "",
+      resolvedSessionID,
+      elapsedMs,
+    }),
+  })
+
+  return result
 }

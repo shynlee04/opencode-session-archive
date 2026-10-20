@@ -464,7 +464,7 @@ describe("TWM-02: REQ-SUB-03 & REQ-SUB-04", () => {
       path: "/repo/src/archive/normalize.ts",
       call_id: "call_read_1",
       read_seq: 3,
-      line_range: "all",
+      line_range: "L1-L1",
       start_line: 1,
       end_line: 1,
       blob_sha: sha256hex("export function normalizeMessage() {}\n"),
@@ -798,5 +798,180 @@ describe("TWM-02: REQ-SUB-03 & REQ-SUB-04", () => {
       expect(res.blocker_summary).toContain(expectedSnippet)
     }
   })
+
+  test("TWM-R4 (A3, S3-1, S3-2, S3-4, S3-6, E-3): emits zero target_path='session' chains, deduplicates to 1 row per target_path across 3 turns, unifies hash domain, and never emits '#all' or 'all' line_range", async () => {
+    const normMod = await import("../src/archive/normalize.ts")
+    const { sink } = collect()
+
+    const rows: MessageRow[] = [
+      // Turn 0: User turn with NO file reads or touches (only text + bash) -> must NOT emit target_path === "session"
+      row("user", { text: "Check git status first" }, { id: "m_u0", seq: 1 }),
+      row(
+        "assistant",
+        {
+          content: [
+            { type: "text", text: "Checking repository status." },
+            {
+              type: "tool",
+              id: "call_bash_0",
+              name: "bash",
+              state: {
+                status: "completed",
+                metadata: { exitCode: 0 },
+                input: { command: "git status --short" },
+                content: [{ type: "text", text: "clean" }],
+              },
+            },
+          ],
+        },
+        { id: "m_a0", seq: 2 },
+      ),
+      // Turn 1: Read src/archive/valve.ts (full 3-line read) + read src/archive/readonly.ts
+      row("user", { text: "Inspect valve.ts and readonly.ts" }, { id: "m_u1", seq: 3 }),
+      row(
+        "assistant",
+        {
+          content: [
+            { type: "text", text: "Reading valve.ts and readonly.ts." },
+            {
+              type: "tool",
+              id: "call_read_v1",
+              name: "read",
+              state: {
+                status: "completed",
+                input: { filePath: "src/archive/valve.ts" },
+                content: [
+                  {
+                    type: "text",
+                    text: "Read file src/archive/valve.ts, lines 1-3 (of 3)\n1: export const V = 1\n2: export const W = 2\n3: export const Z = 3\n",
+                  },
+                ],
+              },
+            },
+            {
+              type: "tool",
+              id: "call_read_ro",
+              name: "read",
+              state: {
+                status: "completed",
+                input: { filePath: "src/archive/readonly.ts" },
+                content: [
+                  {
+                    type: "text",
+                    text: "Read file src/archive/readonly.ts, lines 1-2 (of 2)\n1: export const R1 = 'a'\n2: export const R2 = 'b'\n",
+                  },
+                ],
+              },
+            },
+          ],
+        },
+        { id: "m_a1", seq: 4 },
+      ),
+      // Turn 2: Edit src/archive/valve.ts (first modification, unverified)
+      row("user", { text: "Update V in valve.ts" }, { id: "m_u2", seq: 5 }),
+      row(
+        "assistant",
+        {
+          content: [
+            { type: "text", text: "Updating V to 10." },
+            {
+              type: "tool",
+              id: "call_edit_v2",
+              name: "edit",
+              state: {
+                status: "completed",
+                input: {
+                  filePath: "src/archive/valve.ts",
+                  oldString: "export const V = 1",
+                  newString: "export const V = 10\nexport const W = 2\nexport const Z = 3",
+                },
+                content: [{ type: "text", text: "Edited src/archive/valve.ts" }],
+              },
+            },
+          ],
+        },
+        { id: "m_a2", seq: 6 },
+      ),
+      // Turn 3: Second edit to src/archive/valve.ts + passing verification
+      row("user", { text: "Finalize V = 100 and run bun test" }, { id: "m_u3", seq: 7 }),
+      row(
+        "assistant",
+        {
+          content: [
+            { type: "text", text: "Setting V = 100 and verifying." },
+            {
+              type: "tool",
+              id: "call_write_v3",
+              name: "write",
+              state: {
+                status: "completed",
+                input: {
+                  filePath: "src/archive/valve.ts",
+                  content: "export const V = 100\nexport const W = 2\nexport const Z = 3\nexport const K = 4\n",
+                },
+                content: [{ type: "text", text: "Wrote src/archive/valve.ts" }],
+              },
+            },
+            {
+              type: "tool",
+              id: "call_verify_v3",
+              name: "bash",
+              state: {
+                status: "completed",
+                metadata: { exitCode: 0 },
+                input: { command: "bun test test/valve.test.ts" },
+                content: [{ type: "text", text: "15 pass, 0 fail" }],
+              },
+            },
+          ],
+        },
+        { id: "m_a3", seq: 8 },
+      ),
+    ]
+
+    let prevSeq: number | null = null
+    const normalized = rows.map((r) => {
+      const n = normalizeMessage(r, sink, prevSeq)
+      prevSeq = r.seq
+      return n
+    })
+
+    const ledgers = normMod.extractSessionLedgers(rows, sink)
+    expect(ledgers.fileReads.length).toBeGreaterThanOrEqual(2)
+    for (const r of ledgers.fileReads) {
+      expect(r.line_range).not.toBe("all")
+      expect(r.line_range).not.toBe("#all")
+      expect(r.line_range.startsWith("L") || r.line_range.startsWith("SLICE L")).toBe(true)
+    }
+    const valveRead = ledgers.fileReads.find((r) => r.normalized_path === "src/archive/valve.ts")
+    expect(valveRead?.line_range).toBe("L1-L3")
+
+    const chains = normMod.extractSessionProvenanceChains("ses_1", "ses_1", normalized, rows)
+    // 1. Zero target_path === "session" rows
+    expect(chains.some((c) => c.target_path === "session")).toBe(false)
+    expect(chains.some((c) => c.target_path === "(unknown)")).toBe(false)
+
+    // 2. Exactly 1 provenance_chain row for src/archive/valve.ts (despite being read in Turn 1, edited in Turn 2, and written+verified in Turn 3)
+    const valveChains = chains.filter((c) => c.target_path === "src/archive/valve.ts")
+    expect(valveChains).toHaveLength(1)
+    expect(valveChains[0]).toMatchObject({
+      target_path: "src/archive/valve.ts",
+      finding_seq: 3,
+      intent_seq: 7,
+      repair_seq: 8,
+      repair_blob_sha: sha256hex("export const V = 100\nexport const W = 2\nexport const Z = 3\nexport const K = 4\n"),
+      verification_command: "bun test test/valve.test.ts",
+      verification_exit_code: 0,
+      outcome: "VERIFIED_PASS",
+    })
+
+    // 3. Read-only file has unified hash domain (repair_blob_sha and disk_blob_sha equal to slice_sha, never synthetic session:path:seq)
+    const roChains = chains.filter((c) => c.target_path === "src/archive/readonly.ts")
+    expect(roChains).toHaveLength(1)
+    const expectedRoSliceSha = sha256hex("export const R1 = 'a'\nexport const R2 = 'b'")
+    expect(roChains[0]!.repair_blob_sha).toBe(expectedRoSliceSha)
+    expect(roChains[0]!.disk_blob_sha).toBe(expectedRoSliceSha)
+  })
 })
+
 
