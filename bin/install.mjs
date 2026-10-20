@@ -1,14 +1,14 @@
 #!/usr/bin/env node
-// Installer for hivemind-session-archive.
+// Installer for hivemind-substrate.
 //
-//   npx hivemind-session-archive                 # wire ./opencode.json (project scope)
-//   npx hivemind-session-archive --project <dir> # wire <dir>/opencode.json
-//   npx hivemind-session-archive --global        # wire ~/.config/opencode/opencode.json
-//   npx hivemind-session-archive --check         # report only, no writes
+//   npx hivemind-substrate                 # wire ./opencode.json (project scope)
+//   npx hivemind-substrate --project <dir> # wire <dir>/opencode.json
+//   npx hivemind-substrate --global        # wire ~/.config/opencode/opencode.json
+//   npx hivemind-substrate --check         # report only, no writes
 //
-// Adds a { "package": "hivemind-session-archive" } entry to the config's
+// Adds a { "package": "hivemind-substrate" } entry to the config's
 // "plugins" array, preserving JSONC comments. Idempotent. After the next
-// OpenCode reload, agents in that scope see the `archive_persist` tool.
+// OpenCode reload, agents in that scope see the `substrate` tool.
 //
 // Exit codes: 0 ok · 1 usage/io error
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
@@ -16,7 +16,7 @@ import { homedir } from "node:os"
 import path from "node:path"
 import { applyEdits, modify, parse } from "jsonc-parser"
 
-const PKG = "hivemind-session-archive"
+const PKG = "hivemind-substrate"
 
 const args = process.argv.slice(2)
 const flag = (name) => args.includes(name)

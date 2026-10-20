@@ -1,6 +1,6 @@
 {
   "name": "hivemind-substrate",
-  "version": "0.1.0",
+  "version": "0.2.0-beta.0",
   "description": "OpenCode V2 Context & Working-Memory Substrate plugin: unifies session/delegation archival, step-watermark working-set pruning, compaction continuity, and AST/PageRank/co-change codebase viewports.",
   "license": "MIT",
   "author": "shynlee04",
