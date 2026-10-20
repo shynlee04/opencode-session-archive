@@ -16,7 +16,8 @@ Read `GLOSSARY.md` before naming anything. Read `.opencode/AGENTS.md` for standi
 
 | File / Module | Owns |
 |---|---|
-| `src/plugin.ts` | Thin shell: plugin `setup`, tool registration (`substrate.viewport`, `substrate.valve`, `archive.persist`), lifecycle hooks (`context`, `compaction`, `event.subscribe`), option parsing. Imports of `@opencode/plugin` are type-only - the host supplies the runtime module. |
+| `src/plugin.ts` | Thin shell: plugin `setup`, tool registration (`substrate.viewport`, `substrate.valve`, `archive.persist`, `ctx.context-prune`), lifecycle hooks (`context`, `compaction`, `tool.execute.after`, `event.subscribe`), option parsing. Imports of `@opencode/plugin` are type-only - the host supplies the runtime module. |
+| `src/changes/` | Live project-agnostic change-set & actor trace (`model.ts`, `git.ts`, `host-ledger.ts`, `store.ts`, `trace.ts`): 2-call disclosure (`signal` -> `package` -> `leaf`) over git + host tool ledger with `HEAD`-seeded edit hash-chains, test/build verification `evidence`, and subagent `actors` conclusions. |
 | `src/archive/index.ts` | Incremental `persist()` driver: walk up to the root, flatten the tree, write JSONL + `info.json` + blobs + `index.sqlite` gated by `(session_id, max_seq, source_updated_at)` watermarks. |
 | `src/archive/source.ts` | `SessionSource` seam + `sqliteSource(dbPath)`: read-only `bun:sqlite` access to `~/.local/share/opencode/opencode.db` (`project`, `session_v2`, `session_message`, `kv`). Validates required columns up front; throws `session-archive: host schema drift: <table>.<column> missing`. |
 | `src/archive/normalize.ts` | `session_message` rows -> archive records (`user | assistant | skill | shell | context | compaction | boundary | unknown`), blob sinking (including external `tool-output`/`shell` spills and shadow snapshot file blobs), delegation facts, and trajectory milestones. |
@@ -35,6 +36,14 @@ Read `GLOSSARY.md` before naming anything. Read `.opencode/AGENTS.md` for standi
 - `ctx.session.hook("context", ...)` runs synchronously on the critical path of every primary LLM step and must remain strictly in-memory (`< 2 ms`).
 - Changes under `.opencode/` trigger a host hot-reload - the archive therefore lives in `<canonicalRoot>/.session-archive/`, never under `.opencode/`.
 - Every record carries `raw_ref: {session_id, message_id, seq}` back to `opencode.db`.
+
+## Agent Surface (`hivemind-substrate`)
+
+- **Auto signal (0 calls):** On `idle`, `context` hook injects `[substrate] dirty|commit <id> ... trace({change:"<id>"})` once per change-set.
+- **Call 1 - Package (`<= 800` tok):** `substrate.viewport({ action: "trace", change?: "<id>", commit?: "<sha>" })` -> ranked branches (`source`, `test`, `config`, `docs`, `owner`, `evidence`, `actors`, `pre-existing`, `noise`, `blocked`, `worktrees`, `related`, `history`) with `<id>:<branch>` handles.
+- **Call 2 - Leaf:** `substrate.viewport({ action: "trace", handle: "<id>:<branch>", path?: "<relPath|ses_id>" })` -> file SHA-256 attribution proof + unified diff (`source`/`test`/`config`), subagent touched files + checks + conclusion (`actors`), or test/build check staleness (`evidence`).
+- **Codebase & Recall (`substrate.viewport`):** `repomap` | `skeleton` (`path`) | `slice` (`path`, `symbol`) | `coupled` (`path`) | `brief` (`targetPaths`, `symbolNames`) | `search` (`query`) | `resolve` (`blob`, `startLine`, `endLine`) | `provenance` | `timeline` | `compaction` | `sync`.
+- **Working-Set Valve (`substrate.valve`):** `prune` | `status` | `reset` (`mode`, `keepRecentSteps`) + `FRESH | SLICE | STALE` manifest.
 
 ## Commands
 
