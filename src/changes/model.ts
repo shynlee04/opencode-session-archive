@@ -1,9 +1,10 @@
 /**
- * Change-set trace model.
+ * Change-set trace model (Iteration 2 — Project-Agnostic Code/Test/Git/Actor Truth).
  *
  * The unit is a change set, not a commit. A commit seals a change; it does not
- * define it. Everything here is pure: the git adapter and the ledger adapter
- * feed it real hashes, and the renderers emit the three disclosure levels.
+ * define it. In the wild, project artifacts and markdown planning docs are
+ * uncontrolled context; only git state, executable code, tests, test/command
+ * executions, and the host tool/actor ledger are verifiable ground truth.
  */
 
 import { createHash } from "node:crypto"
@@ -11,10 +12,6 @@ import { createHash } from "node:crypto"
 export type Kind =
   | "source"
   | "test"
-  | "spec"
-  | "plan"
-  | "ticket"
-  | "evidence"
   | "config"
   | "docs"
   | "generated"
@@ -67,6 +64,7 @@ export interface FileChange {
   materiality: Materiality
   fresh: Fresh
   proof: Proof
+  diffExcerpt?: string
 }
 
 export interface WorktreeState {
@@ -92,6 +90,7 @@ export interface LedgerEntry {
   t: number
   callId?: string
   command?: string
+  newSnippet?: string
 }
 
 export interface ShellWrite {
@@ -101,28 +100,22 @@ export interface ShellWrite {
   command: string
 }
 
-export interface TicketState {
-  id: string
-  title: string
-  phase: string
-  status: string
-  acceptance: { passed: number; total: number }
-  path: string
-  issue?: string
-}
-
 export interface EvidenceState {
   command: string
   exit: number
   revision: string
-  outcome: string
+  outcome: "pass" | "fail" | "unknown"
+  session?: string
+  t?: number
+  fresh?: Fresh
+  summary?: string
   blob?: string
 }
 
 export interface RelatedSession {
   session: string
   root: string
-  reason: "path" | "ticket"
+  reason: "path" | "commit"
   handle: string
   t: number
 }
@@ -142,14 +135,12 @@ export interface Actor {
   harness: string
   model: string
   worktree: string
-}
-
-export interface Artifact {
-  kind: Kind
-  path: string
-  sha: string
-  owner: string
-  fresh: Fresh
+  title?: string
+  filesTouched?: number
+  paths?: string[]
+  checksRun?: number
+  lastCheck?: "pass" | "fail" | "none"
+  conclusion?: string
 }
 
 export interface Counts {
@@ -179,8 +170,6 @@ export interface Change {
   preExisting: string[]
   worktrees: WorktreeState[]
   actors: Actor[]
-  tickets: TicketState[]
-  artifacts: Artifact[]
   evidence: EvidenceState[]
   related: RelatedSession[]
   history: HistoryEntry[]
@@ -193,6 +182,7 @@ export interface RawChange {
   after: string | null
   adds?: number
   dels?: number
+  diffExcerpt?: string
 }
 
 export interface BuildInput {
@@ -211,9 +201,10 @@ export interface BuildInput {
   otherLedger: LedgerEntry[]
   shellWrites?: Map<string, ShellWrite>
   runStart: number
+  headCommitMs?: number
   mtimes?: Map<string, number>
   commitFiles?: Map<string, string | null>
-  tickets?: TicketState[]
+  diskContents?: Map<string, string>
   evidence?: EvidenceState[]
   related?: RelatedSession[]
   worktrees?: WorktreeState[]
@@ -284,6 +275,13 @@ function globToRegExp(glob: string): RegExp {
   return new RegExp(out + "$")
 }
 
+/**
+ * Project-agnostic classification rules.
+ * Only code (`source`), tests (`test`), and build/runtime `config` are primary
+ * engineering surfaces. Markdown, `.planning/**`, `.audit/**`, and prose notes
+ * are uncontrolled `docs` context in the wild — never assumed to be structured
+ * tickets, specs, or verification evidence.
+ */
 const RULES: Array<{ kind: Kind; globs: string[] }> = [
   {
     kind: "secret",
@@ -304,56 +302,77 @@ const RULES: Array<{ kind: Kind; globs: string[] }> = [
   },
   {
     kind: "generated",
-    globs: ["dist/**", "**/dist/**", ".local-builds/**", "**/.local-builds/**", "coverage/**", "**/coverage/**", "**/*.snap"],
+    globs: [
+      "dist/**",
+      "**/dist/**",
+      "build/**",
+      "**/build/**",
+      ".next/**",
+      "**/.next/**",
+      ".local-builds/**",
+      "**/.local-builds/**",
+      "coverage/**",
+      "**/coverage/**",
+      "**/*.snap",
+      "**/*.min.js",
+      "**/*.bundle.js",
+    ],
   },
   {
     kind: "vendored",
     globs: ["node_modules/**", "**/node_modules/**", "vendor/**", "**/vendor/**", "third_party/**", "**/third_party/**"],
   },
   {
+    kind: "config",
+    globs: [
+      "**/requirements*.txt",
+      "**/CMakeLists.txt",
+    ],
+  },
+  {
+    kind: "docs",
+    globs: [
+      ".planning/**",
+      "**/.planning/**",
+      ".audit/**",
+      "**/.audit/**",
+      "docs/**",
+      "**/docs/**",
+      "**/*.md",
+      "**/*.mdx",
+      "**/*.txt",
+      "**/*.rst",
+      "**/*.adoc",
+    ],
+  },
+  {
     kind: "test",
-    globs: ["test/**", "tests/**", "**/__tests__/**", "**/*.test.*", "**/*.spec.*"],
-  },
-  {
-    kind: "spec",
     globs: [
-      ".planning/**/SPEC.md",
-      "**/SPEC.md",
-      "PROJECT.md",
-      "ROADMAP.md",
-      "GLOSSARY.md",
-      ".planning/architecture/ADR-*",
-      "**/ADR-*.md",
+      "test/**",
+      "tests/**",
+      "**/__tests__/**",
+      "**/*.test.*",
+      "**/*.spec.*",
+      "**/test_*.py",
+      "**/*_test.go",
+      "**/*_test.rs",
     ],
-  },
-  {
-    kind: "plan",
-    globs: [
-      ".planning/**/PLAN.md",
-      "**/PLAN.md",
-      ".planning/**/STATE.md",
-      "**/STATE.md",
-      ".planning/decisions.tsv",
-      "**/decisions.tsv",
-      "decisions.tsv",
-    ],
-  },
-  { kind: "ticket", globs: [".planning/**/tickets/**", "**/tickets/**"] },
-  {
-    kind: "evidence",
-    globs: [".audit/**", "**/.audit/**", "**/UAT.md", "**/*receipt*", "**/*verification*"],
   },
   {
     kind: "config",
     globs: [
       "package.json",
+      "**/package.json",
       "tsconfig*.json",
       "**/tsconfig*.json",
       "bunfig.toml",
       "**/*.config.*",
       ".github/**",
       "**/Dockerfile",
+      "**/docker-compose*.yml",
       "**/*.lock",
+      "**/package-lock.json",
+      "**/pnpm-lock.yaml",
       ".gitignore",
       "**/.gitignore",
       ".gitattributes",
@@ -363,54 +382,85 @@ const RULES: Array<{ kind: Kind; globs: string[] }> = [
       ".npmrc",
       "**/.npmrc",
       ".nvmrc",
-      ".prettierrc",
-      "**/.prettierrc",
+      ".prettierrc*",
+      "**/.prettierrc*",
       ".prettierignore",
       ".eslintrc*",
-      "biome.json",
-      "**/biome.json",
-      "opencode.json",
-      "**/opencode.json",
-      "opencode.jsonc",
-      "**/opencode.jsonc",
+      "biome.json*",
+      "**/biome.json*",
+      "opencode.json*",
+      "**/opencode.json*",
       "**/Cargo.toml",
       "**/go.mod",
+      "**/go.sum",
       "**/pyproject.toml",
-      "**/requirements*.txt",
       "Makefile",
       "justfile",
+      "**/*.toml",
+      "**/*.yaml",
+      "**/*.yml",
     ],
   },
-  { kind: "docs", globs: ["README.md", "docs/**", "**/AGENTS.md", "**/*.md"] },
   {
     kind: "source",
     globs: [
       "src/**",
+      "lib/**",
+      "app/**",
+      "pkg/**",
+      "cmd/**",
+      "bin/**",
+      "scripts/**",
       "packages/*/src/**",
       "**/*.ts",
       "**/*.tsx",
       "**/*.js",
+      "**/*.jsx",
       "**/*.mjs",
+      "**/*.cjs",
       "**/*.py",
       "**/*.go",
       "**/*.rs",
+      "**/*.java",
+      "**/*.kt",
+      "**/*.c",
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.cs",
+      "**/*.rb",
+      "**/*.php",
+      "**/*.swift",
+      "**/*.scala",
+      "**/*.sh",
+      "**/*.bash",
+      "**/*.zsh",
+      "**/*.sql",
+      "**/*.graphql",
+      "**/*.proto",
+      "**/*.vue",
+      "**/*.svelte",
+      "**/*.astro",
+      "**/*.css",
+      "**/*.scss",
+      "**/*.html",
     ],
   },
 ]
 
 const REGEX_CACHE = new Map<string, RegExp>()
 
-function matches(glob: string, path: string): boolean {
+function matches(glob: string, p: string): boolean {
   let re = REGEX_CACHE.get(glob)
   if (!re) {
     re = globToRegExp(glob)
     REGEX_CACHE.set(glob, re)
   }
-  return re.test(path)
+  return re.test(p)
 }
 
-export function classify(path: string): Kind {
-  const normalized = path.replace(/\\/g, "/").replace(/^\.\//, "")
+export function classify(p: string): Kind {
+  const normalized = p.replace(/\\/g, "/").replace(/^\.\//, "")
   for (const rule of RULES) {
     for (const glob of rule.globs) {
       if (matches(glob, normalized)) return rule.kind
@@ -436,11 +486,13 @@ export function materiality(kind: Kind, attribution: Attribution, focus: boolean
 export interface AttributeInput {
   path: string
   current: string | null
+  currentContent?: string
   baseline: Map<string, string | null>
   runLedger: LedgerEntry[]
   otherLedger: LedgerEntry[]
   shellWrites: Map<string, ShellWrite>
   runStart: number
+  headCommitMs?: number
   mtime: number
   commitFiles?: Map<string, string | null>
 }
@@ -452,22 +504,41 @@ export interface AttributeResult {
 }
 
 export function attribute(input: AttributeInput): AttributeResult {
-  const { path, current, baseline, runLedger, otherLedger, shellWrites, runStart, mtime, commitFiles } = input
+  const {
+    path,
+    current,
+    currentContent,
+    baseline,
+    runLedger,
+    otherLedger,
+    shellWrites,
+    runStart,
+    headCommitMs = 0,
+    mtime,
+    commitFiles,
+  } = input
+
+  // Ledger order is chronological and is the tie-break for tool calls that
+  // share the same message timestamp.
+  const rows = runLedger.filter((e) => e.path === path && e.scope !== "none")
+  const latest = rows[rows.length - 1]
 
   if (commitFiles?.has(path)) {
     const expected = commitFiles.get(path) ?? null
     return {
       attribution: "agent_sealed",
       fresh: expected === current ? "fresh" : "stale",
-      proof: { rule: "commit", current, expected, equal: expected === current },
+      proof: {
+        rule: "commit",
+        current,
+        expected,
+        equal: expected === current,
+        session: latest?.session,
+        t: latest?.t,
+      },
     }
   }
 
-  // Ledger order is chronological and is the tie-break for tool calls that
-  // share the same message timestamp. Do not sort by `t` alone: several tool
-  // parts in one assistant message can have the same millisecond.
-  const rows = runLedger.filter((e) => e.path === path && e.scope !== "none")
-  const latest = rows[rows.length - 1]
   let exactIndex = -1
   for (let i = rows.length - 1; i >= 0; i--) {
     if (rows[i].scope === "file") {
@@ -478,9 +549,14 @@ export function attribute(input: AttributeInput): AttributeResult {
   const exact = exactIndex >= 0 ? rows[exactIndex] : undefined
   if (exact) {
     if (latest && latest.scope === "fragment" && rows.length - 1 > exactIndex) {
+      const snippetPresent =
+        typeof latest.newSnippet === "string" &&
+        latest.newSnippet.length > 0 &&
+        typeof currentContent === "string" &&
+        currentContent.includes(latest.newSnippet)
       return {
-        attribution: "agent_then_changed",
-        fresh: "stale",
+        attribution: snippetPresent ? "agent_fragment" : "agent_then_changed",
+        fresh: snippetPresent ? "fresh" : "stale",
         proof: {
           rule: "ledger-fragment",
           current,
@@ -509,14 +585,19 @@ export function attribute(input: AttributeInput): AttributeResult {
     }
   }
   if (latest) {
+    const snippetPresent =
+      typeof latest.newSnippet === "string" &&
+      latest.newSnippet.length > 0 &&
+      typeof currentContent === "string" &&
+      currentContent.includes(latest.newSnippet)
     return {
-      attribution: "unknown",
-      fresh: "stale",
+      attribution: snippetPresent ? "agent_fragment" : "unknown",
+      fresh: snippetPresent ? "fresh" : "stale",
       proof: {
         rule: "ledger-fragment",
         current,
         expected: null,
-        equal: false,
+        equal: snippetPresent,
         session: latest.session,
         t: latest.t,
         tool: latest.tool,
@@ -542,7 +623,10 @@ export function attribute(input: AttributeInput): AttributeResult {
     }
   }
 
-  const other = otherLedger.find((e) => e.path === path)
+  // Only attribute to `other_session` if the other session touched the file
+  // after the base HEAD commit AND during/after `runStart` (or if it is newer than disk mtime).
+  const minOtherTime = Math.max(runStart, headCommitMs)
+  const other = otherLedger.find((e) => e.path === path && (minOtherTime === 0 || e.t >= minOtherTime))
   if (other) {
     return {
       attribution: "other_session",
@@ -567,6 +651,13 @@ export function attribute(input: AttributeInput): AttributeResult {
         proof: { rule: "baseline", current, expected, equal: true, baseline: expected },
       }
     }
+    if (runStart > 0 && mtime > 0 && mtime < runStart) {
+      return {
+        attribution: "pre_existing",
+        fresh: "fresh",
+        proof: { rule: "mtime", current, expected, equal: false, baseline: expected, t: mtime },
+      }
+    }
     return {
       attribution: "owner_or_external",
       fresh: "stale",
@@ -574,7 +665,15 @@ export function attribute(input: AttributeInput): AttributeResult {
     }
   }
 
-  if (mtime >= runStart) {
+  if (runStart > 0 && mtime > 0 && mtime < runStart) {
+    return {
+      attribution: "pre_existing",
+      fresh: "fresh",
+      proof: { rule: "mtime", current, expected: null, equal: false, t: mtime },
+    }
+  }
+
+  if (mtime >= runStart && mtime > 0) {
     return {
       attribution: "owner_or_external",
       fresh: "stale",
@@ -614,17 +713,20 @@ export function buildChange(input: BuildInput): Change {
   const focus = new Set(input.focus ?? [])
   const shellWrites = input.shellWrites ?? new Map<string, ShellWrite>()
   const mtimes = input.mtimes ?? new Map<string, number>()
+  const diskContents = input.diskContents ?? new Map<string, string>()
 
   const files: FileChange[] = input.changes.map((raw) => {
     const kind = classify(raw.path)
     const result = attribute({
       path: raw.path,
       current: raw.after,
+      currentContent: diskContents.get(raw.path),
       baseline: input.baseline,
       runLedger: input.runLedger,
       otherLedger: input.otherLedger,
       shellWrites,
       runStart: input.runStart,
+      headCommitMs: input.headCommitMs,
       mtime: mtimes.get(raw.path) ?? 0,
       commitFiles: input.commitFiles,
     })
@@ -642,8 +744,8 @@ export function buildChange(input: BuildInput): Change {
   // The kill condition: every dirty path is in the change. The renderer may
   // bound the visible list, but the model never drops a path.
   const seen = new Set(files.map((f) => f.path))
-  for (const path of input.changes.map((c) => c.path)) {
-    if (!seen.has(path)) throw new Error(`change-set: path dropped from model: ${path}`)
+  for (const p of input.changes.map((c) => c.path)) {
+    if (!seen.has(p)) throw new Error(`change-set: path dropped from model: ${p}`)
   }
 
   const counts: Counts = {
@@ -661,20 +763,22 @@ export function buildChange(input: BuildInput): Change {
       ? input.commit.slice(0, 12)
       : changeId(input.worktree, input.base, input.changes)
 
-  const artifacts: Artifact[] = files
-    .filter(
-      (f) =>
-        (f.kind === "spec" || f.kind === "plan" || f.kind === "ticket" || f.kind === "evidence") &&
-        f.materiality !== "noise" &&
-        f.materiality !== "blocked",
-    )
-    .map((f) => ({
-      kind: f.kind,
-      path: f.path,
-      sha: f.after ?? "deleted",
-      owner: input.session,
-      fresh: f.fresh,
-    }))
+  // Compute latest source/test mutation timestamp (combining ledger proof.t AND disk mtimeMs)
+  // so any test/check run prior to the latest code mutation is marked `stale`.
+  let latestCodeMutationT = 0
+  for (const f of files) {
+    if (f.kind !== "source" && f.kind !== "test") continue
+    if (f.attribution === "pre_existing") continue
+    const t = f.proof.equal ? (f.proof.t ?? 0) : Math.max(f.proof.t ?? 0, mtimes.get(f.path) ?? 0)
+    if (t > latestCodeMutationT) latestCodeMutationT = t
+  }
+
+  const evidence: EvidenceState[] = (input.evidence ?? []).map((ev) => ({
+    ...ev,
+    fresh:
+      ev.fresh ??
+      (ev.t && latestCodeMutationT > 0 && ev.t < latestCodeMutationT ? "stale" : "fresh"),
+  }))
 
   const summary = `${files.length} files: ${counts.material} material, ${counts.context} context, ${counts.noise} noise, ${counts.blocked} blocked`
 
@@ -695,21 +799,23 @@ export function buildChange(input: BuildInput): Change {
     preExisting: input.preExisting ?? [],
     worktrees: input.worktrees ?? [],
     actors: input.actors ?? [],
-    tickets: input.tickets ?? [],
-    artifacts,
-    evidence: input.evidence ?? [],
+    evidence,
     related: input.related ?? [],
     history: input.history ?? [],
   }
 }
 
 export function shouldPush(change: Change): boolean {
-  return change.counts.material > 0 || (change.counts.byAttribution.agent_then_changed ?? 0) > 0
+  return (
+    change.counts.material > 0 ||
+    (change.counts.byAttribution.agent_then_changed ?? 0) > 0 ||
+    change.evidence.some((e) => e.outcome === "fail")
+  )
 }
 
 export function renderSignal(change: Change): string | null {
   if (!shouldPush(change)) return null
-  const kinds: Kind[] = ["source", "test", "spec", "plan", "ticket", "evidence", "config", "docs"]
+  const kinds: Kind[] = ["source", "test", "config", "docs", "unknown"]
   const parts = kinds
     .filter((k) => (change.counts.byKind[k] ?? 0) > 0)
     .map((k) => `${change.counts.byKind[k]} ${k}`)
@@ -725,20 +831,29 @@ export function renderSignal(change: Change): string | null {
     (change.counts.byAttribution.agent_fragment ?? 0)
   if (agent > 0) extras.push(`${agent} agent`)
   if (owner > 0) extras.push(`${owner} owner-touched`)
-  const unknown = change.counts.byAttribution.unknown ?? 0
-  if (unknown > 0) extras.push(`${unknown} unknown`)
+  const preExistingCount = change.counts.byAttribution.pre_existing ?? 0
+  if (preExistingCount > 0) extras.push(`${preExistingCount} pre-existing`)
+  if (change.evidence.length > 0) {
+    const passed = change.evidence.filter((e) => e.outcome === "pass").length
+    const failed = change.evidence.filter((e) => e.outcome === "fail").length
+    const stale = change.evidence.filter((e) => e.fresh === "stale").length
+    extras.push(`checks ${passed} pass/${failed} fail${stale > 0 ? ` (${stale} stale)` : ""}`)
+  }
   if (change.counts.noise > 0) extras.push(`${change.counts.noise} generated ignored`)
   if (change.counts.blocked > 0) extras.push(`${change.counts.blocked} secret blocked`)
-  if (change.related.length > 0) extras.push(`${change.related.length} related`)
 
   const head = change.state === "committed" ? `commit ${change.id}` : `${change.state} ${change.id}`
   const call =
     change.state === "committed" && change.commit
       ? `trace({commit:"${change.commit.slice(0, 12)}"})`
       : `trace({change:"${change.id}"})`
-  return `[substrate] ${head} (${change.worktree}): ${parts.join(", ")}${
-    extras.length > 0 ? "; " + extras.join(", ") : ""
-  }. ${call}`
+  const body =
+    parts.length > 0 && extras.length > 0
+      ? `${parts.join(", ")}; ${extras.join(", ")}`
+      : parts.length > 0
+        ? parts.join(", ")
+        : extras.join(", ")
+  return `[substrate] ${head} (${change.worktree}): ${body}. ${call}`
 }
 
 const ATTRIBUTION_RANK: Record<Attribution, number> = {
@@ -770,9 +885,14 @@ function topFiles(files: FileChange[]): unknown[] {
 export function renderPackage(change: Change): PackageView {
   const branches: BranchView[] = []
 
-  for (const kind of ["source", "test", "spec", "plan", "ticket", "evidence", "config", "docs"] as Kind[]) {
+  // Primary project-agnostic engineering branches: source, test, config, docs (excluding pre-existing untouched files)
+  for (const kind of ["source", "test", "config", "docs"] as Kind[]) {
     const files = change.files.filter(
-      (f) => f.kind === kind && f.materiality !== "noise" && f.materiality !== "blocked",
+      (f) =>
+        f.kind === kind &&
+        f.attribution !== "pre_existing" &&
+        f.materiality !== "noise" &&
+        f.materiality !== "blocked",
     )
     if (files.length === 0) continue
     branches.push({
@@ -786,7 +906,11 @@ export function renderPackage(change: Change): PackageView {
   // Safety net: a path the classifier does not recognize must still appear in
   // the tree. Missing a file from every branch is the kill condition.
   const unknownFiles = change.files.filter(
-    (f) => f.kind === "unknown" && f.materiality !== "noise" && f.materiality !== "blocked",
+    (f) =>
+      f.kind === "unknown" &&
+      f.attribution !== "pre_existing" &&
+      f.materiality !== "noise" &&
+      f.materiality !== "blocked",
   )
   if (unknownFiles.length > 0) {
     branches.push({
@@ -809,6 +933,39 @@ export function renderPackage(change: Change): PackageView {
       count: ownerFiles.length,
       top: topFiles(ownerFiles),
       handle: `${change.id}:owner`,
+    })
+  }
+
+  if (change.evidence.length > 0) {
+    branches.push({
+      name: "evidence",
+      count: change.evidence.length,
+      top: change.evidence.slice(-4).reverse(),
+      handle: `${change.id}:evidence`,
+    })
+  }
+
+  if (change.actors.length > 0) {
+    // Rank actors with actual file touches or checks first after root
+    const sortedActors = [...change.actors].sort((a, b) => {
+      if (a.role === "root" && b.role !== "root") return -1
+      if (b.role === "root" && a.role !== "root") return 1
+      return (b.filesTouched ?? 0) - (a.filesTouched ?? 0) || (b.checksRun ?? 0) - (a.checksRun ?? 0)
+    })
+    branches.push({
+      name: "actors",
+      count: change.actors.length,
+      top: sortedActors.slice(0, 4),
+      handle: `${change.id}:actors`,
+    })
+  }
+
+  if (change.preExisting.length > 0) {
+    branches.push({
+      name: "pre-existing",
+      count: change.preExisting.length,
+      top: change.preExisting.slice(0, 4),
+      handle: `${change.id}:pre-existing`,
     })
   }
 
@@ -837,60 +994,27 @@ export function renderPackage(change: Change): PackageView {
     })
   }
 
-  if (change.preExisting.length > 0) {
-    branches.push({
-      name: "pre-existing",
-      count: change.preExisting.length,
-      top: change.preExisting.slice(0, 5),
-      handle: `${change.id}:pre-existing`,
-    })
-  }
-
   if (change.worktrees.length > 0) {
     branches.push({
       name: "worktrees",
       count: change.worktrees.length,
-      top: change.worktrees.slice(0, 5),
+      top: change.worktrees.slice(0, 4),
       handle: `${change.id}:worktrees`,
-    })
-  }
-  if (change.actors.length > 0) {
-    branches.push({
-      name: "actors",
-      count: change.actors.length,
-      top: change.actors.slice(0, 5),
-      handle: `${change.id}:actors`,
-    })
-  }
-  if (change.tickets.length > 0) {
-    branches.push({
-      name: "tickets",
-      count: change.tickets.length,
-      top: change.tickets.slice(0, 5),
-      handle: `${change.id}:tickets`,
     })
   }
   if (change.related.length > 0) {
     branches.push({
       name: "related",
       count: change.related.length,
-      top: change.related.slice(0, 5),
+      top: change.related.slice(0, 4),
       handle: `${change.id}:related`,
-    })
-  }
-  if (change.evidence.length > 0) {
-    branches.push({
-      name: "evidence",
-      count: change.evidence.length,
-      top: change.evidence.slice(0, 5),
-      handle: `${change.id}:evidence`,
     })
   }
   if (change.history.length > 0) {
     branches.push({
       name: "history",
       count: change.history.length,
-      top: change.history.slice(0, 5),
+      top: change.history.slice(0, 4),
       handle: `${change.id}:history`,
     })
   }
@@ -914,7 +1038,7 @@ export function renderPackage(change: Change): PackageView {
   }
 }
 
-const FILE_KINDS = new Set<Kind>(["source", "test", "spec", "plan", "ticket", "evidence", "config", "docs"])
+const FILE_KINDS = new Set<Kind>(["source", "test", "config", "docs"])
 
 function clamp(text: string, limit: number): string {
   return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 1))}…`
@@ -940,7 +1064,7 @@ export function formatPackage(pkg: PackageView): string {
     const topN = FILE_KINDS.has(branch.name as Kind) || branch.name === "owner" ? 2 : 3
     const items = branch.top.slice(0, topN).map((v) => short(v))
     lines.push(
-      `  ${branch.name.padEnd(11)} ${String(branch.count).padStart(2)}  ${items.join(" · ")}  [${branch.handle}]`,
+      `  ${branch.name.padEnd(12)} ${String(branch.count).padStart(3)}  ${items.join(" · ")}  [${branch.handle}]`,
     )
   }
   return lines.join("\n")
@@ -974,13 +1098,15 @@ export function short(value: unknown): string {
                       : ` ${attr}`
     return `${op ? `${op} ` : ""}${p}${suffix}`.trim()
   }
-  if ("id" in o && "status" in o) {
-    const acceptance = o.acceptance as { passed?: number; total?: number } | undefined
-    return clamp(`${o.id}:${o.status}${acceptance ? ` ${acceptance.passed}/${acceptance.total}` : ""}`, 52)
+  if ("command" in o && "outcome" in o) {
+    const freshTag = o.fresh === "stale" ? "(stale)" : ""
+    return clamp(`${o.outcome}${freshTag}:${o.command}`, 54)
   }
   if ("session" in o) {
     const role = o.role ?? o.reason
-    return clamp(`${o.session}${role ? `(${role})` : ""}`, 46)
+    const touches = typeof o.filesTouched === "number" && o.filesTouched > 0 ? ` ${o.filesTouched}f` : ""
+    const checks = typeof o.checksRun === "number" && o.checksRun > 0 ? ` ${o.checksRun}chk` : ""
+    return clamp(`${o.session}${role ? `(${role}${touches}${checks})` : ""}`, 54)
   }
   if ("root" in o) return clamp(`${baseName(String(o.root))}@${o.branch ?? ""}`, 46)
   if ("commit" in o) return clamp(`${o.commit} ${o.subject ?? ""}`, 48)
@@ -990,9 +1116,24 @@ export function short(value: unknown): string {
 }
 
 export function leaf(change: Change, branch: string, path?: string): unknown {
-  if (branch === "blocked") {
-    const files = change.files.filter((f) => f.materiality === "blocked")
-    return files.filter((f) => !path || f.path === path).map((f) => ({ path: f.path, blocked: true }))
+  // Top-level secret redaction guard: any blocked/secret file queried on ANY branch
+  // must never expose proof hashes or diff excerpts.
+  if (path) {
+    const direct = change.files.find((f) => f.path === path)
+    if (direct && (direct.materiality === "blocked" || direct.kind === "secret")) {
+      return { branch: "blocked", file: { path: direct.path, kind: direct.kind, materiality: "blocked", blocked: true } }
+    }
+  }
+
+  if (branch === "blocked" || branch === "secret") {
+    const files = change.files.filter((f) => f.materiality === "blocked" || f.kind === "secret")
+    if (path) {
+      const found = files.find((f) => f.path === path)
+      return found
+        ? { branch: "blocked", file: { path: found.path, kind: found.kind, materiality: "blocked", blocked: true } }
+        : { error: "not found", branch: "blocked", path }
+    }
+    return files.map((f) => ({ path: f.path, blocked: true }))
   }
   if (branch === "noise") {
     const files = change.files.filter((f) => f.materiality === "noise")
@@ -1000,21 +1141,50 @@ export function leaf(change: Change, branch: string, path?: string): unknown {
       .filter((f) => !path || f.path === path)
       .map((f) => ({ path: f.path, kind: f.kind, attribution: f.attribution }))
   }
-  if (branch === "pre-existing") return change.preExisting
+  if (branch === "pre-existing") {
+    if (path) {
+      const found = change.files.find((f) => f.path === path && f.materiality !== "blocked")
+      return found ? { branch, file: found } : { error: "not found", branch, path }
+    }
+    return change.preExisting
+  }
   if (branch === "worktrees") return change.worktrees
-  if (branch === "actors") return change.actors
-  if (branch === "tickets") return change.tickets
+  if (branch === "actors") {
+    if (path) {
+      const actor = change.actors.find((a) => a.session === path || a.session.startsWith(path))
+      if (!actor) return { error: "not found", branch: "actors", session: path }
+      const actorFiles = change.files
+        .filter(
+          (f) =>
+            f.materiality !== "blocked" &&
+            (f.proof.session === actor.session || (actor.paths ?? []).includes(f.path)),
+        )
+        .map((f) => ({ path: f.path, op: f.op, attribution: f.attribution, fresh: f.fresh }))
+      const actorEvidence = change.evidence.filter((e) => e.session === actor.session)
+      return { branch: "actors", actor, files: actorFiles, evidence: actorEvidence }
+    }
+    return change.actors
+  }
   if (branch === "related") return change.related
-  if (branch === "evidence") return change.evidence
+  if (branch === "evidence") {
+    if (path) {
+      const items = change.evidence.filter((e) => e.command.includes(path) || e.session === path)
+      return { branch: "evidence", evidence: items, items }
+    }
+    return { branch: "evidence", evidence: change.evidence, items: change.evidence }
+  }
   if (branch === "history") return change.history
 
   const files = change.files.filter((f) => {
+    if (f.materiality === "blocked") return false
     if (branch === "owner") {
       return f.attribution === "owner_or_external" || f.attribution === "agent_then_changed"
     }
     return f.kind === branch
   })
-  const found = path ? files.find((f) => f.path === path) : undefined
+  const found = path
+    ? files.find((f) => f.path === path) ?? change.files.find((f) => f.path === path && f.materiality !== "blocked")
+    : undefined
   if (path && !found) return { error: "not found", branch, path }
   if (found) return { branch, file: found }
   return { branch, files }

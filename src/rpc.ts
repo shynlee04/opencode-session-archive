@@ -29,6 +29,7 @@ export type SubstrateActionKind =
   | "compaction"
   | "prune"
   | "sync"
+  | "trace"
 
 export type SubstrateSnapshotInput = {
   readonly sessionID?: string
@@ -143,6 +144,11 @@ export type SubstrateActionInput = {
   readonly scope?: "session" | "project" | "all-projects"
   readonly full?: boolean
   readonly includePrivate?: boolean
+  readonly change?: string
+  readonly handle?: string
+  readonly branch?: string
+  readonly commit?: string
+  readonly detail?: "package" | "leaf"
 }
 
 export type SubstrateActionOutput = {

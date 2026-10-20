@@ -1,14 +1,13 @@
 /**
- * Change-set trace orchestrator.
+ * Change-set trace orchestrator (Iteration 2 — Seeded Proof, Real Evidence & Diff Leaf).
  *
  * One live computation, three disclosure levels:
  *   signal  — one short injection naming the exact trace call
  *   package — bounded branch tree with handles
- *   leaf    — one branch/path, full proof
+ *   leaf    — one branch/path/actor/evidence, full proof + bounded diff
  */
 
 import path from "node:path"
-import { existsSync } from "node:fs"
 import {
   type Change,
   type PackageView,
@@ -22,12 +21,10 @@ import {
   type CommitSnapshot,
   type GitSnapshot,
   readCommitSnapshot,
+  readFileDiffExcerpt,
   readGitSnapshot,
-  readOtherTouches,
-  readRelatedFromArchive,
-  readTickets,
-  readWorktrees,
 } from "./git.ts"
+import { readOtherTouches, readRelatedFromArchive } from "./store.ts"
 import { type HostLedger, readHostLedger } from "./host-ledger.ts"
 
 export interface TraceInput {
@@ -64,8 +61,8 @@ function relatedFor(
   ledger: HostLedger,
 ): ReturnType<typeof readRelatedFromArchive> {
   const paths = snapshot.files.map((f) => f.path)
-  const actorIDs = new Set(ledger.sessions.map((s) => s.id))
-  return readRelatedFromArchive(archiveDbPath, paths, ledger.rootSession).filter((r) => !actorIDs.has(r.session))
+  const excludeSessions = ledger.sessions.length > 0 ? ledger.sessions.map((s) => s.id) : [ledger.rootSession]
+  return readRelatedFromArchive(archiveDbPath, paths, excludeSessions)
 }
 
 function assertCoverage(change: Change, ledger: HostLedger, paths: readonly string[]): TraceCoverage {
@@ -90,100 +87,75 @@ function assertCoverage(change: Change, ledger: HostLedger, paths: readonly stri
 export function buildTrace(input: TraceInput): TraceResult {
   const root = path.resolve(input.root)
   const archiveDbPath = input.archiveDbPath ?? path.join(root, ".session-archive", "index.sqlite")
-  const ledger = readHostLedger(input.hostDbPath, root, input.sessionID)
-  const notes: string[] = []
-  if (!ledger.ok && ledger.error) notes.push(`ledger: ${ledger.error}`)
-  if (ledger.fragments > 0) notes.push(`${ledger.fragments} edit fragment(s) not promotable to full-file proof`)
-  if (ledger.skippedOutsideRoot > 0) notes.push(`${ledger.skippedOutsideRoot} tool write(s) outside this worktree`)
-
-  if (input.commit) {
-    const snapshot = readCommitSnapshot(root, input.commit)
-    if (!snapshot.ok) throw new Error(snapshot.error ?? `cannot read commit ${input.commit}`)
-    const otherLedger = readOtherTouches(
-      archiveDbPath,
-      snapshot.files.map((f) => f.path),
-      ledger.sessions.map((s) => s.id),
-    )
-    const change = buildChange({
-      worktree: snapshot.root,
-      branch: snapshot.branch,
-      base: snapshot.base,
-      state: "committed",
-      commit: snapshot.commit,
-      sealedFrom: snapshot.base,
-      session: ledger.sessionID || input.sessionID || "unknown",
-      root: ledger.rootSession || input.sessionID || "unknown",
-      t: snapshot.t || Date.now(),
-      changes: snapshot.files,
-      baseline: snapshot.baseline,
-      runLedger: ledger.entries,
-      otherLedger,
-      shellWrites: ledger.shellWrites,
-      runStart: snapshot.t || 0,
-      mtimes: snapshot.mtimes,
-      commitFiles: snapshot.commitFiles,
-      tickets: readTickets(snapshot.root),
-      related: relatedFor(archiveDbPath, snapshot, ledger),
-      worktrees: readWorktrees(snapshot.root),
-      actors: ledger.actors,
-      history: snapshot.history,
-    })
-    change.preExisting = change.files.filter((f) => f.attribution === "pre_existing").map((f) => f.path)
-    const packageView = renderPackage(change)
-    const coverage = assertCoverage(change, ledger, snapshot.files.map((f) => f.path))
-    return {
-      mode: "committed",
-      root: snapshot.root,
-      change,
-      signal: renderSignal(change),
-      packageView,
-      packageMarkdown: formatPackage(packageView),
-      coverage,
-      ledger,
-      notes,
-    }
+  const isCommitted = Boolean(input.commit)
+  const snapshot = isCommitted ? readCommitSnapshot(root, input.commit!) : readGitSnapshot(root)
+  if (!snapshot.ok) {
+    throw new Error(snapshot.error ?? (isCommitted ? `cannot read commit ${input.commit}` : `cannot inspect worktree ${root}`))
   }
 
-  const snapshot = readGitSnapshot(root)
-  if (!snapshot.ok) throw new Error(snapshot.error ?? `cannot inspect worktree ${root}`)
+  const ledger = readHostLedger(
+    input.hostDbPath,
+    root,
+    input.sessionID,
+    snapshot.headContents,
+    snapshot.diskContents,
+  )
+  const notes: string[] = []
+  if (!ledger.ok && ledger.error) notes.push(`ledger: ${ledger.error}`)
+
+  const runStart = isCommitted ? (snapshot as CommitSnapshot).t || 0 : ledger.runStart || 0
+  const headCommitMs = isCommitted ? (snapshot as CommitSnapshot).t || 0 : (snapshot as GitSnapshot).headCommitMs || 0
+  const minOtherTime = Math.max(runStart, headCommitMs)
   const otherLedger = readOtherTouches(
     archiveDbPath,
     snapshot.files.map((f) => f.path),
     ledger.sessions.map((s) => s.id),
+    minOtherTime,
   )
+
   const change = buildChange({
     worktree: snapshot.root,
     branch: snapshot.branch,
     base: snapshot.base,
-    state: "dirty",
+    state: isCommitted ? "committed" : "dirty",
+    commit: isCommitted ? (snapshot as CommitSnapshot).commit : undefined,
+    sealedFrom: isCommitted ? snapshot.base : undefined,
     session: ledger.sessionID || input.sessionID || "unknown",
     root: ledger.rootSession || input.sessionID || "unknown",
-    t: Date.now(),
+    t: isCommitted ? (snapshot as CommitSnapshot).t || Date.now() : Date.now(),
     changes: snapshot.files,
     baseline: snapshot.baseline,
     runLedger: ledger.entries,
     otherLedger,
     shellWrites: ledger.shellWrites,
-    runStart: ledger.runStart || Date.now(),
+    runStart,
+    headCommitMs,
     mtimes: snapshot.mtimes,
-    tickets: readTickets(snapshot.root),
+    commitFiles: isCommitted ? (snapshot as CommitSnapshot).commitFiles : undefined,
+    diskContents: snapshot.diskContents,
+    evidence: isCommitted
+      ? ledger.evidence.map((ev) => ({ ...ev, revision: (snapshot as CommitSnapshot).commit.slice(0, 12) }))
+      : ledger.evidence,
     related: relatedFor(archiveDbPath, snapshot, ledger),
-    worktrees: snapshot.worktrees,
+    worktrees: isCommitted ? [] : (snapshot as GitSnapshot).worktrees,
     actors: ledger.actors,
     history: snapshot.history,
   })
   change.preExisting = change.files.filter((f) => f.attribution === "pre_existing").map((f) => f.path)
+  const activeFragments = change.files.filter((f) => f.proof.rule === "ledger-fragment" && !f.proof.equal).length
+  if (activeFragments > 0) notes.push(`${activeFragments} edit fragment(s) not promotable to full-file proof`)
+  if (ledger.skippedOutsideRoot > 0) notes.push(`${ledger.skippedOutsideRoot} tool write(s) outside this worktree`)
   const packageView = renderPackage(change)
   const coverage = assertCoverage(change, ledger, snapshot.files.map((f) => f.path))
   return {
-    mode: "dirty",
+    mode: isCommitted ? "committed" : "dirty",
     root: snapshot.root,
     change,
     signal: renderSignal(change),
     packageView,
     packageMarkdown: formatPackage(packageView),
     coverage,
-    ledger,
+    ledger: { ...ledger, fragments: activeFragments },
     notes,
   }
 }
@@ -206,13 +178,28 @@ export function renderTraceLeaf(
   handle?: string,
   branch?: string,
   filePath?: string,
+  maxTokens?: number,
 ): string {
   const value = resolveHandle(result.change, handle, branch, filePath)
+  if (
+    value &&
+    typeof value === "object" &&
+    "file" in (value as Record<string, unknown>) &&
+    (value as { file?: { path?: string; diffExcerpt?: string; blocked?: boolean; materiality?: string } }).file?.path
+  ) {
+    const fileObj = (value as {
+      file: { path: string; diffExcerpt?: string; blocked?: boolean; materiality?: string }
+    }).file
+    if (!fileObj.blocked && fileObj.materiality !== "blocked" && fileObj.diffExcerpt === undefined) {
+      const diff = readFileDiffExcerpt(result.root, fileObj.path, result.change.commit)
+      if (diff) fileObj.diffExcerpt = diff
+    }
+  }
   const text = JSON.stringify(value, null, 2)
-  if (text.length <= 20000) return text
-  return `${text.slice(0, 20000)}\n… truncated (${text.length} chars; narrow with path)`
-}
-
-export function traceExists(root: string): boolean {
-  return existsSync(path.join(path.resolve(root), ".session-archive"))
+  const maxChars =
+    typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
+      ? Math.max(200, Math.floor(maxTokens * 4))
+      : 20000
+  if (text.length <= maxChars) return text
+  return `${text.slice(0, maxChars)}\n… truncated (${text.length} chars; narrow with path or maxTokens)`
 }

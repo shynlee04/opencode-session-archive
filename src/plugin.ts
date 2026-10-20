@@ -49,7 +49,7 @@ import {
   renderProvenanceViewport,
 } from "./viewports/continuity.ts"
 import { buildTrace, renderTraceLeaf, renderTracePackage } from "./changes/trace.ts"
-import { ensureTraceSchema, persistTrace } from "./changes/store.ts"
+import { ensureTraceSchema, markSignalConsumed, persistTrace } from "./changes/store.ts"
 import {
   buildCompactionContinuationPacket,
   buildImplementorViewportBrief,
@@ -905,12 +905,17 @@ export default {
         const blobId = String(input?.blob ?? input?.blobRef ?? input?.sha ?? "").trim()
         const startLine = typeof input?.startLine === "number" ? input.startLine : undefined
         const endLine = typeof input?.endLine === "number" ? input.endLine : undefined
+        const maxTokens = typeof input?.maxTokens === "number" ? input.maxTokens : undefined
         const resolved = valve.resolveBlob(blobId, { startLine, endLine })
         if (resolved) {
+          const slice =
+            typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
+              ? resolved.slice.slice(0, Math.max(80, Math.floor(maxTokens * 4)))
+              : resolved.slice
           return formatToolOutput({
             action: "resolve",
-            markdown: resolved.slice,
-            metadata: resolved as unknown as Record<string, unknown>,
+            markdown: slice,
+            metadata: { ...resolved, slice } as unknown as Record<string, unknown>,
             format: input?.format,
             elapsedMs: performance.now() - t0,
             skipFooter: input?.format === undefined,
@@ -918,10 +923,14 @@ export default {
         }
         const fromArchive = valve.resolve(blobId)
         if (fromArchive) {
+          const capped =
+            typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
+              ? fromArchive.slice(0, Math.max(80, Math.floor(maxTokens * 4)))
+              : fromArchive
           return formatToolOutput({
             action: "resolve",
-            markdown: fromArchive,
-            metadata: { blobRef: blobId, content: fromArchive },
+            markdown: capped,
+            metadata: { blobRef: blobId, content: capped },
             format: input?.format,
             elapsedMs: performance.now() - t0,
             skipFooter: input?.format === undefined,
@@ -945,6 +954,7 @@ export default {
         const handle = typeof input?.handle === "string" ? input.handle : undefined
         const branch = typeof input?.branch === "string" ? input.branch : undefined
         const filePath = typeof input?.path === "string" ? input.path : undefined
+        const maxTokens = typeof input?.maxTokens === "number" ? input.maxTokens : undefined
         const rawDetail = typeof input?.detail === "string" ? input.detail.toLowerCase() : undefined
         try {
           const result = buildTrace({
@@ -959,7 +969,7 @@ export default {
             (rawDetail !== "package" &&
               (handle !== undefined || branch !== undefined || filePath !== undefined))
           const markdown = isLeaf
-            ? renderTraceLeaf(result, handle, branch, filePath)
+            ? renderTraceLeaf(result, handle, branch, filePath, maxTokens)
             : renderTracePackage(result, requestedID)
           return formatToolOutput({
             action: "trace",
@@ -1514,7 +1524,7 @@ export default {
               const previousHead = lastHeadBySession.get(sessionID)
               lastHeadBySession.set(sessionID, head)
               const finalTrace =
-                trace.change.files.length === 0 && previousHead && head && previousHead !== head
+                trace.change.counts.material === 0 && previousHead && head && previousHead !== head
                   ? buildTrace({
                       root: activeWorktreeRoot,
                       hostDbPath: dbPath,
@@ -1525,11 +1535,17 @@ export default {
                   : trace
               if (finalTrace.signal) {
                 ensureTraceSchema(db)
-                persistTrace(db, finalTrace.change, finalTrace.signal)
+                const prev = pendingSignals.get(sessionID)
+                if (prev?.consumed) {
+                  markSignalConsumed(db, sessionID, prev.id)
+                }
+                const stored = persistTrace(db, finalTrace.change, finalTrace.signal)
+                const alreadyConsumed =
+                  (prev?.id === finalTrace.change.id && prev.consumed) || stored.alreadyConsumed
                 pendingSignals.set(sessionID, {
                   id: finalTrace.change.id,
                   text: finalTrace.signal,
-                  consumed: false,
+                  consumed: alreadyConsumed,
                 })
                 const tracePayload = {
                   sessionID,

@@ -73,6 +73,13 @@ try {
   const leaf = args.leaf || args.branch
     ? renderTraceLeaf(trace, args.leaf, args.branch, args.filePath)
     : null
+  const parseLeafJson = (raw: string): unknown => {
+    try {
+      return JSON.parse(raw)
+    } catch {
+      return { truncated: true, preview: raw }
+    }
+  }
 
   if (args.json) {
     console.log(
@@ -83,7 +90,7 @@ try {
           change: trace.change,
           signal: trace.signal,
           package: trace.packageMarkdown,
-          leaf: leaf ? JSON.parse(leaf) : null,
+          leaf: leaf ? parseLeafJson(leaf) : null,
           coverage: trace.coverage,
           notes: trace.notes,
           ledger: {

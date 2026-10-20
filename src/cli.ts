@@ -49,6 +49,7 @@ import {
   queryVibeNavigation,
   renderIntentTimeline,
 } from "./viewports/semantic-digest.ts"
+import { buildTrace, renderTraceLeaf, renderTracePackage } from "./changes/trace.ts"
 
 export interface SubstrateRuntimeContextOptions {
   readonly projectRoot?: string
@@ -883,6 +884,40 @@ export async function executeSubstrateAction(
         break
       }
 
+      case "trace": {
+        const hostDbPath = process.env.OPENCODE_DB_PATH || defaultHostDbPath()
+        const indexDbPath = options.indexDbPath ?? path.join(archiveDir, "index.sqlite")
+        const traceSession = input.sessionID ?? options.sessionID
+        const rawDetail = typeof input.detail === "string" ? input.detail.toLowerCase() : undefined
+        const isLeaf =
+          rawDetail === "leaf" ||
+          (rawDetail !== "package" &&
+            (input.handle !== undefined || input.branch !== undefined || input.path !== undefined))
+        try {
+          const result = buildTrace({
+            root: projectRoot,
+            hostDbPath,
+            sessionID: traceSession,
+            commit: input.commit,
+            archiveDbPath: indexDbPath,
+          })
+          markdown = isLeaf
+            ? renderTraceLeaf(result, input.handle, input.branch, input.path, input.maxTokens)
+            : renderTracePackage(result, input.change)
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          markdown = `trace failed: ${message}`
+          return {
+            ok: false,
+            action: input.action,
+            resolvedSessionID,
+            markdown,
+            tokenEstimate: estimateTokens(markdown),
+          }
+        }
+        break
+      }
+
       case "compaction":
       case "status":
       default: {
@@ -929,6 +964,7 @@ const VALID_ACTIONS = new Set<SubstrateActionKind>([
   "brief",
   "compaction",
   "prune",
+  "trace",
 ])
 
 export interface SubstrateCliOptions {
@@ -962,6 +998,11 @@ export async function runSubstrateCli(
   let full = false
   let includePrivate = false
   let jsonOutput = false
+  let change: string | undefined
+  let handle: string | undefined
+  let branch: string | undefined
+  let commit: string | undefined
+  let detail: "package" | "leaf" | undefined
   let projectRoot = options.projectRoot
   let dbPath = options.dbPath
 
@@ -970,6 +1011,10 @@ export async function runSubstrateCli(
     if (!arg.startsWith("-")) {
       if (VALID_ACTIONS.has(arg as SubstrateActionKind)) {
         action = arg as SubstrateActionKind
+      } else if (action === "trace" && arg.startsWith("chg_") && arg.includes(":")) {
+        handle = arg
+      } else if (action === "trace" && arg.startsWith("chg_")) {
+        change = arg
       } else if (!query && action === "search") {
         query = arg
       } else if (
@@ -979,7 +1024,8 @@ export async function runSubstrateCli(
           action === "compaction" ||
           action === "prune" ||
           action === "sync" ||
-          action === "timeline")
+          action === "timeline" ||
+          action === "trace")
       ) {
         sessionID = arg
       } else if (
@@ -1020,6 +1066,23 @@ export async function runSubstrateCli(
       case "-s":
         sessionID = consumeNext()
         break
+      case "--change":
+        change = consumeNext()
+        break
+      case "--handle":
+        handle = consumeNext()
+        break
+      case "--branch":
+        branch = consumeNext()
+        break
+      case "--commit":
+        commit = consumeNext()
+        break
+      case "--detail": {
+        const val = consumeNext().toLowerCase()
+        if (val === "package" || val === "leaf") detail = val
+        break
+      }
       case "--path":
       case "-p": {
         const val = consumeNext()
@@ -1104,6 +1167,11 @@ export async function runSubstrateCli(
       scope,
       full: full || undefined,
       includePrivate: includePrivate || undefined,
+      change,
+      handle,
+      branch,
+      commit,
+      detail,
     }
 
     const actionOutput = await executeSubstrateAction(db, actionInput, {

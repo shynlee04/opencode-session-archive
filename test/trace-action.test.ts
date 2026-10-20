@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
-import { existsSync, mkdirSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { Plugin } from "@opencode/plugin"
 import { classify } from "../src/changes/model.ts"
+import { runSubstrateCli } from "../src/cli.ts"
 import plugin from "../src/plugin.ts"
 import { addMessage, addProject, addSession, makeDbFile, makeTmpDir, PROJECT_ID } from "./helpers.ts"
 
@@ -98,17 +99,21 @@ function initRepo(root: string): void {
   git(root, ["commit", "-qm", "init"])
 }
 
-function toolPart(name: string, id: string, input: Record<string, unknown>): unknown {
+function toolPart(name: string, id: string, input: Record<string, unknown>, outputText = ""): unknown {
   return {
     type: "tool",
     id,
     name,
-    state: { status: "completed", input, content: [] },
+    state: {
+      status: "completed",
+      input,
+      content: outputText ? [{ type: "text", text: outputText }] : [],
+    },
   }
 }
 
-describe("change-set trace action (real git + real host ledger)", () => {
-  test("write then edit reconstructs the full file and the trace action returns a bounded package plus leaf", async () => {
+describe("change-set trace action (Iteration 2 — project-agnostic git + host ledger + test evidence + actor leaf)", () => {
+  test("write then edit reconstructs the full file and the trace action returns a bounded package plus diff-bearing leaf", async () => {
     const root = makeTmpDir()
     initRepo(root)
     mkdirSync(path.join(root, "src"), { recursive: true })
@@ -211,6 +216,118 @@ describe("change-set trace action (real git + real host ledger)", () => {
     expect((JSON.parse(String(staleHandle.content)) as { error?: string }).error).toBe("stale-handle")
   })
 
+  test("HEAD-seeded edit without full-file read proves agent attribution, pre-existing mtime files stay pre_existing, and child actor + test evidence resolve in 2 calls", async () => {
+    const root = makeTmpDir()
+    initRepo(root)
+    mkdirSync(path.join(root, "src"), { recursive: true })
+    const trackedPath = path.join(root, "src", "tracked.ts")
+    writeFileSync(trackedPath, "export function calc() {\n  return 10\n}\n")
+    const preExistingPath = path.join(root, "src", "old-dirty.ts")
+    writeFileSync(preExistingPath, "export const old = 1\n")
+    git(root, ["add", "src/tracked.ts", "src/old-dirty.ts"])
+    git(root, ["commit", "-qm", "add tracked files"])
+
+    // Dirty old-dirty.ts with an mtime strictly before session runStart (t=5000)
+    writeFileSync(preExistingPath, "export const old = 2\n")
+    utimesSync(preExistingPath, new Date(1000), new Date(1000))
+
+    // Modify tracked.ts as if edited by a child subagent without a full-file read
+    writeFileSync(trackedPath, "export function calc() {\n  return 42\n}\n")
+
+    const dir = makeTmpDir()
+    const { db, dbPath } = makeDbFile(dir)
+    addProject(db)
+    addSession(db, { id: "ses_root", directory: root, title: "orchestrator root", time_created: 5000, time_updated: 7000 })
+    addSession(db, {
+      id: "ses_child_worker",
+      parent_id: "ses_root",
+      directory: root,
+      title: "Fix calc return value",
+      time_created: 5500,
+      time_updated: 6500,
+    })
+    addMessage(db, {
+      id: "m_child_1",
+      session_id: "ses_child_worker",
+      type: "assistant",
+      seq: 1,
+      time_created: 6000,
+      data: {
+        content: [
+          // Edit WITHOUT any prior full-file read -> seeded from git HEAD blob!
+          toolPart("edit", "call_edit_seeded", {
+            path: trackedPath,
+            oldString: "return 10",
+            newString: "return 42",
+          }),
+          toolPart(
+            "bash",
+            "call_test_1",
+            { command: "bun test test/calc.test.ts" },
+            "1 pass\n0 fail\nRan 1 tests across 1 file.\nCommand exited with code 0.",
+          ),
+          {
+            type: "text",
+            text: "Updated calc() to return 42 and verified bun test passes.",
+          },
+        ],
+      },
+    })
+    db.close()
+
+    const { findTool } = await setup({ dbPath }, root)
+    const viewport = findTool("substrate.viewport")
+
+    // Call 1: package view
+    const pkg = await viewport.execute({ action: "trace", sessionID: "ses_root" }, toolContext("ses_root"))
+    expect(pkg.metadata.ok).toBe(true)
+    expect(pkg.metadata.counts.byAttribution.agent).toBe(1)
+    expect(pkg.metadata.counts.byAttribution.pre_existing).toBe(1)
+    expect(pkg.metadata.counts.byAttribution.owner_or_external ?? 0).toBe(0)
+    expect(String(pkg.content)).toContain("evidence")
+    expect(String(pkg.content)).toContain("pass:bun test test/calc.test.ts")
+    expect(String(pkg.content)).toContain("ses_child_worker(delegation 1f 1chk)")
+
+    // Call 2a: zoom into the file leaf -> proves HEAD-seeded edit chain + includes unified git diff
+    const fileLeafRes = await viewport.execute(
+      { action: "trace", sessionID: "ses_root", branch: "source", path: "src/tracked.ts" },
+      toolContext("ses_root"),
+    )
+    const fileLeaf = JSON.parse(String(fileLeafRes.content)) as {
+      file: {
+        path: string
+        attribution: string
+        proof: { rule: string; equal: boolean; session: string }
+        diffExcerpt?: string
+      }
+    }
+    expect(fileLeaf.file.attribution).toBe("agent")
+    expect(fileLeaf.file.proof.rule).toBe("ledger")
+    expect(fileLeaf.file.proof.equal).toBe(true)
+    expect(fileLeaf.file.proof.session).toBe("ses_child_worker")
+    expect(fileLeaf.file.diffExcerpt).toContain("-  return 10")
+    expect(fileLeaf.file.diffExcerpt).toContain("+  return 42")
+
+    // Call 2b: zoom into the child actor leaf -> returns touched files, test checks, and final conclusion
+    const actorLeafRes = await viewport.execute(
+      { action: "trace", sessionID: "ses_root", branch: "actors", path: "ses_child_worker" },
+      toolContext("ses_root"),
+    )
+    const actorLeaf = JSON.parse(String(actorLeafRes.content)) as {
+      actor: { session: string; title: string; filesTouched: number; checksRun: number; lastCheck: string; conclusion: string }
+      files: Array<{ path: string; op: string; attribution: string; fresh: string }>
+      evidence: Array<{ command: string; outcome: string }>
+    }
+    expect(actorLeaf.actor.session).toBe("ses_child_worker")
+    expect(actorLeaf.actor.title).toBe("Fix calc return value")
+    expect(actorLeaf.actor.filesTouched).toBe(1)
+    expect(actorLeaf.actor.checksRun).toBe(1)
+    expect(actorLeaf.actor.lastCheck).toBe("pass")
+    expect(actorLeaf.actor.conclusion).toContain("Updated calc() to return 42")
+    expect(actorLeaf.files).toEqual([{ path: "src/tracked.ts", op: "modify", attribution: "agent", fresh: "fresh" }])
+    expect(actorLeaf.evidence[0]?.outcome).toBe("pass")
+  })
+
   test("commit seal reports agent_sealed and the signal names the exact commit call", async () => {
     const root = makeTmpDir()
     initRepo(root)
@@ -309,6 +426,18 @@ describe("change-set trace action (real git + real host ledger)", () => {
     )
     expect(injectedAgain.length).toBe(0)
 
+    // A subsequent idle on the same unchanged change.id must NOT re-arm the already-consumed signal.
+    await eventListeners[0]!({
+      type: "session.status",
+      properties: { sessionID: "ses_root", status: { type: "idle" } },
+    })
+    const third = { sessionID: "ses_root", messages: [], system: [] as any[] }
+    await hook!(third)
+    const injectedThird = third.system.filter(
+      (item) => typeof item === "object" && String(item.text ?? "").includes("[substrate]"),
+    )
+    expect(injectedThird.length).toBe(0)
+
     const archivePath = path.join(root, ".session-archive", "index.sqlite")
     expect(existsSync(archivePath)).toBe(true)
     const archive = new Database(archivePath, { readonly: true })
@@ -330,10 +459,179 @@ describe("change-set trace action (real git + real host ledger)", () => {
     expect(live.metadata.changeId).toBe(row?.id)
   })
 
-  test("classifier maps real config and planning files instead of hiding them as unknown", () => {
+  test("project-agnostic classifier maps code, tests, scripts, and configs while treating .planning and .audit artifacts as docs context", () => {
     expect(classify(".gitignore")).toBe("config")
     expect(classify("opencode.json")).toBe("config")
-    expect(classify(".planning/decisions.tsv")).toBe("plan")
+    expect(classify("requirements-dev.txt")).toBe("config")
+    expect(classify(".planning/decisions.tsv")).toBe("docs")
+    expect(classify(".audit/2026-10-19/run.md")).toBe("docs")
+    expect(classify(".audit/2026-10-12-architecture-reconciliation/prototype/variant.test.ts")).toBe("docs")
+    expect(classify(".agents/skills/agentmd-deep-init/scripts/scan-chunk.sh")).toBe("source")
     expect(classify("src/feature.ts")).toBe("source")
+    expect(classify("test/feature.test.ts")).toBe("test")
+  })
+
+  test("redacts blocked secret files on any branch and synthesizes diff excerpt for untracked added files", async () => {
+    const root = makeTmpDir()
+    initRepo(root)
+    mkdirSync(path.join(root, "src"), { recursive: true })
+    writeFileSync(path.join(root, ".env"), "NPM_HMOC_STEWARD_KEY=super_secret_token_value\n")
+    writeFileSync(path.join(root, "src", "added.ts"), "export const added = 123\n")
+
+    const dir = makeTmpDir()
+    const { db, dbPath } = makeDbFile(dir)
+    addProject(db)
+    addSession(db, { id: "ses_root", directory: root, title: "secret & add test", time_created: 1000, time_updated: 2000 })
+    addMessage(db, {
+      id: "m1",
+      session_id: "ses_root",
+      type: "assistant",
+      seq: 1,
+      time_created: 1500,
+      data: {
+        content: [
+          toolPart("write", "call_add", {
+            path: path.join(root, "src", "added.ts"),
+            content: "export const added = 123\n",
+          }),
+        ],
+      },
+    })
+    db.close()
+
+    const { findTool } = await setup({ dbPath }, root)
+    const viewport = findTool("substrate.viewport")
+
+    // Querying .env via branch:"source" must still redact and never leak secret content or diffExcerpt
+    const secretViaSource = await viewport.execute(
+      { action: "trace", sessionID: "ses_root", branch: "source", path: ".env" },
+      toolContext("ses_root"),
+    )
+    const secretRaw = String(secretViaSource.content)
+    expect(secretRaw).not.toContain("super_secret_token_value")
+    expect(secretRaw).not.toContain("diffExcerpt")
+    const secretParsed = JSON.parse(secretRaw) as {
+      branch: string
+      file: { path: string; kind: string; materiality: string; blocked: boolean; diffExcerpt?: string }
+    }
+    expect(secretParsed.branch).toBe("blocked")
+    expect(secretParsed.file.blocked).toBe(true)
+    expect(secretParsed.file.diffExcerpt).toBeUndefined()
+
+    // Querying untracked added file includes synthetic unified diff
+    const addedLeaf = await viewport.execute(
+      { action: "trace", sessionID: "ses_root", branch: "source", path: "src/added.ts" },
+      toolContext("ses_root"),
+    )
+    const addedParsed = JSON.parse(String(addedLeaf.content)) as {
+      file: { path: string; op: string; diffExcerpt?: string }
+    }
+    expect(addedParsed.file.op).toBe("add")
+    expect(addedParsed.file.diffExcerpt).toContain("+export const added = 123")
+  })
+
+  test("marks evidence stale after later code mutation, ignores git commit trailers, detects multi-suite failures, walks upward from child sessionID, and rejects unsafe commit flags", async () => {
+    const root = makeTmpDir()
+    initRepo(root)
+    mkdirSync(path.join(root, "src"), { recursive: true })
+    const codePath = path.join(root, "src", "service.ts")
+    writeFileSync(codePath, "export const v = 2\n")
+    utimesSync(codePath, new Date(8000), new Date(8000))
+
+    const dir = makeTmpDir()
+    const { db, dbPath } = makeDbFile(dir)
+    addProject(db)
+    addSession(db, { id: "ses_root", directory: root, title: "root session", time_created: 5000, time_updated: 9000 })
+    addSession(db, {
+      id: "ses_child",
+      parent_id: "ses_root",
+      directory: root,
+      title: "child worker",
+      time_created: 5500,
+      time_updated: 8500,
+    })
+    addMessage(db, {
+      id: "m_child",
+      session_id: "ses_child",
+      type: "assistant",
+      seq: 1,
+      time_created: 6000,
+      data: {
+        content: [
+          toolPart("bash", "call_test_pass", { command: "bun run test" }, "5 pass\n0 fail\nCommand exited with code 0."),
+          toolPart(
+            "bash",
+            "call_git_commit",
+            { command: 'git commit -m "feat" --trailer "Verified-by: bun run test"' },
+            "[main abc1234] feat",
+          ),
+          toolPart(
+            "bash",
+            "call_multi_fail",
+            { command: "bun test" },
+            "suite A: 10 pass, 0 fail\nsuite B: 2 pass, 1 fail",
+          ),
+        ],
+      },
+    })
+    addMessage(db, {
+      id: "m_root_later_write",
+      session_id: "ses_root",
+      type: "assistant",
+      seq: 2,
+      time_created: 7500,
+      data: {
+        content: [
+          toolPart("write", "call_write_later", {
+            path: codePath,
+            content: "export const v = 2\n",
+          }),
+        ],
+      },
+    })
+    db.close()
+
+    const { findTool } = await setup({ dbPath }, root)
+    const viewport = findTool("substrate.viewport")
+
+    // Passing child sessionID walks upward to ses_root and includes both actors + root's write
+    const pkg = await viewport.execute({ action: "trace", sessionID: "ses_child" }, toolContext("ses_child"))
+    expect(pkg.metadata.ok).toBe(true)
+    expect(pkg.metadata.coverage.actors).toBe(2)
+    expect(pkg.metadata.counts.byAttribution.agent).toBe(1)
+    expect(String(pkg.content)).toContain("(stale)")
+
+    const evLeafRes = await viewport.execute(
+      { action: "trace", sessionID: "ses_child", branch: "evidence" },
+      toolContext("ses_child"),
+    )
+    const evLeaf = JSON.parse(String(evLeafRes.content)) as {
+      evidence: Array<{ command: string; outcome: string; fresh: string }>
+    }
+    // git commit --trailer must not be recorded as verification evidence
+    expect(evLeaf.evidence.length).toBe(2)
+    expect(evLeaf.evidence[0]?.outcome).toBe("pass")
+    expect(evLeaf.evidence[0]?.fresh).toBe("stale")
+    expect(evLeaf.evidence[1]?.outcome).toBe("fail")
+    expect(evLeaf.evidence[1]?.fresh).toBe("stale")
+
+    // Unsafe git flag injection in commit parameter must be rejected
+    const badCommit = await viewport.execute(
+      { action: "trace", sessionID: "ses_root", commit: "--output=/tmp/injected" },
+      toolContext("ses_root"),
+    )
+    expect(badCommit.metadata.ok).toBe(false)
+
+    // CLI parity for trace action
+    const prevEnv = process.env.OPENCODE_DB_PATH
+    process.env.OPENCODE_DB_PATH = dbPath
+    try {
+      const cliRes = await runSubstrateCli(["trace", "--project-root", root, "--session", "ses_child"])
+      expect(cliRes.exitCode).toBe(0)
+      expect(cliRes.stdout).toContain("change ")
+    } finally {
+      if (prevEnv === undefined) delete process.env.OPENCODE_DB_PATH
+      else process.env.OPENCODE_DB_PATH = prevEnv
+    }
   })
 })

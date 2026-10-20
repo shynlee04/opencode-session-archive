@@ -1,24 +1,22 @@
 /**
- * Real git adapter for the change-set trace.
+ * Real git adapter for the change-set trace (Iteration 2 — Batched & Project-Agnostic).
  *
  * Read-only by construction: every command is run with `GIT_OPTIONAL_LOCKS=0`
- * and no command mutates the index or the working tree.
+ * and `-c core.quotePath=false`, and no command mutates the index or working tree.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs"
+import { existsSync, readFileSync, statSync } from "node:fs"
 import path from "node:path"
-import { Database } from "bun:sqlite"
 import {
   type ChangeState,
   type HistoryEntry,
-  type LedgerEntry,
   type Op,
   type RawChange,
-  type RelatedSession,
-  type TicketState,
   type WorktreeState,
   fullHash,
 } from "./model.ts"
+
+export { readOtherTouches, readRelatedFromArchive } from "./store.ts"
 
 export interface GitStatusEntry {
   path: string
@@ -36,12 +34,15 @@ export interface GitSnapshot {
   root: string
   branch: string
   base: string
+  headCommitMs: number
   state: ChangeState
   files: GitFile[]
   worktrees: WorktreeState[]
   history: HistoryEntry[]
   baseline: Map<string, string | null>
   mtimes: Map<string, number>
+  headContents: Map<string, string>
+  diskContents: Map<string, string>
 }
 
 export interface CommitSnapshot {
@@ -58,11 +59,22 @@ export interface CommitSnapshot {
   baseline: Map<string, string | null>
   mtimes: Map<string, number>
   history: HistoryEntry[]
+  headContents: Map<string, string>
+  diskContents: Map<string, string>
 }
 
-function runGit(cwd: string, args: string[]): { ok: boolean; code: number; stdout: Buffer; stderr: string } {
+function isSafeCommitRef(ref: string | undefined): ref is string {
+  return typeof ref === "string" && ref.trim().length > 0 && !ref.trim().startsWith("-")
+}
+
+function runGit(
+  cwd: string,
+  args: string[],
+  stdinText?: string,
+): { ok: boolean; code: number; stdout: Buffer; stderr: string } {
   const proc = Bun.spawnSync({
-    cmd: ["git", "-C", cwd, ...args],
+    cmd: ["git", "-c", "core.quotePath=false", "-C", cwd, ...args],
+    stdin: stdinText !== undefined ? Buffer.from(stdinText, "utf8") : undefined,
     stdout: "pipe",
     stderr: "pipe",
     env: {
@@ -117,46 +129,87 @@ export function opFromStatus(xy: string, origPath: string | null): Op {
   return "modify"
 }
 
-function blobAt(cwd: string, spec: string): string | null {
-  const r = runGit(cwd, ["cat-file", "blob", spec])
-  if (!r.ok) return null
-  return fullHash(r.stdout)
+interface BatchBlobInfo {
+  sha256: string
+  lines: number
+  text?: string
 }
 
-function headBlob(cwd: string, relPath: string): string | null {
-  return blobAt(cwd, `HEAD:${relPath}`)
-}
+/**
+ * Reads an arbitrary list of `<rev>:<path>` specs in a single `git cat-file --batch`
+ * subprocess instead of spawning one process per file. Skips UTF-8 decoding for binary blobs.
+ */
+function batchReadBlobs(cwd: string, specs: string[]): Map<string, BatchBlobInfo> {
+  const out = new Map<string, BatchBlobInfo>()
+  const unique = [...new Set(specs.filter(Boolean))]
+  if (unique.length === 0) return out
 
-function commitBlob(cwd: string, commit: string, relPath: string): string | null {
-  return blobAt(cwd, `${commit}:${relPath}`)
-}
+  const r = runGit(cwd, ["cat-file", "--batch"], `${unique.join("\n")}\n`)
+  if (!r.ok && r.stdout.length === 0) return out
 
-function fileHash(absPath: string): string | null {
-  if (!existsSync(absPath)) return null
-  try {
-    return fullHash(readFileSync(absPath))
-  } catch {
-    return null
+  const buf = r.stdout
+  let offset = 0
+  let specIdx = 0
+  while (offset < buf.length && specIdx < unique.length) {
+    const nl = buf.indexOf(10, offset)
+    if (nl === -1) break
+    const header = buf.subarray(offset, nl).toString("utf8")
+    const spec = unique[specIdx++]!
+    offset = nl + 1
+    if (header.endsWith(" missing") || header.endsWith(" ambiguous")) {
+      continue
+    }
+    const parts = header.split(" ")
+    const size = Number.parseInt(parts[parts.length - 1] ?? "0", 10)
+    if (!Number.isFinite(size) || size < 0 || offset + size > buf.length) {
+      break
+    }
+    const content = buf.subarray(offset, offset + size)
+    offset += size + 1 // skip trailing LF after blob payload
+    const sha256 = fullHash(content)
+    const isBinary = content.includes(0)
+    const text = !isBinary && size <= 512 * 1024 ? content.toString("utf8") : undefined
+    const lines = text !== undefined ? countLines(text) : 0
+    out.set(spec, { sha256, lines, text })
   }
+  return out
 }
 
-function fileMtime(absPath: string): number {
+function readDiskFile(absPath: string): { sha256: string | null; mtime: number; text?: string; lines: number } {
+  if (!existsSync(absPath)) return { sha256: null, mtime: 0, lines: 0 }
   try {
-    return statSync(absPath).mtimeMs
+    const st = statSync(absPath)
+    if (!st.isFile()) return { sha256: null, mtime: st.mtimeMs, lines: 0 }
+    const buf = readFileSync(absPath)
+    const sha256 = fullHash(buf)
+    const isBinary = buf.includes(0)
+    const text = !isBinary && buf.length <= 512 * 1024 ? buf.toString("utf8") : undefined
+    const lines = text !== undefined ? countLines(text) : 0
+    return { sha256, mtime: st.mtimeMs, text, lines }
   } catch {
-    return 0
+    return { sha256: null, mtime: 0, lines: 0 }
   }
 }
 
 function numstatMap(cwd: string, args: string[]): Map<string, { adds: number; dels: number }> {
-  const out = runGitText(cwd, args)
+  const out = runGitText(cwd, [...args, "-z"])
   const map = new Map<string, { adds: number; dels: number }>()
-  for (const line of out.split("\n")) {
-    if (!line.trim()) continue
-    const [a, d, ...rest] = line.split("\t")
-    const rel = rest.join("\t")
+  const tokens = out.split("\0")
+  for (let i = 0; i < tokens.length; i++) {
+    const rec = tokens[i]
+    if (!rec) continue
+    const parts = rec.split("\t")
+    if (parts.length < 3) continue
+    const adds = Number.parseInt(parts[0] ?? "0", 10) || 0
+    const dels = Number.parseInt(parts[1] ?? "0", 10) || 0
+    let rel = parts.slice(2).join("\t")
+    // With --numstat -z, renames have an empty path field followed by NUL old\0new\0
+    if (rel === "" && i + 2 < tokens.length) {
+      i += 1 // old path
+      rel = tokens[++i] ?? ""
+    }
     if (!rel) continue
-    map.set(rel, { adds: Number.parseInt(a, 10) || 0, dels: Number.parseInt(d, 10) || 0 })
+    map.set(rel, { adds, dels })
   }
   return map
 }
@@ -166,66 +219,27 @@ function countLines(text: string): number {
   return text.split("\n").length - (text.endsWith("\n") ? 1 : 0)
 }
 
-function ticketStatus(body: string): string {
-  const m = body.match(/^\s*(?:status|state)\s*:\s*([^\n]+)$/im)
-  return m ? m[1].trim() : "unknown"
-}
-
-function walkTickets(root: string): string[] {
-  const phases = path.join(root, ".planning", "phases")
-  if (!existsSync(phases)) return []
-  const out: string[] = []
-  for (const phase of readdirSync(phases, { withFileTypes: true })) {
-    if (!phase.isDirectory()) continue
-    const dir = path.join(phases, phase.name, "tickets")
-    if (!existsSync(dir)) continue
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.isFile() && entry.name.endsWith(".md")) out.push(path.join(dir, entry.name))
-    }
-  }
-  return out
-}
-
-export function readTickets(root: string): TicketState[] {
-  const tickets: TicketState[] = []
-  for (const file of walkTickets(root)) {
-    let body = ""
-    try {
-      body = readFileSync(file, "utf8")
-    } catch {
-      continue
-    }
-    const rel = path.relative(root, file).replace(/\\/g, "/")
-    const phase = rel.split("/")[2] ?? ""
-    const id = path.basename(file, ".md")
-    const heading = body.match(/^#\s+(.+)$/m)?.[1]?.trim() ?? id
-    const passed = (body.match(/^\s*-\s*\[[xX]\]/gm) ?? []).length
-    const total = passed + (body.match(/^\s*-\s*\[\s\]/gm) ?? []).length
-    tickets.push({
-      id,
-      title: heading,
-      phase,
-      status: ticketStatus(body),
-      acceptance: { passed, total },
-      path: rel,
-    })
-  }
-  return tickets.sort((a, b) => a.id.localeCompare(b.id))
-}
-
-export function readWorktrees(root: string): WorktreeState[] {
+export function readWorktrees(root: string, activeRootDirtyCount?: number): WorktreeState[] {
   const out = runGitText(root, ["worktree", "list", "--porcelain"])
   const worktrees: WorktreeState[] = []
   let current: { root?: string; head?: string; branch?: string } = {}
+  let statusChecks = 0
   const flush = () => {
     if (!current.root) return
     const dir = current.root
-    const status = runGitText(dir, ["status", "--porcelain=v2", "--untracked-files=normal"])
+    let dirty = 0
+    if (path.resolve(dir) === path.resolve(root) && activeRootDirtyCount !== undefined) {
+      dirty = activeRootDirtyCount
+    } else if (statusChecks < 6 && existsSync(dir)) {
+      statusChecks++
+      const status = runGitText(dir, ["status", "--porcelain=v2", "-uno"])
+      dirty = status.split("\n").filter(Boolean).length
+    }
     worktrees.push({
       root: dir,
       branch: current.branch ?? "HEAD",
       base: current.head ?? "",
-      dirty: status.split("\n").filter(Boolean).length,
+      dirty,
       ahead: 0,
       behind: 0,
     })
@@ -258,10 +272,42 @@ export function readHistory(root: string, limit = 5): HistoryEntry[] {
       commit: commit.slice(0, 12),
       subject: subject ?? "",
       worktree: root,
-      t: Number.parseInt(ts ?? "0", 10) || 0,
+      t: (Number.parseInt(ts ?? "0", 10) || 0) * 1000,
     })
   }
   return entries
+}
+
+export function readFileDiffExcerpt(root: string, relPath: string, commit?: string, maxLines = 60): string | undefined {
+  if (!relPath || relPath.startsWith("-")) return undefined
+  if (commit !== undefined && !isSafeCommitRef(commit)) return undefined
+
+  const raw = commit
+    ? runGitText(root, ["show", "--format=", "--unified=2", commit, "--", relPath])
+    : runGitText(root, ["diff", "--unified=2", "HEAD", "--", relPath])
+
+  if (raw.trim()) {
+    const lines = raw.trim().split("\n")
+    if (lines.length <= maxLines) return lines.join("\n")
+    return `${lines.slice(0, maxLines).join("\n")}\n… (+${lines.length - maxLines} diff lines)`
+  }
+
+  // Fallback for untracked newly added files (`??`): render synthetic unified diff
+  if (!commit) {
+    const disk = readDiskFile(path.join(root, relPath))
+    if (disk.text !== undefined) {
+      const contentLines = disk.text.replace(/\r\n/g, "\n").split("\n")
+      if (contentLines.length > 1 && contentLines[contentLines.length - 1] === "") {
+        contentLines.pop()
+      }
+      const header = `--- /dev/null\n+++ b/${relPath}\n@@ -0,0 +1,${contentLines.length} @@`
+      const body = contentLines.map((l) => `+${l}`)
+      const all = [header, ...body]
+      if (all.length <= maxLines) return all.join("\n")
+      return `${all.slice(0, maxLines).join("\n")}\n… (+${all.length - maxLines} diff lines)`
+    }
+  }
+  return undefined
 }
 
 export function readGitSnapshot(rootArg: string): GitSnapshot {
@@ -274,41 +320,60 @@ export function readGitSnapshot(rootArg: string): GitSnapshot {
       root,
       branch: "",
       base: "",
+      headCommitMs: 0,
       state: "dirty",
       files: [],
       worktrees: [],
       history: [],
       baseline: new Map(),
       mtimes: new Map(),
+      headContents: new Map(),
+      diskContents: new Map(),
     }
   }
   const top = topRes.stdout.toString("utf8").trim()
   const branch = runGitText(top, ["rev-parse", "--abbrev-ref", "HEAD"]).trim() || "HEAD"
   const base = runGitText(top, ["rev-parse", "HEAD"]).trim()
+  const headTsSec = Number.parseInt(runGitText(top, ["show", "-s", "--format=%ct", "HEAD"]).trim() || "0", 10) || 0
+  const headCommitMs = headTsSec * 1000
   const status = runGit(top, ["status", "--porcelain=v2", "-z", "--untracked-files=all"])
   const entries = parsePorcelainV2(status.stdout.toString("utf8"))
   const numstat = numstatMap(top, ["diff", "--numstat", "HEAD"])
   const files: GitFile[] = []
   const baseline = new Map<string, string | null>()
   const mtimes = new Map<string, number>()
+  const headContents = new Map<string, string>()
+  const diskContents = new Map<string, string>()
+
+  const headSpecs = entries
+    .filter((e) => e.xy !== "??")
+    .map((e) => `HEAD:${e.origPath ?? e.path}`)
+  const headBlobs = batchReadBlobs(top, headSpecs)
 
   for (const entry of entries) {
     const beforeRel = entry.origPath ?? entry.path
-    const before = headBlob(top, beforeRel)
-    const after = entry.xy.includes("D") ? null : fileHash(path.join(top, entry.path))
+    const headInfo = entry.xy === "??" ? undefined : headBlobs.get(`HEAD:${beforeRel}`)
+    const before = headInfo?.sha256 ?? null
+    if (headInfo?.text !== undefined) {
+      headContents.set(entry.path, headInfo.text)
+    }
+
+    const disk = entry.xy.includes("D")
+      ? { sha256: null, mtime: 0, text: undefined, lines: 0 }
+      : readDiskFile(path.join(top, entry.path))
+    const after = disk.sha256
+    if (disk.text !== undefined) {
+      diskContents.set(entry.path, disk.text)
+    }
+
     const stat = numstat.get(entry.path)
     let adds = stat?.adds ?? 0
     let dels = stat?.dels ?? 0
     if (entry.xy === "??" && after) {
-      try {
-        adds = countLines(readFileSync(path.join(top, entry.path), "utf8"))
-      } catch {
-        adds = 0
-      }
+      adds = disk.lines
     }
-    if (entry.xy.includes("D") && before) {
-      const r = runGit(top, ["cat-file", "blob", `HEAD:${beforeRel}`])
-      if (r.ok) dels = countLines(r.stdout.toString("utf8"))
+    if (entry.xy.includes("D") && headInfo) {
+      dels = headInfo.lines
     }
     files.push({
       path: entry.path,
@@ -317,10 +382,10 @@ export function readGitSnapshot(rootArg: string): GitSnapshot {
       after,
       adds,
       dels,
-      mtime: fileMtime(path.join(top, entry.path)),
+      mtime: disk.mtime,
     })
     baseline.set(entry.path, before)
-    mtimes.set(entry.path, fileMtime(path.join(top, entry.path)))
+    mtimes.set(entry.path, disk.mtime)
   }
 
   return {
@@ -328,28 +393,31 @@ export function readGitSnapshot(rootArg: string): GitSnapshot {
     root: top,
     branch,
     base,
+    headCommitMs,
     state: files.length > 0 ? "dirty" : "committed",
     files,
-    worktrees: readWorktrees(top),
+    worktrees: readWorktrees(top, files.length),
     history: readHistory(top),
     baseline,
     mtimes,
+    headContents,
+    diskContents,
   }
 }
 
-function parseNameStatus(text: string): Array<{ path: string; origPath: string | null; op: Op }> {
+function parseNameStatusZ(text: string): Array<{ path: string; origPath: string | null; op: Op }> {
   const out: Array<{ path: string; origPath: string | null; op: Op }> = []
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue
-    const parts = line.split("\t")
-    const code = parts[0] ?? ""
+  const tokens = text.split("\0")
+  for (let i = 0; i < tokens.length; i++) {
+    const code = (tokens[i] ?? "").trim()
+    if (!code) continue
     if (code.startsWith("R") || code.startsWith("C")) {
-      const origPath = parts[1] ?? ""
-      const next = parts[2] ?? ""
-      if (next) out.push({ path: next, origPath, op: "rename" })
+      const origPath = tokens[++i] ?? ""
+      const next = tokens[++i] ?? ""
+      if (next) out.push({ path: next, origPath: origPath || null, op: "rename" })
       continue
     }
-    const rel = parts[1] ?? ""
+    const rel = tokens[++i] ?? ""
     if (!rel) continue
     const op: Op = code.startsWith("A") ? "add" : code.startsWith("D") ? "delete" : "modify"
     out.push({ path: rel, origPath: null, op })
@@ -359,39 +427,74 @@ function parseNameStatus(text: string): Array<{ path: string; origPath: string |
 
 export function readCommitSnapshot(rootArg: string, commit: string): CommitSnapshot {
   const root = path.resolve(rootArg)
+  const empty: CommitSnapshot = {
+    ok: false,
+    root,
+    commit,
+    subject: "",
+    branch: "",
+    base: "",
+    t: 0,
+    files: [],
+    commitFiles: new Map(),
+    baseline: new Map(),
+    mtimes: new Map(),
+    history: [],
+    headContents: new Map(),
+    diskContents: new Map(),
+  }
+  if (!isSafeCommitRef(commit)) {
+    return { ...empty, error: `invalid commit ref: ${commit}` }
+  }
   const topRes = runGit(root, ["rev-parse", "--show-toplevel"])
   if (!topRes.ok) {
-    return {
-      ok: false,
-      error: `not a git worktree: ${root}`,
-      root,
-      commit,
-      subject: "",
-      branch: "",
-      base: "",
-      t: 0,
-      files: [],
-      commitFiles: new Map(),
-      baseline: new Map(),
-      mtimes: new Map(),
-      history: [],
-    }
+    return { ...empty, error: `not a git worktree: ${root}` }
   }
   const top = topRes.stdout.toString("utf8").trim()
-  const meta = runGitText(top, ["show", "--no-patch", "--format=%H%x00%s%x00%ct", commit]).trim()
-  const [sha, subject, ts] = meta.split("\0")
-  const resolved = sha || commit
-  const parent = runGitText(top, ["rev-parse", `${resolved}^`]).trim()
-  const nameStatus = runGitText(top, ["diff-tree", "--no-commit-id", "--name-status", "-r", "--root", resolved])
+  const verify = runGit(top, ["rev-parse", "--verify", "--quiet", `${commit}^{commit}`])
+  if (!verify.ok) {
+    return { ...empty, root: top, error: `unknown commit: ${commit}` }
+  }
+  const resolved = verify.stdout.toString("utf8").trim() || commit
+  const meta = runGitText(top, ["show", "--no-patch", "--format=%H%x00%s%x00%ct", resolved]).trim()
+  const [, subject, ts] = meta.split("\0")
+  const parent = runGitText(top, ["rev-parse", "--verify", "--quiet", `${resolved}^`]).trim()
+  const nameStatus = runGitText(top, ["diff-tree", "--no-commit-id", "--name-status", "-r", "-z", "--root", resolved])
   const numstat = numstatMap(top, ["show", "--numstat", "--format=", resolved])
   const files: GitFile[] = []
   const commitFiles = new Map<string, string | null>()
   const baseline = new Map<string, string | null>()
   const mtimes = new Map<string, number>()
+  const headContents = new Map<string, string>()
+  const diskContents = new Map<string, string>()
 
-  for (const entry of parseNameStatus(nameStatus)) {
-    const before = entry.origPath ? commitBlob(top, parent || "4b825dc642cb6eb9a060e54bf8d69288fbee4904", entry.origPath) : parent ? commitBlob(top, parent, entry.path) : null
-    const after = entry.op === "delete" ? null : commitBlob(top, resolved, entry.path)
+  const parsedEntries = parseNameStatusZ(nameStatus)
+  const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+  const specs: string[] = []
+  for (const entry of parsedEntries) {
+    const beforeSpec = entry.origPath
+      ? `${parent || emptyTree}:${entry.origPath}`
+      : parent
+        ? `${parent}:${entry.path}`
+        : ""
+    if (beforeSpec) specs.push(beforeSpec)
+    if (entry.op !== "delete") specs.push(`${resolved}:${entry.path}`)
+  }
+  const blobs = batchReadBlobs(top, specs)
+
+  for (const entry of parsedEntries) {
+    const beforeSpec = entry.origPath
+      ? `${parent || emptyTree}:${entry.origPath}`
+      : parent
+        ? `${parent}:${entry.path}`
+        : ""
+    const beforeInfo = beforeSpec ? blobs.get(beforeSpec) : undefined
+    const afterInfo = entry.op === "delete" ? undefined : blobs.get(`${resolved}:${entry.path}`)
+    const before = beforeInfo?.sha256 ?? null
+    const after = afterInfo?.sha256 ?? null
+    if (beforeInfo?.text !== undefined) headContents.set(entry.path, beforeInfo.text)
+    if (afterInfo?.text !== undefined) diskContents.set(entry.path, afterInfo.text)
+
     const stat = numstat.get(entry.path)
     files.push({
       path: entry.path,
@@ -413,106 +516,13 @@ export function readCommitSnapshot(rootArg: string, commit: string): CommitSnaps
     subject: subject ?? "",
     branch: runGitText(top, ["rev-parse", "--abbrev-ref", "HEAD"]).trim() || "HEAD",
     base: parent,
-    t: Number.parseInt(ts ?? "0", 10) || 0,
+    t: (Number.parseInt(ts ?? "0", 10) || 0) * 1000,
     files,
     commitFiles,
     baseline,
     mtimes,
     history: readHistory(top),
-  }
-}
-
-export function readOtherTouches(
-  indexDbPath: string,
-  paths: string[],
-  excludeSessions: readonly string[],
-): LedgerEntry[] {
-  if (!existsSync(indexDbPath) || paths.length === 0) return []
-  let db: Database | null = null
-  try {
-    db = new Database(indexDbPath, { readonly: true })
-    const hasTouch = db
-      .query("SELECT name FROM sqlite_master WHERE type='table' AND name='file_touch'")
-      .get() as { name?: string } | null
-    if (!hasTouch?.name) return []
-    const placeholders = paths.map(() => "?").join(",")
-    const exclude = excludeSessions.length > 0 ? excludeSessions.map(() => "?").join(",") : null
-    const sql = `SELECT session_id, normalized_path, tool, op, t FROM file_touch
-      WHERE normalized_path IN (${placeholders})${exclude ? ` AND session_id NOT IN (${exclude})` : ""}
-      ORDER BY t DESC`
-    const rows = db.query(sql).all(...paths, ...excludeSessions) as Array<{
-      session_id: string
-      normalized_path: string
-      tool: string
-      op: string
-      t: number
-    }>
-    const seen = new Set<string>()
-    const out: LedgerEntry[] = []
-    for (const row of rows) {
-      if (seen.has(row.normalized_path)) continue
-      seen.add(row.normalized_path)
-      const op: Op = row.op.includes("add")
-        ? "add"
-        : row.op.includes("delete")
-          ? "delete"
-          : row.op.includes("rename")
-            ? "rename"
-            : "modify"
-      out.push({
-        session: row.session_id,
-        root: row.session_id,
-        path: row.normalized_path,
-        op,
-        tool: row.tool === "write" ? "write" : row.tool === "patch" ? "patch" : row.tool === "shell" ? "shell" : "edit",
-        before: null,
-        after: null,
-        scope: "fragment",
-        t: Number(row.t ?? 0),
-      })
-    }
-    return out
-  } catch {
-    return []
-  } finally {
-    db?.close()
-  }
-}
-
-export function readRelatedFromArchive(indexDbPath: string, paths: string[], excludeSession: string): RelatedSession[] {
-  if (!existsSync(indexDbPath) || paths.length === 0) return []
-  let db: Database | null = null
-  try {
-    db = new Database(indexDbPath, { readonly: true })
-    const hasTouch = db
-      .query("SELECT name FROM sqlite_master WHERE type='table' AND name='file_touch'")
-      .get() as { name?: string } | null
-    if (!hasTouch?.name) return []
-    const placeholders = paths.map(() => "?").join(",")
-    const rows = db
-      .query(
-        `SELECT session_id, normalized_path, MAX(t) AS t FROM file_touch
-         WHERE normalized_path IN (${placeholders}) AND session_id != ?
-         GROUP BY session_id, normalized_path ORDER BY t DESC LIMIT 20`,
-      )
-      .all(...paths, excludeSession) as Array<{ session_id: string; normalized_path: string; t: number }>
-    const seen = new Set<string>()
-    const out: RelatedSession[] = []
-    for (const row of rows) {
-      if (seen.has(row.session_id)) continue
-      seen.add(row.session_id)
-      out.push({
-        session: row.session_id,
-        root: row.session_id,
-        reason: "path",
-        handle: `session:${row.session_id}`,
-        t: Number(row.t ?? 0),
-      })
-    }
-    return out.slice(0, 5)
-  } catch {
-    return []
-  } finally {
-    db?.close()
+    headContents,
+    diskContents,
   }
 }
