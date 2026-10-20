@@ -30,11 +30,14 @@
   ],
   "scripts": {
     "local-build": "node scripts/local-build.mjs",
-    "test": "bun test",
+    "test": "bun test test/",
+    "test:external": "SUBSTRATE_EXTERNAL=1 bun test test/",
+    "test:all": "bun test",
     "typecheck": "tsc --noEmit",
     "build": "bun scripts/build.ts",
     "substrate": "bun src/cli.ts",
-    "prepublishOnly": "bun test && bun run typecheck && bun run build"
+    "trace": "bun scripts/trace-live.ts",
+    "prepublishOnly": "bun run test && bun run typecheck && bun run build"
   },
   "publishConfig": {
     "access": "public"

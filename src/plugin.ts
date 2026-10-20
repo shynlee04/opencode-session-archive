@@ -48,6 +48,8 @@ import {
   formatVerificationGateLabel,
   renderProvenanceViewport,
 } from "./viewports/continuity.ts"
+import { buildTrace, renderTraceLeaf, renderTracePackage } from "./changes/trace.ts"
+import { ensureTraceSchema, persistTrace } from "./changes/store.ts"
 import {
   buildCompactionContinuationPacket,
   buildImplementorViewportBrief,
@@ -374,6 +376,12 @@ export default {
     const archiveDir = resolveArchiveDir(canonicalRoot, dir)
     const blobDir = path.join(archiveDir, "blobs")
     const indexDbPath = path.join(archiveDir, "index.sqlite")
+
+    // Event-driven trace signal. The context hook only reads this map; the idle
+    // subscriber does the real git + host-ledger work and writes the durable row.
+    type PendingSignal = { readonly id: string; readonly text: string; consumed: boolean }
+    const pendingSignals = new Map<string, PendingSignal>()
+    const lastHeadBySession = new Map<string, string>()
 
     const valve = new WorkingSetValve({
       blobDir,
@@ -929,6 +937,66 @@ export default {
         })
       }
 
+      if (action === "trace") {
+        // Read-only live path: real git + the host ledger, never a full archive sync.
+        const traceSession = typeof input?.sessionID === "string" ? input.sessionID : context?.sessionID
+        const commit = typeof input?.commit === "string" ? input.commit : undefined
+        const requestedID = typeof input?.change === "string" ? input.change : undefined
+        const handle = typeof input?.handle === "string" ? input.handle : undefined
+        const branch = typeof input?.branch === "string" ? input.branch : undefined
+        const filePath = typeof input?.path === "string" ? input.path : undefined
+        const rawDetail = typeof input?.detail === "string" ? input.detail.toLowerCase() : undefined
+        try {
+          const result = buildTrace({
+            root: activeWorktreeRoot,
+            hostDbPath: dbPath,
+            sessionID: traceSession,
+            commit,
+            archiveDbPath: indexDbPath,
+          })
+          const isLeaf =
+            rawDetail === "leaf" ||
+            (rawDetail !== "package" &&
+              (handle !== undefined || branch !== undefined || filePath !== undefined))
+          const markdown = isLeaf
+            ? renderTraceLeaf(result, handle, branch, filePath)
+            : renderTracePackage(result, requestedID)
+          return formatToolOutput({
+            action: "trace",
+            markdown,
+            metadata: {
+              ok: true,
+              changeId: result.change.id,
+              state: result.change.state,
+              counts: result.change.counts,
+              coverage: result.coverage,
+              source: "git+host-ledger",
+              notes: result.notes,
+              packageTokens: estimateTokens(result.packageMarkdown),
+              signal: result.signal,
+              detail: isLeaf ? "leaf" : "package",
+              ...(isLeaf
+                ? { handle: handle ?? `${result.change.id}:${branch ?? "source"}`, path: filePath ?? null }
+                : { handles: result.packageView.branches.map((b) => b.handle) }),
+            },
+            format: input?.format,
+            elapsedMs: performance.now() - t0,
+            sessionID: result.ledger.sessionID || traceSession || null,
+            skipFooter: input?.format === undefined,
+          })
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          return formatToolOutput({
+            action: "trace",
+            markdown: `trace failed: ${message}`,
+            metadata: { ok: false, error: message },
+            format: input?.format,
+            elapsedMs: performance.now() - t0,
+            skipFooter: true,
+          })
+        }
+      }
+
       const explicitSession = typeof input?.sessionID === "string" ? input.sessionID : undefined
       const hookSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
       const { db } = ensureSyncedDb(explicitSession ?? hookSession)
@@ -1209,7 +1277,19 @@ export default {
     // 1. < 2 ms in-memory context hook (REQ-SUB-07, REQ-SUB-08, REQ-SUB-17)
     if (typeof ctx.session?.hook === "function") {
       await ctx.session.hook("context", (event) => {
+        const hookEvent = event as unknown as {
+          sessionID?: string
+          system?: Array<string | { type: "text"; text: string }>
+        }
         valve.applyContextHookInMemory(event as unknown as Parameters<typeof valve.applyContextHookInMemory>[0])
+        const hookSession = typeof hookEvent.sessionID === "string" ? hookEvent.sessionID : undefined
+        if (!hookSession) return
+        const pending = pendingSignals.get(hookSession)
+        if (!pending || pending.consumed) return
+        const system = Array.isArray(hookEvent.system) ? hookEvent.system : []
+        system.unshift({ type: "text", text: pending.text })
+        hookEvent.system = system
+        pending.consumed = true
       })
 
       // 2. SQLite-backed compaction continuity hook (REQ-SUB-14, REQ-SUB-15, REQ-SUB-16, REQ-SUB-17)
@@ -1421,6 +1501,49 @@ export default {
           }
           rpcHandle?.events?.emit?.(SUBSTRATE_UPDATED_EVENT, payload)
           rpcHandle?.emit?.(SUBSTRATE_UPDATED_EVENT, payload)
+
+          if (sessionID) {
+            try {
+              const trace = buildTrace({
+                root: activeWorktreeRoot,
+                hostDbPath: dbPath,
+                sessionID,
+                archiveDbPath: indexDbPath,
+              })
+              const head = trace.change.base || ""
+              const previousHead = lastHeadBySession.get(sessionID)
+              lastHeadBySession.set(sessionID, head)
+              const finalTrace =
+                trace.change.files.length === 0 && previousHead && head && previousHead !== head
+                  ? buildTrace({
+                      root: activeWorktreeRoot,
+                      hostDbPath: dbPath,
+                      sessionID,
+                      commit: head,
+                      archiveDbPath: indexDbPath,
+                    })
+                  : trace
+              if (finalTrace.signal) {
+                ensureTraceSchema(db)
+                persistTrace(db, finalTrace.change, finalTrace.signal)
+                pendingSignals.set(sessionID, {
+                  id: finalTrace.change.id,
+                  text: finalTrace.signal,
+                  consumed: false,
+                })
+                const tracePayload = {
+                  sessionID,
+                  action: "trace",
+                  changeId: finalTrace.change.id,
+                  updatedAt: new Date().toISOString(),
+                }
+                rpcHandle?.events?.emit?.(SUBSTRATE_UPDATED_EVENT, tracePayload)
+                rpcHandle?.emit?.(SUBSTRATE_UPDATED_EVENT, tracePayload)
+              }
+            } catch {
+              // Trace is advisory; never block idle.
+            }
+          }
         } catch {
           // ignore non-fatal subscriber error
         } finally {
@@ -1486,13 +1609,14 @@ export default {
         name: "viewport",
         options: { namespace: "substrate", codemode },
         description:
-          "Query the 4-tier Hivemind Substrate viewport (status | resolve | timeline | provenance | compaction | sync | persist | search | find | repomap | skeleton | slice | coupled | brief | intents | latest).",
+          "Query the 4-tier Hivemind Substrate viewport (trace | status | resolve | timeline | provenance | compaction | sync | persist | search | find | repomap | skeleton | slice | coupled | brief | intents | latest). trace returns the live change-set package from real git plus the host tool ledger; pass change or handle for the leaf.",
         input: {
           type: "object",
           properties: {
             action: {
               type: "string",
               enum: [
+                "trace",
                 "status",
                 "resolve",
                 "timeline",
@@ -1515,6 +1639,11 @@ export default {
             scope: { type: "string", enum: ["session", "project", "all-projects"] },
             query: { type: "string" },
             blob: { type: "string" },
+            change: { type: "string", description: "Change id from the substrate signal (trace only)." },
+            handle: { type: "string", description: "Leaf handle <change-id>:<branch> (trace only)." },
+            branch: { type: "string", description: "Leaf branch when no handle is given (trace only)." },
+            commit: { type: "string", description: "Trace a committed change instead of the working tree (trace only)." },
+            detail: { type: "string", enum: ["package", "leaf"], description: "Package (default) or leaf (trace only)." },
             path: { type: "string" },
             symbol: { type: "string" },
             targetPaths: { type: "array", items: { type: "string" } },
