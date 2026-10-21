@@ -906,16 +906,50 @@ export default {
         const startLine = typeof input?.startLine === "number" ? input.startLine : undefined
         const endLine = typeof input?.endLine === "number" ? input.endLine : undefined
         const maxTokens = typeof input?.maxTokens === "number" ? input.maxTokens : undefined
-        const resolved = valve.resolveBlob(blobId, { startLine, endLine })
+        const rawQuery = typeof input?.query === "string" ? input.query.trim() : typeof input?.q === "string" ? input.q.trim() : ""
+
+        const filterByQuery = (rawText: string, q: string): string => {
+          if (!q) return rawText
+          const lines = rawText.split("\n")
+          let matcher: (line: string) => boolean
+          try {
+            const re = new RegExp(q, "i")
+            matcher = (line) => re.test(line)
+          } catch {
+            const lower = q.toLowerCase()
+            matcher = (line) => line.toLowerCase().includes(lower)
+          }
+          const matchedIndices = new Set<number>()
+          for (let i = 0; i < lines.length; i++) {
+            if (matcher(lines[i] ?? "")) {
+              for (let c = Math.max(0, i - 3); c <= Math.min(lines.length - 1, i + 3); c++) {
+                matchedIndices.add(c)
+              }
+            }
+          }
+          if (matchedIndices.size === 0) return `No matches for "${q}" in blob ${blobId} (${lines.length} lines).`
+          const sorted = [...matchedIndices].sort((a, b) => a - b)
+          const out: string[] = []
+          let prevIdx = -2
+          for (const idx of sorted) {
+            if (prevIdx >= 0 && idx > prevIdx + 1) out.push("…")
+            out.push(`L${idx + 1}: ${lines[idx]}`)
+            prevIdx = idx
+          }
+          return out.join("\n")
+        }
+
+        const resolved = valve.resolveBlob(blobId, rawQuery ? {} : { startLine, endLine })
         if (resolved) {
+          const baseText = rawQuery ? filterByQuery(resolved.slice, rawQuery) : resolved.slice
           const slice =
             typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
-              ? resolved.slice.slice(0, Math.max(80, Math.floor(maxTokens * 4)))
-              : resolved.slice
+              ? baseText.slice(0, Math.max(80, Math.floor(maxTokens * 4)))
+              : baseText
           return formatToolOutput({
             action: "resolve",
             markdown: slice,
-            metadata: { ...resolved, slice } as unknown as Record<string, unknown>,
+            metadata: { ...resolved, slice, ...(rawQuery ? { query: rawQuery } : {}) } as unknown as Record<string, unknown>,
             format: input?.format,
             elapsedMs: performance.now() - t0,
             skipFooter: input?.format === undefined,
@@ -923,14 +957,15 @@ export default {
         }
         const fromArchive = valve.resolve(blobId)
         if (fromArchive) {
+          const baseText = rawQuery ? filterByQuery(fromArchive, rawQuery) : fromArchive
           const capped =
             typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
-              ? fromArchive.slice(0, Math.max(80, Math.floor(maxTokens * 4)))
-              : fromArchive
+              ? baseText.slice(0, Math.max(80, Math.floor(maxTokens * 4)))
+              : baseText
           return formatToolOutput({
             action: "resolve",
             markdown: capped,
-            metadata: { blobRef: blobId, content: capped },
+            metadata: { blobRef: blobId, content: capped, ...(rawQuery ? { query: rawQuery } : {}) },
             format: input?.format,
             elapsedMs: performance.now() - t0,
             skipFooter: input?.format === undefined,

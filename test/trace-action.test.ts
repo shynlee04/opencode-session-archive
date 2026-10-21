@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
-import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { Plugin } from "@opencode/plugin"
 import { classify } from "../src/changes/model.ts"
@@ -633,5 +633,145 @@ describe("change-set trace action (Iteration 2 — project-agnostic git + host l
       if (prevEnv === undefined) delete process.env.OPENCODE_DB_PATH
       else process.env.OPENCODE_DB_PATH = prevEnv
     }
+  })
+
+  test("discovers linked git worktree edits, preserves committed session slices as agent_sealed, parses patchText, ignores pre-existing deletions, and supports resolve query search", async () => {
+    const root = makeTmpDir()
+    initRepo(root)
+    writeFileSync(path.join(root, ".gitignore"), ".worktree/\n")
+    mkdirSync(path.join(root, "src"), { recursive: true })
+    writeFileSync(path.join(root, "src", "core.ts"), "export const version = 1\n")
+    writeFileSync(path.join(root, "src", "legacy.ts"), "export const legacy = true\n")
+    git(root, ["add", ".gitignore", "src/core.ts", "src/legacy.ts"])
+    git(root, ["commit", "-qm", "base with core and legacy"])
+
+    // Delete legacy.ts on disk without any ledger touch -> must be pre_existing, never owner_or_external
+    rmSync(path.join(root, "src", "legacy.ts"))
+
+    // Create a linked git worktree under .worktree/lane-a (ignored by root's .gitignore)
+    const laneDir = path.join(root, ".worktree", "lane-a")
+    mkdirSync(path.join(root, ".worktree"), { recursive: true })
+    git(root, ["worktree", "add", laneDir, "-b", "lane/a"])
+
+    // Edit src/core.ts inside the linked worktree
+    const laneCorePath = path.join(laneDir, "src", "core.ts")
+    writeFileSync(laneCorePath, "export const version = 2\n")
+
+    // Also write and commit a sealed file in root during the session
+    const sealedPath = path.join(root, "src", "committed-in-session.ts")
+    writeFileSync(sealedPath, "export const sealedSlice = true\n")
+    git(root, ["add", "src/committed-in-session.ts"])
+    git(root, ["commit", "-qm", "commit slice during session"])
+
+    // Also add a patched doc via OpenCode patchText
+    mkdirSync(path.join(root, "docs"), { recursive: true })
+    const notePath = path.join(root, "docs", "note.md")
+    writeFileSync(notePath, "# Runtime Note\nVerified alignment.\n")
+
+    const dir = makeTmpDir()
+    const { db, dbPath } = makeDbFile(dir)
+    addProject(db)
+    const nowMs = Date.now()
+    addSession(db, {
+      id: "ses_root",
+      directory: root,
+      title: "multi-worktree root",
+      time_created: nowMs - 10_000,
+      time_updated: nowMs,
+    })
+    addSession(db, {
+      id: "ses_lane_worker",
+      parent_id: "ses_root",
+      directory: root,
+      title: "Lane A Worker",
+      time_created: nowMs - 8_000,
+      time_updated: nowMs - 1_000,
+    })
+    addMessage(db, {
+      id: "m_root_seal",
+      session_id: "ses_root",
+      type: "assistant",
+      seq: 1,
+      time_created: nowMs - 9_000,
+      data: {
+        content: [
+          toolPart("write", "call_write_sealed", {
+            path: sealedPath,
+            content: "export const sealedSlice = true\n",
+          }),
+          toolPart("patch", "call_patch_doc", {
+            patchText: `*** Begin Patch\n*** Add File: ${notePath}\n+# Runtime Note\n+Verified alignment.\n`,
+          }),
+        ],
+      },
+    })
+    addMessage(db, {
+      id: "m_lane_edit",
+      session_id: "ses_lane_worker",
+      type: "assistant",
+      seq: 1,
+      time_created: nowMs - 2_000,
+      data: {
+        content: [
+          // Unseeded edit in linked worktree -> seeded on demand from lane worktree HEAD!
+          toolPart("edit", "call_lane_edit", {
+            path: laneCorePath,
+            oldString: "version = 1",
+            newString: "version = 2",
+          }),
+          toolPart("write", "call_tmp_probe", {
+            path: "/tmp/ephemeral-probe-outside-repo.ts",
+            content: "export const probe = 1\n",
+          }),
+          toolPart(
+            "shell",
+            "call_lane_test",
+            { command: `cd ${laneDir} && bun test src/core.test.ts 2>&1 | tail -5` },
+            "3 pass\n0 fail\nCommand exited with code 0.",
+          ),
+        ],
+      },
+    })
+    db.close()
+
+    const { findTool } = await setup({ dbPath }, root)
+    const viewport = findTool("substrate.viewport")
+
+    const pkg = await viewport.execute({ action: "trace", sessionID: "ses_root" }, toolContext("ses_root"))
+    expect(pkg.metadata.ok).toBe(true)
+    // Both the dirty linked-worktree file (agent) AND the committed session file (agent_sealed) are material!
+    expect(pkg.metadata.counts.material).toBe(2)
+    expect(pkg.metadata.counts.byAttribution.agent).toBe(2) // laneCorePath + notePath (via patch)
+    expect(pkg.metadata.counts.byAttribution.agent_sealed).toBe(1) // sealedPath
+    expect(pkg.metadata.counts.byAttribution.pre_existing).toBe(1) // deleted legacy.ts
+    expect(pkg.metadata.counts.byAttribution.owner_or_external ?? 0).toBe(0)
+    expect(pkg.metadata.notes).toEqual([]) // 0 fragments and 0 non-scratch outside writes!
+    expect(String(pkg.content)).toContain(".worktree/lane-a/src/core.ts")
+    expect(String(pkg.content)).toContain("src/committed-in-session.ts sealed")
+    expect(String(pkg.content)).toContain("pass:[lane-a] bun test src/core.test.ts")
+
+    // Zoom into linked-worktree file leaf -> returns unified diff from linked worktree
+    const laneLeafRes = await viewport.execute(
+      { action: "trace", sessionID: "ses_root", branch: "source", path: ".worktree/lane-a/src/core.ts" },
+      toolContext("ses_root"),
+    )
+    const laneLeaf = JSON.parse(String(laneLeafRes.content)) as {
+      file: { path: string; attribution: string; diffExcerpt?: string }
+    }
+    expect(laneLeaf.file.attribution).toBe("agent")
+    expect(laneLeaf.file.diffExcerpt).toContain("-export const version = 1")
+    expect(laneLeaf.file.diffExcerpt).toContain("+export const version = 2")
+
+    // Verify resolve with query filters matching lines with context in 1 call
+    mkdirSync(path.join(root, ".session-archive", "blobs"), { recursive: true })
+    const sampleBlob = Array.from({ length: 30 }, (_, i) => `line ${i + 1}: ${i === 14 ? "N1 target finding here" : "filler"}`).join("\n")
+    writeFileSync(path.join(root, ".session-archive", "blobs", "deadbeef1234.txt"), sampleBlob)
+    const resolvedQuery = await viewport.execute(
+      { action: "resolve", blob: "deadbeef1234", query: "N1 target" },
+      toolContext("ses_root"),
+    )
+    expect(String(resolvedQuery.content)).toContain("L15: line 15: N1 target finding here")
+    expect(String(resolvedQuery.content)).toContain("L12: line 12: filler")
+    expect(String(resolvedQuery.content)).not.toContain("L1: line 1: filler")
   })
 })

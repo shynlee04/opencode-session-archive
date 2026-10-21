@@ -20,6 +20,7 @@ import {
 import {
   type CommitSnapshot,
   type GitSnapshot,
+  augmentSnapshotWithWorktreesAndLedger,
   readCommitSnapshot,
   readFileDiffExcerpt,
   readGitSnapshot,
@@ -99,9 +100,18 @@ export function buildTrace(input: TraceInput): TraceResult {
     input.sessionID,
     snapshot.headContents,
     snapshot.diskContents,
+    isCommitted ? undefined : (snapshot as GitSnapshot).worktrees.map((w) => w.root),
   )
   const notes: string[] = []
   if (!ledger.ok && ledger.error) notes.push(`ledger: ${ledger.error}`)
+
+  const sealedFromLedger = isCommitted
+    ? undefined
+    : augmentSnapshotWithWorktreesAndLedger(
+        snapshot as GitSnapshot,
+        ledger.entries,
+        ledger.sessions.map((s) => s.directory),
+      )
 
   const runStart = isCommitted ? (snapshot as CommitSnapshot).t || 0 : ledger.runStart || 0
   const headCommitMs = isCommitted ? (snapshot as CommitSnapshot).t || 0 : (snapshot as GitSnapshot).headCommitMs || 0
@@ -131,7 +141,7 @@ export function buildTrace(input: TraceInput): TraceResult {
     runStart,
     headCommitMs,
     mtimes: snapshot.mtimes,
-    commitFiles: isCommitted ? (snapshot as CommitSnapshot).commitFiles : undefined,
+    commitFiles: isCommitted ? (snapshot as CommitSnapshot).commitFiles : sealedFromLedger,
     diskContents: snapshot.diskContents,
     evidence: isCommitted
       ? ledger.evidence.map((ev) => ({ ...ev, revision: (snapshot as CommitSnapshot).commit.slice(0, 12) }))

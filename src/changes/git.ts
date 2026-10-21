@@ -5,7 +5,7 @@
  * and `-c core.quotePath=false`, and no command mutates the index or working tree.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs"
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs"
 import path from "node:path"
 import {
   type ChangeState,
@@ -219,45 +219,109 @@ function countLines(text: string): number {
   return text.split("\n").length - (text.endsWith("\n") ? 1 : 0)
 }
 
-export function readWorktrees(root: string, activeRootDirtyCount?: number): WorktreeState[] {
+function safeRealpath(p: string): string {
+  try {
+    return realpathSync(p)
+  } catch {
+    const dir = path.dirname(p)
+    try {
+      return path.join(realpathSync(dir), path.basename(p))
+    } catch {
+      return path.resolve(p)
+    }
+  }
+}
+
+export function readWorktrees(
+  root: string,
+  activeRootDirtyCount?: number,
+  priorityRoots?: ReadonlySet<string>,
+): WorktreeState[] {
   const out = runGitText(root, ["worktree", "list", "--porcelain"])
-  const worktrees: WorktreeState[] = []
-  let current: { root?: string; head?: string; branch?: string } = {}
-  let statusChecks = 0
-  const flush = () => {
+  const parsed: Array<{ root: string; head: string; branch: string; prunable: boolean }> = []
+  let current: { root?: string; head?: string; branch?: string; prunable?: boolean } = {}
+  const pushCurrent = () => {
     if (!current.root) return
-    const dir = current.root
+    parsed.push({
+      root: current.root,
+      head: current.head ?? "",
+      branch: current.branch ?? "HEAD",
+      prunable: Boolean(current.prunable),
+    })
+    current = {}
+  }
+  for (const line of out.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      pushCurrent()
+      current.root = line.slice("worktree ".length)
+    } else if (line.startsWith("HEAD ")) {
+      current.head = line.slice("HEAD ".length)
+    } else if (line.startsWith("branch ")) {
+      current.branch = line.slice("branch ".length).replace(/^refs\/heads\//, "")
+    } else if (line.startsWith("prunable ")) {
+      current.prunable = true
+    } else if (line.trim() === "") {
+      pushCurrent()
+    }
+  }
+  pushCurrent()
+
+  const resolvedRoot = safeRealpath(root)
+  const valid = parsed.filter((wt) => !wt.prunable && existsSync(wt.root))
+
+  // Prioritize primary root, then caller-supplied active worktrees, then nested `.worktree/` lanes
+  valid.sort((a, b) => {
+    const aReal = safeRealpath(a.root)
+    const bReal = safeRealpath(b.root)
+    const aIsRoot = aReal === resolvedRoot ? 0 : 1
+    const bIsRoot = bReal === resolvedRoot ? 0 : 1
+    if (aIsRoot !== bIsRoot) return aIsRoot - bIsRoot
+    const aPrio = priorityRoots?.has(aReal) ? 0 : 1
+    const bPrio = priorityRoots?.has(bReal) ? 0 : 1
+    if (aPrio !== bPrio) return aPrio - bPrio
+    const aNested = aReal.startsWith(`${resolvedRoot}${path.sep}`) ? 0 : 1
+    const bNested = bReal.startsWith(`${resolvedRoot}${path.sep}`) ? 0 : 1
+    return aNested - bNested
+  })
+
+  const worktrees: WorktreeState[] = []
+  let statusChecks = 0
+  for (const item of valid) {
+    const dir = item.root
+    const dirReal = safeRealpath(dir)
     let dirty = 0
-    if (path.resolve(dir) === path.resolve(root) && activeRootDirtyCount !== undefined) {
+    const isPrimary = dirReal === resolvedRoot
+    const isPriority = Boolean(priorityRoots?.has(dirReal))
+    if (isPrimary && activeRootDirtyCount !== undefined) {
       dirty = activeRootDirtyCount
-    } else if (statusChecks < 6 && existsSync(dir)) {
+    } else if ((isPriority || statusChecks < 8) && existsSync(dir)) {
       statusChecks++
       const status = runGitText(dir, ["status", "--porcelain=v2", "-uno"])
       dirty = status.split("\n").filter(Boolean).length
     }
     worktrees.push({
       root: dir,
-      branch: current.branch ?? "HEAD",
-      base: current.head ?? "",
+      branch: item.branch,
+      base: item.head,
       dirty,
       ahead: 0,
       behind: 0,
     })
-    current = {}
   }
-  for (const line of out.split("\n")) {
-    if (line.startsWith("worktree ")) {
-      flush()
-      current.root = line.slice("worktree ".length)
-    } else if (line.startsWith("HEAD ")) {
-      current.head = line.slice("HEAD ".length)
-    } else if (line.startsWith("branch ")) {
-      current.branch = line.slice("branch ".length).replace(/^refs\/heads\//, "")
-    } else if (line.trim() === "") {
-      flush()
-    }
-  }
-  flush()
+
+  // Keep primary worktree first, then dirty/priority worktrees
+  worktrees.sort((a, b) => {
+    const aReal = safeRealpath(a.root)
+    const bReal = safeRealpath(b.root)
+    const aIsRoot = aReal === resolvedRoot ? 0 : 1
+    const bIsRoot = bReal === resolvedRoot ? 0 : 1
+    if (aIsRoot !== bIsRoot) return aIsRoot - bIsRoot
+    const aPrio = priorityRoots?.has(aReal) ? 0 : 1
+    const bPrio = priorityRoots?.has(bReal) ? 0 : 1
+    if (aPrio !== bPrio) return aPrio - bPrio
+    return b.dirty - a.dirty
+  })
+
   return worktrees
 }
 
@@ -282,9 +346,26 @@ export function readFileDiffExcerpt(root: string, relPath: string, commit?: stri
   if (!relPath || relPath.startsWith("-")) return undefined
   if (commit !== undefined && !isSafeCommitRef(commit)) return undefined
 
-  const raw = commit
-    ? runGitText(root, ["show", "--format=", "--unified=2", commit, "--", relPath])
-    : runGitText(root, ["diff", "--unified=2", "HEAD", "--", relPath])
+  const absTarget = safeRealpath(path.join(root, relPath))
+  const targetDir = path.dirname(absTarget)
+  let effectiveRoot = safeRealpath(root)
+  let effectiveRel = relPath
+  if (existsSync(targetDir)) {
+    const subTop = safeRealpath(runGitText(targetDir, ["rev-parse", "--show-toplevel"]).trim())
+    if (subTop && subTop !== effectiveRoot) {
+      effectiveRoot = subTop
+      effectiveRel = path.relative(subTop, absTarget).split(path.sep).join("/")
+    }
+  }
+
+  let raw = commit
+    ? runGitText(effectiveRoot, ["show", "--format=", "--unified=2", commit, "--", effectiveRel])
+    : runGitText(effectiveRoot, ["diff", "--unified=2", "HEAD", "--", effectiveRel])
+
+  if (!raw.trim() && !commit) {
+    // Fallback for files sealed into a commit inside the worktree or main branch
+    raw = runGitText(effectiveRoot, ["log", "-1", "-p", "--format=", "--unified=2", "HEAD", "--", effectiveRel])
+  }
 
   if (raw.trim()) {
     const lines = raw.trim().split("\n")
@@ -294,7 +375,7 @@ export function readFileDiffExcerpt(root: string, relPath: string, commit?: stri
 
   // Fallback for untracked newly added files (`??`): render synthetic unified diff
   if (!commit) {
-    const disk = readDiskFile(path.join(root, relPath))
+    const disk = readDiskFile(absTarget)
     if (disk.text !== undefined) {
       const contentLines = disk.text.replace(/\r\n/g, "\n").split("\n")
       if (contentLines.length > 1 && contentLines[contentLines.length - 1] === "") {
@@ -308,6 +389,137 @@ export function readFileDiffExcerpt(root: string, relPath: string, commit?: stri
     }
   }
   return undefined
+}
+
+export function augmentSnapshotWithWorktreesAndLedger(
+  snapshot: GitSnapshot,
+  ledgerEntries: ReadonlyArray<{ path: string; op: Op; after: string | null; scope: string; t: number }>,
+  sessionDirs: ReadonlyArray<string>,
+): Map<string, string | null> {
+  const commitFiles = new Map<string, string | null>()
+  const root = safeRealpath(snapshot.root)
+  const existingPaths = new Set(snapshot.files.map((f) => f.path))
+
+  // Identify linked worktrees touched by the session tree's ledger or session directories
+  const priorityWorktreeRoots = new Set<string>()
+  for (const dir of sessionDirs) {
+    const abs = safeRealpath(dir)
+    if (abs !== root) priorityWorktreeRoots.add(abs)
+  }
+
+  for (const wt of snapshot.worktrees) {
+    const wtRoot = safeRealpath(wt.root)
+    if (wtRoot === root) continue
+    const relWt = path.relative(root, wtRoot).split(path.sep).join("/")
+    const isInsideRoot = Boolean(relWt && !relWt.startsWith("..") && !path.isAbsolute(relWt))
+    const prefix = isInsideRoot ? `${relWt}/` : `@${path.basename(wtRoot)}/`
+    if (ledgerEntries.some((e) => e.path.startsWith(prefix))) {
+      priorityWorktreeRoots.add(wtRoot)
+    }
+  }
+
+  if (priorityWorktreeRoots.size > 0) {
+    snapshot.worktrees = readWorktrees(root, snapshot.files.length, priorityWorktreeRoots)
+  }
+
+  // 1. Collect dirty files from active linked worktrees touched by this session tree
+  for (const wt of snapshot.worktrees) {
+    const wtRoot = safeRealpath(wt.root)
+    if (wtRoot === root) continue
+    if (!priorityWorktreeRoots.has(wtRoot)) continue
+    if (!existsSync(wtRoot)) continue
+
+    const relWt = path.relative(root, wtRoot).split(path.sep).join("/")
+    const isInsideRoot = Boolean(relWt && !relWt.startsWith("..") && !path.isAbsolute(relWt))
+    const prefix = isInsideRoot ? `${relWt}/` : `@${path.basename(wtRoot)}/`
+
+    const status = runGit(wtRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"])
+    const entries = parsePorcelainV2(status.stdout.toString("utf8"))
+    if (entries.length === 0) continue
+
+    const numstat = numstatMap(wtRoot, ["diff", "--numstat", "HEAD"])
+    const headSpecs = entries
+      .filter((e) => e.xy !== "??")
+      .map((e) => `HEAD:${e.origPath ?? e.path}`)
+    const headBlobs = batchReadBlobs(wtRoot, headSpecs)
+
+    for (const entry of entries) {
+      const canonicalPath = `${prefix}${entry.path}`
+      if (existingPaths.has(canonicalPath)) continue
+
+      const beforeRel = entry.origPath ?? entry.path
+      const headInfo = entry.xy === "??" ? undefined : headBlobs.get(`HEAD:${beforeRel}`)
+      const before = headInfo?.sha256 ?? null
+      if (headInfo?.text !== undefined) {
+        snapshot.headContents.set(canonicalPath, headInfo.text)
+      }
+
+      const disk = entry.xy.includes("D")
+        ? { sha256: null, mtime: 0, text: undefined, lines: 0 }
+        : readDiskFile(path.join(wtRoot, entry.path))
+      const after = disk.sha256
+      if (disk.text !== undefined) {
+        snapshot.diskContents.set(canonicalPath, disk.text)
+      }
+
+      const stat = numstat.get(entry.path)
+      let adds = stat?.adds ?? 0
+      let dels = stat?.dels ?? 0
+      if (entry.xy === "??" && after) adds = disk.lines
+      if (entry.xy.includes("D") && headInfo) dels = headInfo.lines
+
+      snapshot.files.push({
+        path: canonicalPath,
+        op: opFromStatus(entry.xy, entry.origPath),
+        before,
+        after,
+        adds,
+        dels,
+        mtime: disk.mtime,
+      })
+      existingPaths.add(canonicalPath)
+      snapshot.baseline.set(canonicalPath, before)
+      snapshot.mtimes.set(canonicalPath, disk.mtime)
+    }
+  }
+
+  // 2. Include session ledger-touched files that were committed (sealed) during the session
+  //    so atomic commits inside main or linked worktrees never erase material work.
+  const latestByPath = new Map<string, { path: string; op: Op; after: string | null; scope: string; t: number; newSnippet?: string }>()
+  for (const e of ledgerEntries as ReadonlyArray<{ path: string; op: Op; after: string | null; scope: string; t: number; newSnippet?: string }>) {
+    if (e.scope === "none") continue
+    latestByPath.set(e.path, e)
+  }
+
+  for (const [relPath, entry] of latestByPath) {
+    if (existingPaths.has(relPath)) continue
+    const absPath = path.join(root, relPath)
+    const disk = readDiskFile(absPath)
+    if (!disk.sha256) continue
+    const matchesFull = entry.scope === "file" && Boolean(entry.after && disk.sha256 === entry.after)
+    const matchesFragment =
+      entry.scope === "fragment" &&
+      Boolean(entry.newSnippet && disk.text !== undefined && disk.text.includes(entry.newSnippet))
+    if (matchesFull || matchesFragment) {
+      if (disk.text !== undefined) {
+        snapshot.diskContents.set(relPath, disk.text)
+      }
+      snapshot.files.push({
+        path: relPath,
+        op: entry.op,
+        before: null,
+        after: disk.sha256,
+        adds: 0,
+        dels: 0,
+        mtime: disk.mtime,
+      })
+      existingPaths.add(relPath)
+      snapshot.mtimes.set(relPath, disk.mtime)
+      commitFiles.set(relPath, disk.sha256)
+    }
+  }
+
+  return commitFiles
 }
 
 export function readGitSnapshot(rootArg: string): GitSnapshot {

@@ -136,6 +136,7 @@ export interface Actor {
   model: string
   worktree: string
   title?: string
+  updatedAt?: number
   filesTouched?: number
   paths?: string[]
   checksRun?: number
@@ -460,7 +461,11 @@ function matches(glob: string, p: string): boolean {
 }
 
 export function classify(p: string): Kind {
-  const normalized = p.replace(/\\/g, "/").replace(/^\.\//, "")
+  const normalized = p
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^(?:\.worktrees?|worktrees?)\/[^/]+\//, "")
+    .replace(/^@[^/]+\//, "")
   for (const rule of RULES) {
     for (const glob of rule.globs) {
       if (matches(glob, normalized)) return rule.kind
@@ -569,6 +574,22 @@ export function attribute(input: AttributeInput): AttributeResult {
         },
       }
     }
+    const laterShell = shellWrites.get(path)
+    if (exact.after !== current && laterShell && laterShell.t >= exact.t) {
+      return {
+        attribution: "agent_shell",
+        fresh: "fresh",
+        proof: {
+          rule: "shell",
+          current,
+          expected: current,
+          equal: true,
+          session: exact.session,
+          t: laterShell.t,
+          command: laterShell.command,
+        },
+      }
+    }
     return {
       attribution: exact.after === current ? "agent" : "agent_then_changed",
       fresh: exact.after === current ? "fresh" : "stale",
@@ -591,7 +612,7 @@ export function attribute(input: AttributeInput): AttributeResult {
       typeof currentContent === "string" &&
       currentContent.includes(latest.newSnippet)
     return {
-      attribution: snippetPresent ? "agent_fragment" : "unknown",
+      attribution: snippetPresent ? "agent_fragment" : "agent_then_changed",
       fresh: snippetPresent ? "fresh" : "stale",
       proof: {
         rule: "ledger-fragment",
@@ -610,9 +631,9 @@ export function attribute(input: AttributeInput): AttributeResult {
   if (shell && shell.t >= runStart) {
     if (!shell.known) {
       return {
-        attribution: "unknown",
-        fresh: "stale",
-        proof: { rule: "shell", current, expected: null, equal: false, command: shell.command, t: shell.t },
+        attribution: "agent_shell",
+        fresh: "fresh",
+        proof: { rule: "shell", current, expected: current, equal: true, command: shell.command, t: shell.t },
       }
     }
     const expected = shell.after ?? null
@@ -625,8 +646,8 @@ export function attribute(input: AttributeInput): AttributeResult {
 
   // Only attribute to `other_session` if the other session touched the file
   // after the base HEAD commit AND during/after `runStart` (or if it is newer than disk mtime).
-  const minOtherTime = Math.max(runStart, headCommitMs)
-  const other = otherLedger.find((e) => e.path === path && (minOtherTime === 0 || e.t >= minOtherTime))
+  const effectiveBaselineMs = Math.max(runStart, headCommitMs)
+  const other = otherLedger.find((e) => e.path === path && (effectiveBaselineMs === 0 || e.t >= effectiveBaselineMs))
   if (other) {
     return {
       attribution: "other_session",
@@ -651,7 +672,14 @@ export function attribute(input: AttributeInput): AttributeResult {
         proof: { rule: "baseline", current, expected, equal: true, baseline: expected },
       }
     }
-    if (runStart > 0 && mtime > 0 && mtime < runStart) {
+    if (effectiveBaselineMs > 0 && current === null && mtime === 0) {
+      return {
+        attribution: "pre_existing",
+        fresh: "fresh",
+        proof: { rule: "baseline", current, expected, equal: false, baseline: expected },
+      }
+    }
+    if (effectiveBaselineMs > 0 && mtime > 0 && mtime < effectiveBaselineMs) {
       return {
         attribution: "pre_existing",
         fresh: "fresh",
@@ -665,7 +693,15 @@ export function attribute(input: AttributeInput): AttributeResult {
     }
   }
 
-  if (runStart > 0 && mtime > 0 && mtime < runStart) {
+  if (effectiveBaselineMs > 0 && current === null && mtime === 0) {
+    return {
+      attribution: "pre_existing",
+      fresh: "fresh",
+      proof: { rule: "mtime", current, expected: null, equal: false, t: 0 },
+    }
+  }
+
+  if (effectiveBaselineMs > 0 && mtime > 0 && mtime < effectiveBaselineMs) {
     return {
       attribution: "pre_existing",
       fresh: "fresh",
@@ -673,7 +709,7 @@ export function attribute(input: AttributeInput): AttributeResult {
     }
   }
 
-  if (mtime >= runStart && mtime > 0) {
+  if (mtime >= effectiveBaselineMs && mtime > 0) {
     return {
       attribution: "owner_or_external",
       fresh: "stale",
@@ -816,9 +852,14 @@ export function shouldPush(change: Change): boolean {
 export function renderSignal(change: Change): string | null {
   if (!shouldPush(change)) return null
   const kinds: Kind[] = ["source", "test", "config", "docs", "unknown"]
+  const activeByKind = countBy(
+    change.files
+      .filter((f) => f.attribution !== "pre_existing" && f.materiality !== "noise" && f.materiality !== "blocked")
+      .map((f) => f.kind),
+  )
   const parts = kinds
-    .filter((k) => (change.counts.byKind[k] ?? 0) > 0)
-    .map((k) => `${change.counts.byKind[k]} ${k}`)
+    .filter((k) => (activeByKind[k] ?? 0) > 0)
+    .map((k) => `${activeByKind[k]} ${k}`)
 
   const owner =
     (change.counts.byAttribution.owner_or_external ?? 0) +
@@ -858,19 +899,24 @@ export function renderSignal(change: Change): string | null {
 
 const ATTRIBUTION_RANK: Record<Attribution, number> = {
   agent: 0,
-  agent_sealed: 0,
-  agent_shell: 1,
-  agent_fragment: 2,
-  agent_then_changed: 3,
-  other_session: 4,
-  owner_or_external: 5,
-  unknown: 6,
-  pre_existing: 7,
+  agent_fragment: 1,
+  agent_shell: 2,
+  agent_sealed: 3,
+  agent_then_changed: 4,
+  other_session: 5,
+  owner_or_external: 6,
+  unknown: 7,
+  pre_existing: 8,
 }
 
 function topFiles(files: FileChange[]): unknown[] {
   return [...files]
-    .sort((a, b) => ATTRIBUTION_RANK[a.attribution] - ATTRIBUTION_RANK[b.attribution] || a.path.localeCompare(b.path))
+    .sort(
+      (a, b) =>
+        ATTRIBUTION_RANK[a.attribution] - ATTRIBUTION_RANK[b.attribution] ||
+        (b.proof.t ?? 0) - (a.proof.t ?? 0) ||
+        a.path.localeCompare(b.path),
+    )
     .slice(0, 3)
     .map((f) => ({
       path: f.path,
@@ -946,11 +992,18 @@ export function renderPackage(change: Change): PackageView {
   }
 
   if (change.actors.length > 0) {
-    // Rank actors with actual file touches or checks first after root
+    // Rank root first, then active delegates sorted by recency (updatedAt DESC) so active lanes surface immediately
     const sortedActors = [...change.actors].sort((a, b) => {
       if (a.role === "root" && b.role !== "root") return -1
       if (b.role === "root" && a.role !== "root") return 1
-      return (b.filesTouched ?? 0) - (a.filesTouched ?? 0) || (b.checksRun ?? 0) - (a.checksRun ?? 0)
+      const aActive = (a.filesTouched ?? 0) > 0 || (a.checksRun ?? 0) > 0 ? 0 : 1
+      const bActive = (b.filesTouched ?? 0) > 0 || (b.checksRun ?? 0) > 0 ? 0 : 1
+      if (aActive !== bActive) return aActive - bActive
+      return (
+        (b.updatedAt ?? 0) - (a.updatedAt ?? 0) ||
+        (b.filesTouched ?? 0) - (a.filesTouched ?? 0) ||
+        (b.checksRun ?? 0) - (a.checksRun ?? 0)
+      )
     })
     branches.push({
       name: "actors",

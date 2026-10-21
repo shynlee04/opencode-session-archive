@@ -93,7 +93,12 @@ function safeRealpath(p: string): string {
   }
 }
 
-function normalizeToRoot(raw: string, sessionDir: string, root: string): string | null {
+function normalizeToRoot(
+  raw: string,
+  sessionDir: string,
+  root: string,
+  externalWorktrees?: ReadonlyArray<string>,
+): string | null {
   if (!raw) return null
   const abs = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(sessionDir, raw)
   const rel = path.relative(root, abs)
@@ -103,8 +108,20 @@ function normalizeToRoot(raw: string, sessionDir: string, root: string): string 
   const realRoot = safeRealpath(root)
   const realAbs = safeRealpath(abs)
   const realRel = path.relative(realRoot, realAbs)
-  if (!realRel || realRel.startsWith("..") || path.isAbsolute(realRel)) return null
-  return realRel.split(path.sep).join("/")
+  if (realRel && !realRel.startsWith("..") && !path.isAbsolute(realRel)) {
+    return realRel.split(path.sep).join("/")
+  }
+  if (externalWorktrees) {
+    for (const wt of externalWorktrees) {
+      const realWt = safeRealpath(wt)
+      if (realWt === realRoot) continue
+      const wtRel = path.relative(realWt, realAbs)
+      if (wtRel && !wtRel.startsWith("..") && !path.isAbsolute(wtRel)) {
+        return `@${path.basename(realWt)}/${wtRel.split(path.sep).join("/")}`
+      }
+    }
+  }
+  return null
 }
 
 function readFullContent(
@@ -137,10 +154,101 @@ function resolveTarget(input: Record<string, unknown>): string {
   return String(input.filePath ?? input.path ?? input.TargetFile ?? input.file ?? input.target ?? "")
 }
 
+function isScratchTarget(raw: string, sessionDir: string): boolean {
+  if (!raw) return true
+  const abs = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(sessionDir, raw)
+  return (
+    abs.startsWith("/tmp/") ||
+    abs.startsWith("/private/tmp/") ||
+    abs.startsWith("/var/folders/") ||
+    abs.startsWith("/private/var/folders/")
+  )
+}
+
+interface ParsedPatchBlock {
+  rawPath: string
+  op: "add" | "modify" | "delete"
+  newSnippet?: string
+}
+
+function parsePatchBlocks(patchText: string): ParsedPatchBlock[] {
+  const blocks: ParsedPatchBlock[] = []
+  const lines = patchText.split("\n")
+  let current: { rawPath: string; op: "add" | "modify" | "delete"; added: string[] } | null = null
+  const flush = () => {
+    if (!current) return
+    const snippet = current.added.join("\n").trim().slice(0, 200) || undefined
+    blocks.push({ rawPath: current.rawPath, op: current.op, newSnippet: snippet })
+    current = null
+  }
+  for (const line of lines) {
+    const addMatch = line.match(/^\*\*\*\s+Add File:\s+(.+)$/)
+    if (addMatch?.[1]) {
+      flush()
+      current = { rawPath: addMatch[1].trim(), op: "add", added: [] }
+      continue
+    }
+    const updateMatch = line.match(/^\*\*\*\s+Update File:\s+(.+)$/)
+    if (updateMatch?.[1]) {
+      flush()
+      current = { rawPath: updateMatch[1].trim(), op: "modify", added: [] }
+      continue
+    }
+    const deleteMatch = line.match(/^\*\*\*\s+Delete File:\s+(.+)$/)
+    if (deleteMatch?.[1]) {
+      flush()
+      current = { rawPath: deleteMatch[1].trim(), op: "delete", added: [] }
+      continue
+    }
+    if (current && line.startsWith("+") && !line.startsWith("+++")) {
+      current.added.push(line.slice(1))
+    }
+  }
+  flush()
+  return blocks
+}
+
+function effectiveShellDir(command: string, input: Record<string, unknown>, sessionDir: string): string {
+  const rawWorkdir = typeof input.workdir === "string" ? input.workdir : typeof input.cwd === "string" ? input.cwd : ""
+  const baseDir = rawWorkdir
+    ? path.isAbsolute(rawWorkdir)
+      ? path.resolve(rawWorkdir)
+      : path.resolve(sessionDir, rawWorkdir)
+    : sessionDir
+  const cdMatch = command.match(/^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*(?:&&|;)/)
+  const cdTarget = cdMatch?.[1] ?? cdMatch?.[2] ?? cdMatch?.[3]
+  if (cdTarget && !cdTarget.includes("$")) {
+    return path.isAbsolute(cdTarget) ? path.resolve(cdTarget) : path.resolve(baseDir, cdTarget)
+  }
+  return baseDir
+}
+
+const VERIFICATION_SEGMENT_RE =
+  /\b((?:bun\s+(?:run\s+)?(?:test|typecheck|build|check)|npm\s+(?:run\s+)?(?:test|typecheck|build|check|lint)|pnpm\s+(?:run\s+)?(?:test|typecheck|build|check|lint)|yarn\s+(?:run\s+)?(?:test|typecheck|build|check|lint)|npx\s+(?:tsc|vitest|jest|playwright)|tsc\b|vitest\b|jest\b|pytest\b|cargo\s+(?:test|check|clippy|build)|go\s+(?:test|vet|build)|make\s+(?:test|check|build))[^;&|\n]*)/i
+
+function formatVerificationCommand(command: string, shellDir: string, root: string): string {
+  const trimmed = command.replace(/\s+/g, " ").trim()
+  const hasLeadingSetup = /^\s*(?:cd\s+|set\s+|[A-Za-z_][A-Za-z0-9_]*=)/.test(trimmed) || trimmed.includes("&&") || trimmed.includes(";")
+  if (!hasLeadingSetup && trimmed.length <= 80) {
+    return trimmed
+  }
+  const cleaned = trimmed.replace(/\s+\d*>&\d+/g, "")
+  const segMatch = cleaned.match(VERIFICATION_SEGMENT_RE)
+  const coreCmd = (segMatch?.[1] ?? cleaned)
+    .replace(/\s*>\s*\S+.*$/, "")
+    .trim()
+  const relDir = path.relative(root, shellDir).split(path.sep).join("/")
+  if (relDir && relDir !== "." && !relDir.startsWith("..") && !path.isAbsolute(relDir)) {
+    const laneName = relDir.replace(/^\.worktree\//, "")
+    return `[${laneName}] ${coreCmd}`.slice(0, 160)
+  }
+  return coreCmd.slice(0, 160)
+}
+
 function isMutatingShell(command: string): boolean {
-  return /(^|\s)(?:>|>>|tee\s|sed\s+-i|mv\s|cp\s|rm\s|touch\s|mkdir\s|git\s+(?:checkout|restore|apply|merge|commit)|bun\s+install|npm\s+install|pnpm\s+install|yarn\s+add)\b/.test(
+  return /(^|\s)(?:>|>>|tee\s|sed\s+-i|mv\s|cp\s|rm\s|touch\s|mkdir\s|git\s+(?:checkout|restore|apply|merge|commit)|bun\s+(?:install|add|remove)|npm\s+(?:install|i|ci)|pnpm\s+(?:install|add)|yarn\s+(?:install|add))\b/.test(
     command,
-  ) || /(?:^|\s)(?:>|>>)\s*\S/.test(command)
+  ) || /(?:^|\s)(?:>|>>)\s*\S/.test(command) || /\b(?:write_text|write_bytes|writeFileSync)\s*\(/.test(command)
 }
 
 function stripQuotedLiterals(command: string): string {
@@ -223,7 +331,59 @@ function shellTargets(command: string): string[] {
   if (mv?.[1]) out.push(mv[1])
   const rm = command.match(/(?:^|\s)rm\s+(?:-[a-zA-Z]+\s+)*([^\s;|&]+(?:\s+[^\s;|&-][^\s;|&]*)*)/)
   if (rm?.[1]) out.push(...rm[1].split(/\s+/).filter((s) => !s.startsWith("-")))
-  return [...new Set(out.filter((s) => !s.startsWith("-") && !/^\d+$/.test(s) && s !== "/dev/null"))]
+  if (/\bbun\s+(?:install|add|remove)\b/.test(command)) out.push("bun.lock", "bun.lockb", "package.json")
+  if (/\bnpm\s+(?:install|i|ci)\b/.test(command)) out.push("package-lock.json", "package.json")
+  if (/\bpnpm\s+(?:install|add)\b/.test(command)) out.push("pnpm-lock.yaml", "package.json")
+  if (/\byarn\s+(?:install|add)\b/.test(command)) out.push("yarn.lock", "package.json")
+  if (/\b(?:write_text|write_bytes|writeFileSync)\s*\(/.test(command)) {
+    for (const m of command.matchAll(/Path\(\s*['"]([^'"]+)['"]\s*\)/g)) {
+      if (m[1]) out.push(m[1])
+    }
+    for (const m of command.matchAll(/writeFileSync\(\s*['"]([^'"]+)['"]/g)) {
+      if (m[1]) out.push(m[1])
+    }
+  }
+  return [
+    ...new Set(
+      out.filter(
+        (s) =>
+          !s.startsWith("-") &&
+          !/^\d+$/.test(s) &&
+          s !== "/dev/null" &&
+          !s.includes("$") &&
+          !s.includes('"') &&
+          !s.includes("'") &&
+          !s.includes("(") &&
+          !s.includes(")") &&
+          !s.includes("="),
+      ),
+    ),
+  ]
+}
+
+function readGitHeadBlobAtPath(root: string, relPath: string): string | null {
+  const absTarget = safeRealpath(path.join(root, relPath))
+  const targetDir = path.dirname(absTarget)
+  if (!existsSync(targetDir)) return null
+  const topProc = Bun.spawnSync({
+    cmd: ["git", "-c", "core.quotePath=false", "-C", targetDir, "rev-parse", "--show-toplevel"],
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
+  })
+  if (topProc.exitCode !== 0) return null
+  const subTop = safeRealpath(Buffer.from(topProc.stdout ?? []).toString("utf8").trim())
+  if (!subTop) return null
+  const subRel = path.relative(subTop, absTarget).split(path.sep).join("/")
+  if (!subRel || subRel.startsWith("..")) return null
+  const showProc = Bun.spawnSync({
+    cmd: ["git", "-c", "core.quotePath=false", "-C", subTop, "show", `HEAD:${subRel}`],
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
+  })
+  if (showProc.exitCode !== 0) return null
+  return Buffer.from(showProc.stdout ?? []).toString("utf8")
 }
 
 export function readHostLedger(
@@ -232,6 +392,7 @@ export function readHostLedger(
   sessionID?: string,
   seedContents?: Map<string, string>,
   diskContents?: Map<string, string>,
+  externalWorktrees?: ReadonlyArray<string>,
 ): HostLedger {
   const root = path.resolve(rootArg)
   const empty: HostLedger = {
@@ -437,7 +598,7 @@ export function readHostLedger(
 
       if (isRead) {
         const rawPath = resolveTarget(input)
-        const rel = normalizeToRoot(rawPath, sessionDir, root)
+        const rel = normalizeToRoot(rawPath, sessionDir, root, externalWorktrees)
         if (!rel) continue
         const existing = stateByPath.get(rel)
         if (existing?.content != null) continue
@@ -449,9 +610,9 @@ export function readHostLedger(
 
       if (isWrite) {
         const rawPath = resolveTarget(input)
-        const rel = normalizeToRoot(rawPath, sessionDir, root)
+        const rel = normalizeToRoot(rawPath, sessionDir, root, externalWorktrees)
         if (!rel) {
-          skippedOutsideRoot++
+          if (!isScratchTarget(rawPath, sessionDir)) skippedOutsideRoot++
           continue
         }
         const rawContent = input.content ?? input.CodeContent ?? input.ReplacementContent
@@ -477,18 +638,55 @@ export function readHostLedger(
       }
 
       if (isEdit) {
+        const rawPatchText = typeof input.patchText === "string" ? input.patchText : typeof input.patch === "string" ? input.patch : ""
+        if (rawPatchText && (name === "patch" || name === "apply_patch")) {
+          const blocks = parsePatchBlocks(rawPatchText)
+          for (const block of blocks) {
+            const rel = normalizeToRoot(block.rawPath, sessionDir, root, externalWorktrees)
+            if (!rel) {
+              if (!isScratchTarget(block.rawPath, sessionDir)) skippedOutsideRoot++
+              continue
+            }
+            const prev = stateByPath.get(rel)
+            const diskText = diskContents?.get(rel)
+            const after = diskText !== undefined ? fullHash(diskText) : fullHash(block.newSnippet ?? rawPatchText)
+            const scope: LedgerScope = diskText !== undefined ? "file" : "fragment"
+            entries.push({
+              session: row.session_id,
+              root: rootID,
+              parent: session?.parent_id ?? undefined,
+              path: rel,
+              op: block.op,
+              tool: "patch",
+              before: prev?.after ?? null,
+              after,
+              scope,
+              t,
+              callId,
+              newSnippet: block.newSnippet,
+            })
+            if (diskText !== undefined) {
+              stateByPath.set(rel, { content: diskText, after, scope: "file" })
+            }
+            recordActorPath(row.session_id, rel)
+          }
+          continue
+        }
+
         const rawPath = resolveTarget(input)
-        const rel = normalizeToRoot(rawPath, sessionDir, root)
+        const rel = normalizeToRoot(rawPath, sessionDir, root, externalWorktrees)
         if (!rel) {
-          skippedOutsideRoot++
+          if (!isScratchTarget(rawPath, sessionDir)) skippedOutsideRoot++
           continue
         }
         let prev = stateByPath.get(rel)
-        // Seed from git HEAD blob when the agent edited after a partial line-range read or rg
-        if (!prev?.content && seedContents?.has(rel)) {
-          const seeded = seedContents.get(rel)!
-          prev = { content: seeded, after: fullHash(seeded), scope: "file" }
-          stateByPath.set(rel, prev)
+        // Seed from git HEAD blob (including linked worktree HEAD) when the agent edited after a partial line-range read or rg
+        if (!prev?.content) {
+          const seeded = seedContents?.get(rel) ?? readGitHeadBlobAtPath(root, rel)
+          if (seeded != null) {
+            prev = { content: seeded, after: fullHash(seeded), scope: "file" }
+            stateByPath.set(rel, prev)
+          }
         }
 
         const edits: Array<{ oldString: string; newString: string; replaceAll: boolean }> = []
@@ -579,11 +777,12 @@ export function readHostLedger(
       if (isShell) {
         const command = String(input.command ?? input.cmd ?? "").trim()
         if (!command) continue
+        const shellDir = effectiveShellDir(command, input, sessionDir)
 
         if (isVerificationCommand(command)) {
           const ver = parseCommandVerification(command, state, outputText)
           evidence.push({
-            command: command.slice(0, 160),
+            command: formatVerificationCommand(command, shellDir, root),
             exit: ver.exit,
             revision: "worktree",
             outcome: ver.outcome,
@@ -600,7 +799,7 @@ export function readHostLedger(
 
         if (!isMutatingShell(command)) continue
         for (const target of shellTargets(command)) {
-          const rel = normalizeToRoot(target, sessionDir, root)
+          const rel = normalizeToRoot(target, shellDir, root, externalWorktrees)
           if (!rel) continue
           const existing = shellWrites.get(rel)
           if (!existing || existing.t < t) {
@@ -623,6 +822,7 @@ export function readHostLedger(
         model: info.model,
         worktree: s.directory,
         title: s.title ?? undefined,
+        updatedAt: Number(s.time_updated ?? s.time_created ?? 0),
         filesTouched: touched.length,
         paths: touched,
         checksRun: chk?.count ?? 0,
